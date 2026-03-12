@@ -20,7 +20,7 @@ from typing import Callable, List, Optional
 from google import genai
 from google.genai import types
 
-from .gemini_client import build_gemini_client
+from .gemini_client import build_gemini_client, gemini_model_candidates, is_model_not_found_error
 from .retrieval import CoverageInfo, Evidence, QueryIntent, RetrievalResult
 
 
@@ -592,16 +592,25 @@ def generate_chat_answer(
     for attempt in range(1, 5):
         try:
             client = build_gemini_client(gemini_api_key)
-            resp = client.models.generate_content(
-                model=gemini_model,
-                contents=f"SORU: {query}",
-                config=types.GenerateContentConfig(
-                    system_instruction=_CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query),
-                    temperature=0.4,
-                    max_output_tokens=1024,
-                ),
-            )
-            return (resp.text or "").strip() or "Anlayamadım, tekrar eder misin?"
+            last_model_error: Optional[Exception] = None
+            for model_name in gemini_model_candidates(gemini_model):
+                try:
+                    resp = client.models.generate_content(
+                        model=model_name,
+                        contents=f"SORU: {query}",
+                        config=types.GenerateContentConfig(
+                            system_instruction=_CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query),
+                            temperature=0.4,
+                            max_output_tokens=1024,
+                        ),
+                    )
+                    return (resp.text or "").strip() or "Anlayamadım, tekrar eder misin?"
+                except Exception as model_exc:
+                    last_model_error = model_exc
+                    if not is_model_not_found_error(model_exc):
+                        raise
+            if last_model_error is not None:
+                raise last_model_error
         except Exception as e:
             last_err = e
             if attempt >= 4 or not _retryable(e):
@@ -725,16 +734,25 @@ def generate_answer(
         for attempt in range(1, 5):
             try:
                 client = build_gemini_client(gemini_api_key)
-                response = client.models.generate_content(
-                    model=gemini_model,
-                    contents=user_contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=temperature,
-                        max_output_tokens=max_tokens,
-                    ),
-                )
-                return response.text or ""
+                last_model_error: Optional[Exception] = None
+                for model_name in gemini_model_candidates(gemini_model):
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=user_contents,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_instruction,
+                                temperature=temperature,
+                                max_output_tokens=max_tokens,
+                            ),
+                        )
+                        return response.text or ""
+                    except Exception as model_exc:
+                        last_model_error = model_exc
+                        if not is_model_not_found_error(model_exc):
+                            raise
+                if last_model_error is not None:
+                    raise last_model_error
             except Exception as e:
                 last_err = e
                 if attempt >= 4 or not _retryable(e):
@@ -1028,19 +1046,30 @@ def generate_answer_stream(
 
     client = build_gemini_client(gemini_api_key)
     chunks: list[str] = []
-    for event in client.models.generate_content_stream(
-        model=gemini_model,
-        contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=0.1,
-            max_output_tokens=4096,
-        ),
-    ):
-        token = (event.text or "")
-        if token:
-            chunks.append(token)
-            _emit(token)
+    last_model_error: Optional[Exception] = None
+    for model_name in gemini_model_candidates(gemini_model):
+        try:
+            for event in client.models.generate_content_stream(
+                model=model_name,
+                contents=user_message,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.1,
+                    max_output_tokens=4096,
+                ),
+            ):
+                token = (event.text or "")
+                if token:
+                    chunks.append(token)
+                    _emit(token)
+            break
+        except Exception as model_exc:
+            last_model_error = model_exc
+            chunks = []
+            if not is_model_not_found_error(model_exc):
+                raise
+    if not chunks and last_model_error is not None:
+        raise last_model_error
 
     answer = "".join(chunks).strip() or "Belgede bu bilgi bulunamadı."
 

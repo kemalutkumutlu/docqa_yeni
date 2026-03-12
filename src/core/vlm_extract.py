@@ -8,7 +8,7 @@ from google import genai
 from google.genai import types
 from PIL import Image
 
-from .gemini_client import build_gemini_client
+from .gemini_client import build_gemini_client, gemini_model_candidates, is_model_not_found_error
 
 
 @dataclass(frozen=True)
@@ -71,18 +71,28 @@ def _extract_via_gemini(image: Image.Image, cfg: VLMConfig) -> str:
     img_bytes = buf.getvalue()
 
     client = build_gemini_client(cfg.api_key)
-    resp = client.models.generate_content(
-        model=cfg.model,
-        contents=[
-            types.Part.from_text(text=_EXTRACT_ONLY_PROMPT),
-            types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            max_output_tokens=4096,
-        ),
-    )
-    return (resp.text or "").strip()
+    last_model_error: Exception | None = None
+    for model_name in gemini_model_candidates(cfg.model):
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_text(text=_EXTRACT_ONLY_PROMPT),
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=4096,
+                ),
+            )
+            return (resp.text or "").strip()
+        except Exception as exc:
+            last_model_error = exc
+            if not is_model_not_found_error(exc):
+                raise
+    if last_model_error is not None:
+        raise last_model_error
+    return ""
 
 
 def _extract_via_ollama(image: Image.Image, cfg: VLMConfig) -> str:

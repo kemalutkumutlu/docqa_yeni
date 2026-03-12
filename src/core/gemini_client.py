@@ -104,3 +104,24 @@ def build_gemini_client(api_key: str = ""):
             "Gemini kullanimi icin GEMINI_API_KEY (veya GOOGLE_API_KEY) tanimli olmali."
         )
     return genai.Client(api_key=key)
+
+
+def gemini_model_candidates(primary_model: str, fallback_env: str = "GEMINI_FALLBACK_MODEL") -> list[str]:
+    primary = (primary_model or "").strip()
+    fallback = (os.getenv(fallback_env, "") or "").strip()
+    out: list[str] = []
+    for item in (primary, fallback):
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def is_model_not_found_error(exc: Exception) -> bool:
+    msg = str(exc or "")
+    lowered = msg.lower()
+    return (
+        "not_found" in lowered
+        or "publisher model" in lowered
+        or "was not found" in lowered
+        or "does not have access to it" in lowered
+    )
