@@ -38,6 +38,22 @@ class OllamaConfig:
     timeout: int = 120
 
 
+def ollama_is_available(cfg: OllamaConfig) -> tuple[bool, str]:
+    """
+    Lightweight health check for the local Ollama service.
+    Returns (available, detail).
+    """
+    url = f"{cfg.base_url.rstrip('/')}/api/tags"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=min(int(cfg.timeout), 10)) as resp:
+            if 200 <= getattr(resp, "status", 0) < 300:
+                return True, "ok"
+            return False, f"HTTP {getattr(resp, 'status', 'unknown')}"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
 def _ollama_generate(
     base_url: str,
     model: str,

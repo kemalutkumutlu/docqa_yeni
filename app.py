@@ -19,9 +19,10 @@ from chainlit.input_widget import Select, Slider
 
 from src.config import load_settings
 from src.core.ingestion import OCRConfig
-from src.core.local_llm import OllamaConfig
+from src.core.local_llm import OllamaConfig, ollama_is_available
 from src.core.pipeline import RAGPipeline
 from src.core.vlm_extract import VLMConfig
+from src.core.gemini_client import use_vertex_ai
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -236,6 +237,7 @@ _VLM_MODE_VALUES = ["off", "auto", "force"]
 _VLM_PROVIDER_VALUES = ["gemini", "local"]
 _VLM_MAX_PAGES_LIMIT = 200
 _VLM_MAX_PAGES_DEFAULT = 25
+_PROFILE_WARNING_KEY = "profile_warning"
 
 
 def _get_cached_settings():
@@ -294,6 +296,67 @@ def _runtime_overrides() -> dict:
 
 def _get_runtime_value(key: str, fallback):
     return _runtime_overrides().get(key, fallback)
+
+
+def _has_gemini_backend(settings) -> bool:
+    if use_vertex_ai():
+        return True
+    return bool((settings.gemini_api_key or "").strip())
+
+
+def _resolve_llm_provider_choice(requested_provider: str, settings, ollama_cfg: OllamaConfig) -> tuple[str, str | None]:
+    provider = (requested_provider or "").strip().lower()
+    gemini_ready = _has_gemini_backend(settings)
+    openai_ready = bool((settings.openai_api_key or "").strip())
+    ollama_ready, ollama_detail = ollama_is_available(ollama_cfg)
+
+    if provider == "none":
+        return "none", None
+    if provider == "gemini":
+        if gemini_ready:
+            return "gemini", None
+        if openai_ready:
+            return "openai", "Gemini auth hazir degil. Gecici olarak `OpenAI` kullaniliyor."
+        if ollama_ready:
+            return "local", "Gemini auth hazir degil. Gecici olarak `Local` kullaniliyor."
+        return "none", "Gemini auth hazir degil. Gecici olarak `Extractive` moda dusuldu."
+    if provider == "openai":
+        if openai_ready:
+            return "openai", None
+        if gemini_ready:
+            return "gemini", "Secilen profil `OpenAI`, ancak `OPENAI_API_KEY` tanimli degil. `Gemini` fallback kullaniliyor."
+        if ollama_ready:
+            return "local", "Secilen profil `OpenAI`, ancak `OPENAI_API_KEY` tanimli degil. `Local` fallback kullaniliyor."
+        return "none", "Secilen profil `OpenAI`, ancak `OPENAI_API_KEY` tanimli degil. `Extractive` fallback kullaniliyor."
+    if provider == "local":
+        if ollama_ready:
+            return "local", None
+        if gemini_ready:
+            return "gemini", f"Secilen profil `Local`, ancak Ollama erisilemedi (`{ollama_detail}`). `Gemini` fallback kullaniliyor."
+        if openai_ready:
+            return "openai", f"Secilen profil `Local`, ancak Ollama erisilemedi (`{ollama_detail}`). `OpenAI` fallback kullaniliyor."
+        return "none", f"Secilen profil `Local`, ancak Ollama erisilemedi (`{ollama_detail}`). `Extractive` fallback kullaniliyor."
+    return "gemini", None
+
+
+def _resolve_vlm_provider_choice(requested_provider: str, settings, ollama_cfg: OllamaConfig) -> tuple[str, str | None]:
+    provider = (requested_provider or "").strip().lower()
+    gemini_ready = _has_gemini_backend(settings)
+    ollama_ready, ollama_detail = ollama_is_available(ollama_cfg)
+
+    if provider == "local":
+        if ollama_ready:
+            return "local", None
+        if gemini_ready:
+            return "gemini", f"Secilen `VLM Provider=local`, ancak Ollama erisilemedi (`{ollama_detail}`). `gemini` fallback kullaniliyor."
+        return "local", f"Secilen `VLM Provider=local`, ancak Ollama erisilemedi (`{ollama_detail}`). Yukleme sirasinda VLM devre disi kalabilir."
+
+    if provider == "gemini" and not gemini_ready:
+        if ollama_ready:
+            return "local", "Gemini VLM auth hazir degil. `local` fallback kullaniliyor."
+        return "gemini", "Gemini VLM auth hazir degil. Yukleme sirasinda VLM devre disi kalabilir."
+
+    return provider or "gemini", None
 
 
 def _settings_widgets(pipeline: RAGPipeline) -> list:
@@ -431,19 +494,17 @@ def _apply_chat_profile_to_pipeline(pipeline: RAGPipeline) -> str | None:
         timeout=settings.ollama_timeout,
     )
 
-    if provider == "openai" and not settings.openai_api_key.strip():
-        return (
-            "Secilen profil `OpenAI` ancak `OPENAI_API_KEY` tanimli degil. "
-            f"Mevcut provider korunuyor: `{pipeline.llm_provider}`."
-        )
-    if provider == "gemini" and not settings.gemini_api_key.strip():
-        return (
-            "Secilen profil `Gemini` ancak `GEMINI_API_KEY` tanimli degil. "
-            f"Mevcut provider korunuyor: `{pipeline.llm_provider}`."
-        )
+    resolved_provider, warning = _resolve_llm_provider_choice(provider, settings, pipeline.ollama_config)
+    pipeline.llm_provider = resolved_provider
+    return warning
 
-    pipeline.llm_provider = provider
-    return None
+
+async def _sync_profile_to_pipeline(pipeline: RAGPipeline) -> None:
+    warning = _apply_chat_profile_to_pipeline(pipeline)
+    previous = cl.user_session.get(_PROFILE_WARNING_KEY)
+    if warning and warning != previous:
+        await cl.Message(content=warning).send()
+    cl.user_session.set(_PROFILE_WARNING_KEY, warning or "")
 
 
 def _shorten_for_sidebar(text: str, limit: int = 84) -> str:
@@ -696,6 +757,7 @@ async def on_chat_start():
     # Intentionally no auto welcome message to avoid initial layout jump in UI.
     if profile_warning:
         await cl.Message(content=profile_warning).send()
+    cl.user_session.set(_PROFILE_WARNING_KEY, profile_warning or "")
     await cl.ChatSettings(_settings_widgets(pipeline)).send()
     await _update_documents_sidebar(pipeline)
 
@@ -736,13 +798,26 @@ async def on_settings_update(values: dict):
         _VLM_MAX_PAGES_LIMIT,
     )
 
+    settings = _get_cached_settings()
+    ollama_cfg = pipeline.ollama_config or OllamaConfig(
+        base_url=settings.ollama_base_url,
+        llm_model=settings.ollama_llm_model,
+        vlm_model=settings.ollama_vlm_model,
+        timeout=settings.ollama_timeout,
+    )
+    resolved_vlm_provider, vlm_warning = _resolve_vlm_provider_choice(
+        selected_vlm_provider,
+        settings,
+        ollama_cfg,
+    )
+
     cl.user_session.set(
         _RUNTIME_OVERRIDES_KEY,
         {
             "embedding_model_choice": selected_model_choice,
             "embedding_device": selected_device,
             "vlm_mode": selected_vlm_mode,
-            "vlm_provider": selected_vlm_provider,
+            "vlm_provider": resolved_vlm_provider,
             "vlm_max_pages": selected_vlm_pages,
         },
     )
@@ -751,7 +826,7 @@ async def on_settings_update(values: dict):
         embedding_model=resolved_model,
         embedding_device=selected_device,
         vlm_mode=selected_vlm_mode,
-        vlm_provider=selected_vlm_provider,
+        vlm_provider=resolved_vlm_provider,
         vlm_max_pages=selected_vlm_pages,
     )
 
@@ -759,7 +834,7 @@ async def on_settings_update(values: dict):
         messages = [
             "**Runtime ayarlari guncellendi**",
             f"- Embedding: `{pipeline.embedding_model}` | `{pipeline.embedding_device}`",
-            f"- VLM: `{selected_vlm_provider}` | `{selected_vlm_mode}` | max_pages=`{selected_vlm_pages}`",
+            f"- VLM: `{resolved_vlm_provider}` | `{selected_vlm_mode}` | max_pages=`{selected_vlm_pages}`",
         ]
         if result.get("index_rebuilt"):
             messages.append("- Mevcut dokumanlar icin embedding indeksi yeniden olusturuldu.")
@@ -767,6 +842,8 @@ async def on_settings_update(values: dict):
             messages.append("- Embedding ayari degisti; indeks yeni ayarlarla hazir.")
         if result.get("vlm_changed"):
             messages.append("- VLM ayarlari bir sonraki dosya yuklemelerinde uygulanir.")
+        if vlm_warning:
+            messages.append(f"- Not: {vlm_warning}")
         await cl.Message(content="\n".join(messages)).send()
 
     await _update_documents_sidebar(pipeline)
@@ -1150,6 +1227,7 @@ async def on_retry_last(action: cl.Action):
     pipeline: RAGPipeline | None = cl.user_session.get("pipeline")
     if not pipeline:
         pipeline = _get_pipeline()
+    await _sync_profile_to_pipeline(pipeline)
 
     thinking_msg = cl.Message(content="Tekrar deneniyor...")
     await thinking_msg.send()
@@ -1312,6 +1390,7 @@ async def on_message(message: cl.Message):
     # Ensure pipeline exists
     if not pipeline:
         pipeline = _get_pipeline()
+    await _sync_profile_to_pipeline(pipeline)
     _thread_pipeline_set(active_ui_thread_id, pipeline)
 
     # Chat mode does not require documents
