@@ -1500,9 +1500,15 @@ def generate_extractive_answer(
     lines: list[str] = []
     seen_pages: set[str] = set()
     for ev in retrieval.evidences[:5]:  # top 5 evidence chunks
-        cite = f"[{ev.doc_name} - Sayfa {ev.page}]" if ev.page else f"[{ev.doc_name}]"
+        file_name = _extract_file_name_from_heading_path(ev.heading_path)
+        if ev.page_start and ev.page_end and ev.page_end != ev.page_start:
+            cite = f"[{file_name} - Sayfa {ev.page_start}-{ev.page_end}]"
+        elif ev.page_start:
+            cite = f"[{file_name} - Sayfa {ev.page_start}]"
+        else:
+            cite = f"[{file_name}]"
         # Deduplicate same page content
-        key = f"{ev.doc_name}:{ev.page}:{ev.text[:80]}"
+        key = f"{file_name}:{ev.page_start}:{ev.page_end}:{ev.text[:80]}"
         if key in seen_pages:
             continue
         seen_pages.add(key)

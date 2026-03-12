@@ -1,56 +1,66 @@
 # GPU_REQUIREMENTS
 
-Bu proje GPU'yu Python tarafinda **yalnizca embedding** (SentenceTransformers / PyTorch) icin kullanir.
-Gemini/OpenAI LLM API cagirilari uzak servis oldugu icin GPU ile hizlanmaz.
+Bu repo icin GPU kullanimi, secilen profile gore degisir. Guncel varsayilan profil Gemini tabanli uzaktaki servisleri kullandigi icin, lokal GPU her adimda etkili degildir.
 
-> Not (Local mod): `LLM_PROVIDER=local` / `VLM_PROVIDER=local` iken Ollama kendi surecinde GPU kullanir.
-> Bu durumda VRAM kapasitesi local LLM/VLM performansi icin kritik hale gelir.
+## Kisa Ozet
 
-## Ne kazandirir?
+- `Gemini generation`: lokal GPU kullanmaz
+- `Gemini embedding`: lokal GPU kullanmaz
+- `Gemini VLM`: lokal GPU kullanmaz
+- `sentence-transformers` lokal embedding: lokal GPU kullanabilir
+- `Ollama` local LLM/VLM: kendi surecinde lokal GPU kullanabilir
 
-- PDF'ler ilk kez indexlenirken (chunk embedding) ve retrieval sirasinda query embedding uretilirken hizlanma.
+Yani bugunku demo profilinde RTX 4090 zorunlu degildir; ancak lokal embedding veya local Ollama yoluna gecersen fark yaratir.
 
-## Local LLM/VLM (Ollama) icin VRAM notu
+## GPU Ne Zaman Fayda Saglar?
 
-- VRAM, local modelin GPU'da calisip calisamayacagini belirler.
-- Daha buyuk model (veya daha uzun context) daha fazla VRAM ister.
-- VRAM yetersizse CPU offload olabilir; bu da token hizini ve cevap gecikmesini belirgin etkiler.
-- Pratikte 6 GB VRAM sinifinda 7B quantize modeller daha guvenli bir denge verir.
+### 1. Lokal embedding
 
-## Model boyutu, quantization ve OOM (Local LLM/VLM)
+`EMBEDDING_MODEL=auto` veya sabit bir `sentence-transformers` modeli secersen:
 
-- Bu repo'nun referans GPU'su (GTX 1660 SUPER, 6 GB VRAM) dusuk/orta seviye oldugu icin, local modda amac "en buyuk modeli kosmak" degil; **tam offline calisma** yetenegini gostermektir.
-- Buyuk acik modellerde (ornegin 70B/120B sinifi; `gpt-oss-120b` gibi) quantization genellikle zorunlu hale gelir. Aksi halde model agirliklari VRAM/RAM'e sigmayabilir.
-- OOM (out-of-memory) sadece model agirliklarindan kaynaklanmaz:
-  - Context uzadiginda **KV cache** bellek kullanimi artar.
-  - Eszamanli istek/batch arttikca bellek baskisi artar.
-- OOM durumunda tipik sonuc:
-  - Model yuklenemez veya inference sirasinda hata verir
-  - veya CPU offload ile calisir (calisabilir ama hiz/latency ciddi etkilenir)
+- ilk index olusturmada hizlanma
+- query embedding sirasinda hizlanma
 
-## Kurulum (Windows, onerilen yaklasim)
+Ornek:
 
-GPU kurulumunu CPU ortamindan ayri tutmak (ayri venv) en az sorunlu yaklasimdir.
+```ini
+EMBEDDING_MODEL=auto
+EMBEDDING_DEVICE=cuda
+```
 
-### 1) GPU venv olustur
+veya
+
+```ini
+EMBEDDING_MODEL=intfloat/multilingual-e5-base
+EMBEDDING_DEVICE=cuda
+```
+
+### 2. Lokal Ollama
+
+```ini
+LLM_PROVIDER=local
+VLM_PROVIDER=local
+```
+
+Bu durumda Ollama'nin sectigin modeline gore VRAM tuketimi onemli hale gelir.
+
+## Onerilen Kurulum
+
+GPU ortamini ayri sanal ortamda tut:
 
 ```bash
-cd <repo_root>
 python -m venv .venv-gpu
-.\.venv-gpu\Scripts\activate
+source .venv-gpu/bin/activate
 python -m pip install -U pip
 ```
 
-### 2) CUDA uyumlu PyTorch kur
-
-Her kullanicinin CUDA/driver uyumu farkli olabildigi icin PyTorch paketini uygun CUDA index-url ile kurun.
-Ornek (CUDA 12.1):
+CUDA uyumlu PyTorch kur. Ornek `cu121`:
 
 ```bash
 python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### 3) Proje bagimliliklarini kur
+Sonra proje bagimliliklarini kur:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -58,36 +68,59 @@ python -m pip install -r requirements.txt
 
 ## Dogrulama
 
-### Torch + GPU goruyor mu?
+### Torch GPU goruyor mu?
 
 ```bash
-python -c "import torch; print('torch',torch.__version__); print('torch_cuda',torch.version.cuda); print('cuda_available',torch.cuda.is_available()); print('gpu',torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+python -c "import torch; print('torch', torch.__version__); print('cuda', torch.version.cuda); print('available', torch.cuda.is_available()); print('gpu', torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 ```
 
-### Embedding gercekten GPU'da mi?
+### Lokal embedding gercekten GPU'da mi?
+
+Bu test yalnizca lokal embedding icin anlamlidir:
 
 ```bash
-python -c "from src.config import load_settings; from src.core.embedding import Embedder; s=load_settings(); print('selected', s.embedding_model, s.embedding_device); e=Embedder(s.embedding_model, device=s.embedding_device); e.embed_query('test'); print('device:', e._model.device)"
+python -c "from src.config import load_settings; from src.core.embedding import Embedder; s = load_settings(); print('selected', s.embedding_model, s.embedding_device); e = Embedder(s.embedding_model, device=s.embedding_device); e.embed_query('test'); print('device:', getattr(getattr(e, '_model', None), 'device', 'remote-or-n/a'))"
 ```
 
-> Not: Yanlis venv ile calistirmamak icin app'i su sekilde baslatmak en garantisi:
->
-> `.\.venv-gpu\Scripts\python.exe -m chainlit run app.py -w`
+Not:
 
-## Opsiyonel: Embedding device secimi
+- `gemini-embedding-001` kullanirken bu yol lokal `torch` device raporlamaz; embedding uzaktan gelir.
 
-Varsayilan: `EMBEDDING_DEVICE=auto` (CUDA varsa GPU, yoksa CPU).
+## VRAM Notu
 
-`.env` icinde override edebilirsiniz:
+Local Ollama kullaniyorsan:
 
-```ini
-EMBEDDING_DEVICE=auto
-# EMBEDDING_DEVICE=cpu
-# EMBEDDING_DEVICE=cuda
-```
+- daha buyuk model daha fazla VRAM ister
+- uzun context KV cache'i buyutur
+- VRAM yetmezse CPU offload olabilir
+- bu da latency'yi belirgin artirir
+
+Pratikte:
+
+- 7B quantize modeller guvenli baslangictir
+- demo amaci offline gostermekse orta boy model secmek daha mantiklidir
 
 ## Troubleshooting
 
-- **CUDA True ama hizlanma yok**: embedding device kontrol komutuyla `device: cuda` gorundugunu teyit edin.
-- **Port cakismasi (8000)**: `README.md` → Troubleshooting bolumune bakin (`--port 8001` veya `AUTO_EXIT_ON_NO_CLIENTS=1`).
+### CUDA gorunuyor ama hizlanma yok
 
+Muhtemel neden: Gemini tabanli uzak embedding kullaniyorsun. Bu beklenen davranistir.
+
+### `device: cpu` gorunuyor
+
+Kontrol et:
+
+- `EMBEDDING_MODEL` lokal mi
+- `EMBEDDING_DEVICE=cuda` mi
+- dogru venv aktif mi
+- CUDA uyumlu torch kurulmus mu
+
+### App'i hangi Python ile acayim?
+
+Tek onerilen yol:
+
+```bash
+./run.sh
+```
+
+Bu script `.venv-gpu/bin/python` kullanir ve `preflight.py` ile acilis dogrulamasini yapar.

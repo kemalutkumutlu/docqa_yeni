@@ -1,749 +1,360 @@
-# TUSAS DOCQA — Belge Analiz ve Soru-Cevap Sistemi
+# TUSAS DOCQA
 
-[![CI](https://github.com/kemalutkumutlu/TUSAS-DOCQA/actions/workflows/ci.yml/badge.svg)](https://github.com/kemalutkumutlu/TUSAS-DOCQA/actions/workflows/ci.yml)
+PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Pipeline, belgeyi ingest eder, yapiyi cikartir, hiyerarsik chunk'lara boler, Chroma + BM25 ile retrieval yapar ve cevabi kaynakla birlikte uretir.
 
-Yapay zeka destekli **Kurumsal Karar Destek ve Belge Analiz** sistemi. Teknik raporlar, dokümanlar ve operasyonel veriler (PDF/Görsel) üzerinde anlama, özetleme ve soru-cevap yetenekleri sunar.
+## Ozet
 
-## CI/CD & LLMOps (GitHub Actions)
+- Belge turleri: `PDF`, `PNG`, `JPG`
+- Retrieval: dense + sparse + RRF
+- Query routing: `section_list` ve `normal_qa`
+- Generation: Gemini, OpenAI, local Ollama veya extractive mod
+- VLM extraction: Gemini veya local vision model
+- Demo icin onerilen profil: Vertex AI + Gemini
 
-Workflow: `.github/workflows/ci.yml`
+## Onerilen Demo Profili
 
-- **Baseline Gate (LLM-free)**: Her push/PR’da core pipeline regresyon kapilarini kosar:
-  - `python scripts/baseline_gate.py`
-  - `python scripts/lang_gate.py`
-- **Case Study Eval (Gemini)**: Sadece `GEMINI_API_KEY` tanimliysa calisir (repo Settings → Secrets/Variables):
-  - `python scripts/eval_case_study.py --pdf Case_Study_20260205.pdf`
-
-> Not: Secret yoksa eval job adimlari otomatik skip edilir.
-
-## Mimari
-
-```
-PDF/Image ─→ Ingestion ─→ Structure ─→ Chunking ─→ Indexing ─→ Retrieval ─→ Generation
-              (PyMuPDF     (Heading      (Parent/     (Chroma +   (Query      (Gemini /
-               + OCR        Detection     Child)      BM25 +      Routing +    Ollama +
-               + (opt)      + Tree)                   RRF)        Section      Guardrails)
-               VLM)                                                  Fetch)
-```
-
-> **Local (Offline) Mod**: `LLM_PROVIDER=local` ve/veya `VLM_PROVIDER=local` ile tum pipeline Ollama uzerinden calisan yerel LLM/VLM'e yonlendirilir. Hicbir dis API cagrisi yapilmaz — savunma sanayii ve air-gapped ortamlar icin uygundur.
-
-### Temel Ozellikler
-
-| Ozellik | Aciklama |
-|---------|----------|
-| **Belge Yukleme** | PDF, JPG, PNG destegi |
-| **Metin Cikarimi** | PDF text-layer + Tesseract OCR + (opsiyonel) Gemini VLM extract-only |
-| **Dual-Quality Secim** | Aynı sayfada birden fazla cikarim adayi varsa (PDF/OCR/VLM), baslik/structure korunumu daha iyi olani secilir |
-| **Hiyerarsik Chunking** | Bolum algılama, parent-child chunk'lar, heading metadata |
-| **Hibrit Arama** | Dense (vector) + Sparse (BM25) + RRF fusion |
-| **Query Routing** | Liste/bolum soruları vs normal QA otomatik ayrimi |
-| **Complete Section Fetch** | Liste sorularinda tum bolum + alt bolumler getirilir |
-| **Coverage Check** | Beklenen madde sayisi vs cevaptaki madde sayisi kontrolu |
-| **Deterministic Section-List** | Uygun oldugunda liste sorulari LLM'e bagli kalmadan, parent section text'inden deterministik listelenir (eksik madde riski azalir) |
-```
-# TUSAS DOCQA — Belge Analiz ve Soru-Cevap Sistemi
-
-[![CI](https://github.com/kemalutkumutlu/TUSAS-DOCQA/actions/workflows/ci.yml/badge.svg)](https://github.com/kemalutkumutlu/TUSAS-DOCQA/actions/workflows/ci.yml)
-
-Yapay zeka destekli **Belge Analiz ve Soru-Cevap** sistemi. PDF ve gorsel belgeleri yukleyerek doğal dil ile soru sorun, kaynakli ve dogrulanmis cevaplar alin.
-
-## CI (GitHub Actions)
-
-Workflow: `.github/workflows/ci.yml`
-
-- **Baseline Gate (LLM-free)**: Her push/PR’da core pipeline regresyon kapilarini kosar:
-  - `python scripts/baseline_gate.py`
-  - `python scripts/lang_gate.py`
-- **Case Study Eval (Gemini)**: Sadece `GEMINI_API_KEY` tanimliysa calisir (repo Settings → Secrets/Variables):
-  - `python scripts/eval_case_study.py --pdf Case_Study_20260205.pdf`
-
-> Not: Secret yoksa eval job adimlari otomatik skip edilir.
-
-## Mimari
-
-```
-PDF/Image ─→ Ingestion ─→ Structure ─→ Chunking ─→ Indexing ─→ Retrieval ─→ Generation
-              (PyMuPDF     (Heading      (Parent/     (Chroma +   (Query      (Gemini /
-               + OCR        Detection     Child)      BM25 +      Routing +    Ollama +
-               + (opt)      + Tree)                   RRF)        Section      Guardrails)
-               VLM)                                                  Fetch)
-```
-
-> **Local (Offline) Mod**: `LLM_PROVIDER=local` ve/veya `VLM_PROVIDER=local` ile tum pipeline Ollama uzerinden calisan yerel LLM/VLM'e yonlendirilir. Hicbir dis API cagrisi yapilmaz — savunma sanayii ve air-gapped ortamlar icin uygundur.
-
-### Temel Ozellikler
-
-| Ozellik | Aciklama |
-|---------|----------|
-| **Belge Yukleme** | PDF, JPG, PNG destegi |
-| **Metin Cikarimi** | PDF text-layer + Tesseract OCR + (opsiyonel) Gemini VLM extract-only |
-| **Dual-Quality Secim** | Aynı sayfada birden fazla cikarim adayi varsa (PDF/OCR/VLM), baslik/structure korunumu daha iyi olani secilir |
-| **Hiyerarsik Chunking** | Bolum algılama, parent-child chunk'lar, heading metadata |
-| **Hibrit Arama** | Dense (vector) + Sparse (BM25) + RRF fusion |
-| **Query Routing** | Liste/bolum soruları vs normal QA otomatik ayrimi |
-| **Complete Section Fetch** | Liste sorularinda tum bolum + alt bolumler getirilir |
-| **Coverage Check** | Beklenen madde sayisi vs cevaptaki madde sayisi kontrolu |
-| **Deterministic Section-List** | Uygun oldugunda liste sorulari LLM'e bagli kalmadan, parent section text'inden deterministik listelenir (eksik madde riski azalir) |
-| **Halusinasyon Onleme** | Strict system prompt, sadece baglamdaki bilgi |
-| **Citation** | Her bilgi cumlesine [DosyaAdi - Sayfa X] referansi |
-| **Coklu Belge + Izolasyon** | Tek session'da birden fazla belge; retrieval doc_id ile izole edilir (cross-doc contamination onlenir) |
-| **Aktif Belge** | Birden fazla belge yuklendiginde `/use <dosya>` ile hedef belge secilir (varsayilan: son yuklenen) |
-| **Runtime UI Ayarlari** | Arayuzden `Embedding Model/Device`, `VLM Mode/Provider/Max Pages` secilip canli guncellenebilir |
-| **Belge Durumu Paneli** | Sidebar'da aktif/yuklu belge + LLM/Embedding/VLM runtime durumu gosterilir |
-| **Incremental Indexing** | Yeni belge eklendiginde sadece yeni chunk'lar embed edilir; onceki belgeler tekrar islenmez |
-| **LLM-Free Extractive QA** | `LLM_PROVIDER=none` ile LLM olmadan belgeden dogrudan alinti bazli cevap (embedding + retrieval yeterli) |
-| **Local (Offline) Mod** | `LLM_PROVIDER=local` + `VLM_PROVIDER=local` ile Ollama uzerinden tamamen yerel LLM/VLM. Dis API yok, air-gapped ortam destegi |
-| **Edge / Kısıtlı Donanım** | 4-bit quantization (Q4) desteği ile tüketici sınıfı donanımlarda (örn. 6GB VRAM GPU) çalışabilir mimari |
-| **Observability** | Index build, retrieval ve generation sureleri event log'a kaydedilir (`RAG_LOG=1`) |
-| **Otomatik Değerlendirme (LLMOps)** | CI pipeline üzerinde koşan `eval_case_study.py` ile doğruluk, tutarlılık ve halüsinasyon metriklerinin otomatik takibi |
-
-## Kurulum (Windows)
-
-### Kurulum Paketi (Checklist)
-
-Bu repo, baskalarinin kolayca kurup calistirabilmesi icin gerekli dosyalari “kurulum paketi” gibi birlikte sunar:
-
-- Python bagimliliklari: `requirements.txt`
-- Ornek konfigurasyon: `.env.example` (lokalde `.env` kullanin)
-- Tekrar-kosulabilir test/benchmark scriptleri: `scripts/` (ozellikle `scripts/baseline_gate.py`)
-- (Opsiyonel) GPU kurulum/dogrulama rehberi: `GPU_REQUIREMENTS.md` (CPU `.venv` + GPU `.venv-gpu` ayrimi)
-- (Opsiyonel) Docker kurulum paketi: `Dockerfile` + `docker-compose.yml` + `.dockerignore`
-
-Minimum calisan profil (API anahtari yok):
-
-- `LLM_PROVIDER=none` (extractive) veya
-- `LLM_PROVIDER=local` / `VLM_PROVIDER=local` (Ollama ile tamamen offline)
-
-Opsiyonel bilesenler:
-
-- OCR icin Tesseract (scan PDF / JPG/PNG): bkz. asagidaki `OCR` bolumu
-- Embedding hizlandirma icin NVIDIA GPU + CUDA uyumlu PyTorch: bkz. `GPU_REQUIREMENTS.md`
-- Online kalite/acceptance eval icin Gemini: `LLM_PROVIDER=gemini` + `GEMINI_API_KEY`
-
-### 1) Sanal Ortam
-
-```bash
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### (Opsiyonel) Docker ile Calistirma
-
-Docker kurulumu olan ortamlarda (Docker Desktop/WSL2 vb.):
-
-```bash
-docker compose up --build
-```
-
-Ardindan tarayicida `http://localhost:8000` acin.
-
-Docker icinden hizli regresyon testi:
-
-```bash
-docker compose run --rm docqa python scripts/baseline_gate.py
-```
-
-Docker icinden retrieval kalite testi:
-
-```bash
-docker compose run --rm docqa python scripts/eval_retrieval.py --pdf Case_Study_20260205.pdf
-```
-
-Gelistirici modu (kaynak kod bind mount, rebuild gerektirmeden calistirma):
-
-```bash
-docker compose run --rm -p 8000:8000 -v .:/app docqa python -m chainlit run app.py -w --host 0.0.0.0 --port 8000
-```
-
-Notlar:
-
-- Varsayilan `docker-compose.yml` profili **LLM-free** (extractive) calisir: `LLM_PROVIDER=none`, `VLM_MODE=off`.
-- Docker Desktop **calisiyor** olmali ve Linux container engine acik olmali.
-  - `failed to connect ... dockerDesktopLinuxEngine` gorurseniz Docker Desktop’tan **Switch to Linux containers** secin.
-- Local (Ollama) mod kullanacaksaniz, Docker icinden host’taki Ollama’ya erismek icin genelde `OLLAMA_BASE_URL=http://host.docker.internal:11434` gerekir (OS’a gore degisebilir).
-- Eger `.env` icinde `$` karakteri olan bir deger kullaniyorsaniz (ornegin bir secret), Docker Compose bunu degisken gibi yorumlayabilir.
-  - Cozum: `$` karakterini `$$` olarak escape edin veya Docker icin ayri bir env dosyasi kullanin.
-
-### (Opsiyonel) GPU Notu (Embedding Hizlandirma)
-
-Bu projede GPU, **sadece embedding** (SentenceTransformers) tarafinda etkilidir. Gemini/OpenAI LLM API (ve Gemini VLM API) uzak servis oldugu icin GPU ile hizlanmaz.
-
-- Varsayilan davranis:
-  - CUDA varsa embedding otomatik **GPU**'da calisir
-  - `EMBEDDING_MODEL=auto` iken CUDA varsa **multilingual-e5-base**, CUDA yoksa **multilingual-e5-small** secilir
-  - Override icin `.env`: `EMBEDDING_DEVICE=auto|cpu|cuda` ve/veya `EMBEDDING_MODEL=<model>`
-
-- GPU’yu dogrulama (runtime):
-
-```bash
-python -c "from src.config import load_settings; s=load_settings(); print('embedding_model', s.embedding_model); print('embedding_device', s.embedding_device); from src.core.embedding import Embedder; e=Embedder(s.embedding_model, device=s.embedding_device); e.embed_query('test'); print('device:', e._model.device)"
-```
-
-### 2) (Opsiyonel) OCR — Taranmis PDF ve Gorseller icin
-
-[Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) yukleyin.
-PATH'de degilse `.env`'de `TESSERACT_CMD` ayarlayin.
-
-**Not (Windows izinleri):** Turkce dil paketi (tur.traineddata) icin Program Files'a yazamiyorsaniz,
-`.env` icinde `TESSDATA_PREFIX` ile kullanici-yazilabilir bir klasor belirtebilirsiniz.
-
-#### Kurulum (winget ile)
-
-```bash
-winget install -e --id UB-Mannheim.TesseractOCR --accept-package-agreements --accept-source-agreements
-```
-
-#### Dil dosyalari (TR/EN) — projeye lokal kurulum (onerilen)
-
-Bu proje varsayilan olarak OCR dilini `tur+eng` kullanir. Admin izni gerektirmeden calismasi icin
-`tur.traineddata` ve `eng.traineddata` dosyalarini proje altina koyabilirsiniz:
-
-```bash
-mkdir -Force .\data\tessdata
-```
-
-PowerShell ile hızlı indirme (tessdata_fast):
-
-```bash
-$base = "https://github.com/tesseract-ocr/tessdata_fast/raw/main"
-Invoke-WebRequest -Uri "$base/tur.traineddata" -OutFile .\data\tessdata\tur.traineddata
-Invoke-WebRequest -Uri "$base/eng.traineddata" -OutFile .\data\tessdata\eng.traineddata
-```
-
-Ardindan `.env` icinde:
-
-```ini
-TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
-TESSDATA_PREFIX=./data/tessdata
-TESSERACT_CONFIG=--psm 6 --oem 3
-```
-
-#### Gorsellerde kalite (JPG/PNG) — PDF’e yaklastirma
-
-Gorsellerde text-layer olmadigi icin kalite **OCR/VLM** basarisina baglidir. Bu proje gorsel ingestion’da
-PDF’e benzer “dual-quality” yaklasimi uygular:
-
-- **EXIF yon duzeltme**: Telefon fotosu / tarama goruntulerinde yan donuk sayfalar otomatik duzeltilir.
-- **Upscale + preprocess**: Kucuk/cozunurlugu dusuk goruntuler OCR icin kontrollu bicimde buyutulur; gri tonlama,
-  autocontrast, hafif sharpen ve konservatif threshold varyantlari denenir.
-- **En iyi adayi secme**: OCR (birden cok varyant) ve/veya VLM (extract-only) cikarimlari arasindan, baslik/structure
-  korunumu daha iyi olani otomatik secilir.
-
-> Not: En yuksek tablo/cok-kolon basarisi icin VLM (Gemini multimodal, extract-only) acik olmali (`VLM_MODE=force|auto`
-> ve `GEMINI_API_KEY`).
-
-### 3) API Anahtari
-
-`.env.example` dosyasini `.env` olarak kopyalayin ve asagidakileri doldurun:
+Mevcut stabil profil:
 
 ```ini
 LLM_PROVIDER=gemini
-GEMINI_API_KEY=your-api-key-here
-GEMINI_MODEL=gemini-2.0-flash
+GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_FALLBACK_MODEL=gemini-2.5-pro
+
+EMBEDDING_MODEL=gemini-embedding-001
+EMBEDDING_DIMENSION=3072
+
+VLM_PROVIDER=gemini
+VLM_MODE=force
+OCR_ENABLED=0
+
+VERTEX_ENABLED=1
+VERTEX_PROJECT_ID=your-gcp-project
+VERTEX_LOCATION=global
+VERTEX_REQUEST_TIMEOUT_MS=120000
+GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
 ```
 
-> Guvenlik: `GEMINI_API_KEY` degerini repo'ya commit etmeyin. Sadece lokal `.env`'de tutun.
+Bu profilin mantigi:
 
-#### Neden Gemini? (Online Mod)
+- generation: `gemini-3.1-pro-preview`
+- fallback: `gemini-2.5-pro`
+- embedding: `gemini-embedding-001` `3072d`
+- VLM extraction: Gemini, varsayilan olarak acik
+- klasik Tesseract OCR: kapali
 
-- Bu projede “online” varsayilan entegrasyon **Gemini** olarak secildi, cunku:
-  - **VLM (multimodal, extract-only)** ile tablo/cok-kolon gibi karmasik layout'larda metin cikarimi kalitesi belirgin artiyor (OCR tek basina yeterli olmayabiliyor).
-  - Kabul testleri/CI akisinda `GEMINI_API_KEY` varsa `eval_case_study.py` ile otomatik dogrulama yapilabiliyor.
-  - Tamamen yerel ihtiyac icin ayri bir yol da mevcut: `LLM_PROVIDER=local` / `VLM_PROVIDER=local` (Ollama).
+## Mimari
 
-#### (Opsiyonel) LLM'siz Calistirma (Extractive Mod)
-
-LLM API anahtari olmadan da sistemi kullanabilirsiniz. Bu modda cevaplar belgeden dogrudan alinti olarak dondurulur:
-
-```ini
-LLM_PROVIDER=none
+```text
+PDF/Image
+  -> Ingestion
+  -> Structure Detection
+  -> Hierarchical Chunking
+  -> Indexing (Chroma + BM25)
+  -> Retrieval (Hybrid + RRF + section fetch)
+  -> Generation (Gemini/OpenAI/Ollama/Extractive)
 ```
 
-> Bu modda sohbet (`/chat`) desteklenmez; sadece belge sorusu + extractive cevap uretilir.
+Ana teknik kararlar:
 
-### 4) (Opsiyonel) Tamamen Yerel / Offline Mod (Ollama)
+- `Hybrid retrieval`: exact keyword ve semantic intent birlikte yakalansin
+- `Hierarchical chunking`: belge baslik yapisi korunarak section-level retrieval yapilsin
+- `Section-list routing`: "nelerdir", "listele" gibi sorularda tum bolum getirilsin
+- `Guarded generation`: baglam disi cevap engellensin, citation zorunlu olsun
 
-Savunma sanayii ve air-gapped ortamlar icin tum pipeline disariya baglanti olmadan calisabilir.
-Bu modda LLM ve VLM olarak **Ollama** uzerinde calisan yerel modeller kullanilir.
+## Kurulum
 
-#### Kurulum
+### 1) Ortam
 
-1. [Ollama](https://ollama.com/download) indirin ve kurun.
-2. Gerekli modelleri cekin:
+Python `3.11+` onerilir.
 
 ```bash
-ollama pull qwen2.5:7b
-ollama pull llava:7b
+python -m venv .venv-gpu
+source .venv-gpu/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
 ```
 
-3. `.env` dosyasini ayarlayin:
+Not:
+
+- Varsayilan profil Gemini embedding kullandigi icin lokal GPU zorunlu degildir.
+- Lokal `sentence-transformers` embedding kullanacaksan `GPU_REQUIREMENTS.md` icindeki CUDA PyTorch adimini da uygula.
+
+### 2) Konfigurasyon
+
+Ornek dosyayi kopyala:
+
+```bash
+cp .env.example .env
+```
+
+#### Vertex AI ile calisma
+
+Onerilen yol budur.
+
+```ini
+LLM_PROVIDER=gemini
+GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_FALLBACK_MODEL=gemini-2.5-pro
+
+EMBEDDING_MODEL=gemini-embedding-001
+EMBEDDING_DIMENSION=3072
+
+VLM_PROVIDER=gemini
+VLM_MODE=force
+OCR_ENABLED=0
+
+VERTEX_ENABLED=1
+VERTEX_PROJECT_ID=your-gcp-project
+VERTEX_LOCATION=global
+VERTEX_REQUEST_TIMEOUT_MS=120000
+GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
+```
+
+Gerekli GCP adimlari:
+
+1. Vertex AI API'yi ac
+2. Billing aktif olsun
+3. Service account JSON olustur
+4. `GOOGLE_APPLICATION_CREDENTIALS` ile JSON dosyasini ver
+
+#### AI Studio ile calisma
+
+Vertex kullanmayacaksan:
+
+```ini
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=your-ai-studio-key
+GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_FALLBACK_MODEL=gemini-2.5-pro
+
+EMBEDDING_MODEL=gemini-embedding-001
+EMBEDDING_DIMENSION=3072
+
+VLM_PROVIDER=gemini
+VLM_MODE=force
+OCR_ENABLED=0
+
+VERTEX_ENABLED=0
+```
+
+Not:
+
+- Vertex env degiskenleri set ise AI Studio key ile `401 UNAUTHENTICATED` alirsin.
+- AI Studio ile calisacaksan `VERTEX_ENABLED=0` ve eski `GOOGLE_GENAI_USE_VERTEXAI` benzeri shell env'leri kapat.
+
+#### Tamamen lokal mod
 
 ```ini
 LLM_PROVIDER=local
 VLM_PROVIDER=local
-
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_LLM_MODEL=qwen2.5:7b
-OLLAMA_VLM_MODEL=llava:7b
-OLLAMA_TIMEOUT=120
+EMBEDDING_MODEL=auto
 ```
 
-4. Ollama'nin calistigini dogrulayin:
+Bu profil Ollama gerektirir. Ayrinti icin `chainlit.md` ve `.env.example`.
+
+## Calistirma
+
+Tek onerilen launch yolu:
 
 ```bash
-ollama list
+./run.sh
 ```
 
-#### Baska Bir Modelle Calistirma (OpenAI/Gemini Haric)
+Bu script:
 
-- Text LLM degistirmek icin:
-  - `ollama pull <model_adi>`
-  - `.env` icinde `OLLAMA_LLM_MODEL=<model_adi>` guncelleyin
-- Vision/VLM degistirmek icin:
-  - `ollama pull <vlm_model_adi>`
-  - `.env` icinde `OLLAMA_VLM_MODEL=<vlm_model_adi>` guncelleyin
-- Tamamen “key'siz” calisma:
-  - `LLM_PROVIDER=local` (veya LLM istemiyorsaniz `LLM_PROVIDER=none`)
-  - Dis API kullanmamak icin `VLM_MODE=off` (Gemini VLM extract-only kapali)
+- `.env` dosyasini yukler
+- `.venv-gpu/bin/python` kullanir
+- `scripts/preflight.py` calistirir
+- sonra Chainlit uygulamasini baslatir
 
-> **GPU Notu**: GTX 1660 Super (6 GB VRAM) ile `qwen2.5:7b` (Q4 quantize) ve `llava:7b` calistirilabilir.
-> Daha fazla VRAM'e sahip GPU'larda daha buyuk modeller (13B vb.) kullanilabilir.
->
-> **VRAM neden onemli?**
-> - Modelin GPU'ya sigip sigmayacagini belirler (ozellikle local LLM/VLM tarafinda).
-> - Daha uzun context ve daha stabil token hizlari icin VRAM baskisi kritik olur.
-> - VRAM yetersizse model CPU'ya offload olabilir; bu da latency'yi belirgin artirir.
->
-> **Neden kucuk local model secildi?**
-> - Referans yerel donanim (GTX 1660 SUPER, 6 GB VRAM) dusuk/orta seviye oldugu icin 7B sinifi (Q4) modeller secildi.
-> - Amac: Sistemin **tamamen offline** (dis API olmadan) calisabildigini pratikte gostermek.
->
-> **Buyuk acik modellerde (ornegin 100B+ sinifi, `gpt-oss-120b` gibi) quantization/OOM neden kritik?**
-> - Model agirliklari buyudukce VRAM/RAM ihtiyaci katlanir; pratikte quantization (Q4/Q5 vb.) olmadan lokal calistirmak zorlasir.
-> - OOM (out-of-memory) yalnizca agirliklardan degil, **context/KV cache** ve eszamanli istek sayisindan da kaynaklanabilir.
-> - OOM durumunda model ya calismaz ya da CPU offload'a dusup belirgin performans dususu yasatir.
->
-> **Onemli**: Local mod aktifken `GEMINI_API_KEY` zorunlu degildir. Embedding her zaman lokal SentenceTransformers ile yapilir.
->
-> **Performans & Mimari**:
-> - **Inference**: Yerel modda bellek verimliliği için **4-bit Quantization (GGUF/AWQ)**, **KV Cache** yönetimi ve **Batching** stratejilerini optimize eden motorlar (Ollama/llama.cpp) kullanılır.
-> - **Mimari**: **Decoder-only Transformer** (Llama/Qwen) modelleri ile **Encoder** (Embedding) modelleri hibrit çalışır.
->
-> **Mod farklari**:
-> | Ayar | Online (Gemini) | Local (Ollama) | Extractive (none) |
-> |------|-----------------|----------------|--------------------|
-> | LLM | Gemini API | Ollama LLM | Yok |
-> | VLM | Gemini API | Ollama VLM | Yok |
-> | Embedding | Lokal ST | Lokal ST | Lokal ST |
-> | Internet | Gerekli | Gerekli degil | Gerekli degil |
-> | Kalite | En yuksek | GPU'ya bagli | Extractive (basic) |
+Varsayilan adres:
 
-### 3.1) (Opsiyonel) VLM Ayarlari (Layout/Tablo icin)
+```text
+http://127.0.0.1:8000
+```
 
-Karmasik PDF layout'lari (tablo, cok kolon, CV vb.) icin sistem sayfa goruntusunden **extract-only**
-metin cikarmak uzere VLM (Gemini multimodal) kullanabilir.
+Host ve port override:
 
-Varsayilan davranis UI ile uyumludur: `VLM_MODE=force` ve `VLM_MAX_PAGES=25` (env ile override edilebilir).
-Isterseniz `.env` icinde degistirebilirsiniz:
+```bash
+HOST=0.0.0.0 PORT=8001 ./run.sh
+```
+
+Preflight'i tek basina calistirmak icin:
+
+```bash
+.venv-gpu/bin/python scripts/preflight.py
+```
+
+Preflight su kontrolleri yapar:
+
+- auth / client kurulumu
+- generation modeli erisilebilir mi
+- embedding cagrisi calisiyor mu
+- VLM extraction cagrisi donuyor mu
+
+## UI ve Demo Notlari
+
+Chainlit UI runtime ayarlari sunar:
+
+- `Embedding Model`
+- `Embedding Device`
+- `VLM Mode`
+- `VLM Provider`
+- `VLM Max Pages`
+
+Ancak demo sirasinda bunlari degistirmemen tavsiye edilir. Ozellikle:
+
+- embedding model degisirse indeks yeniden olusturulur
+- VLM ayarlari yeni yuklemelerde fark yaratir
+- provider degisikligi, state'i karmasiklastirir
+
+Mülakat icin en guvenli yol: `.env` ile sabit profil + `./run.sh`.
+
+## OCR, VLM ve GPU
+
+### OCR
+
+- `OCR_ENABLED=0`: klasik Tesseract kapali
+- `OCR_ENABLED=1`: Tesseract ek extraction adayi olarak devreye girer
+
+Tesseract gerekiyorsa:
+
+- `TESSERACT_CMD`
+- `TESSDATA_PREFIX`
+- `TESSERACT_CONFIG`
+
+ayarlarini `.env` icinde ver.
+
+### VLM
+
+Varsayilan demo profilinde:
 
 ```ini
-VLM_MODE=off
-VLM_MAX_PAGES=50
+VLM_PROVIDER=gemini
+VLM_MODE=force
 ```
 
-### 3.2) Dosya Isleme Suresi Neden Yuksek Olabilir?
+Bu, gorsel/PDF extraction sirasinda Gemini VLM'in zorlanarak kullanilmasi anlamina gelir.
 
-Bu projede ingestion tarafi bilincli olarak **kalite-oncelikli** tasarlanmistir. Bu nedenle bazi profillerde
-ilk yukleme suresi yuksek olabilir.
+### GPU
 
-- **Ana maliyet kalemleri**
-  - Sayfa bazli OCR + (opsiyonel) VLM extract cagrilari (ozellikle `VLM_MODE=force` iken)
-  - OCR/VLM adaylari arasinda dual-quality secimi (yapi/heading korunumu daha iyi olani secme)
-  - Chunk embedding (ilk calistirmada model indirme + embedding hesaplama)
-- **GPU beklentisi**
-  - GPU bu projede sadece embedding tarafini hizlandirir.
-  - Gemini/OpenAI LLM API (ve Gemini VLM API) uzak servis oldugu icin GPU ile hizlanmaz.
+GPU kullanimi profile gore degisir:
 
-#### Bu projede kalite icin verilen tradeoff'lar
+- Gemini generation / Gemini embedding / Gemini VLM: uzak servis, lokal GPU kullanmaz
+- Lokal `sentence-transformers` embedding: lokal GPU kullanabilir
+- Ollama local LLM/VLM: kendi surecinde GPU kullanabilir
 
-- `VLM_MODE=force`: Layout/tablo kalite kazanimi icin latency ve API maliyeti artisini kabul eder.
-- Dual-quality secim (PDF/OCR/VLM): Tek yol yerine en iyi metin/yapi secildigi icin kalite artar, sure uzar.
-- Deterministic section-list + coverage guard: Cevap kalitesi ve eksiksizlik icin generation tarafinda ek kontrol uygulanir.
+Detayli notlar icin `GPU_REQUIREMENTS.md`.
 
-#### Hizlandirmak icin onerilen profil (kaliteyi makul koruyarak)
+## Test ve Dogrulama
 
-```ini
-VLM_MODE=auto
-VLM_MAX_PAGES=10
-EMBEDDING_DEVICE=auto
-```
-
-- `VLM_MODE=auto`: VLM sadece dusuk kalite text sayfalarinda devreye girer.
-- `VLM_MAX_PAGES`: VLM cagrilarini sinirlayarak ilk index suresini dusurur.
-- `EMBEDDING_DEVICE=auto`: CUDA varsa embedding'i GPU'ya alir.
-
-#### Notlar
-
-- Ayni dosya ayni ayarlarla ayni oturumda tekrar yuklenirse reprocess skip edilir (hizli aktif belge secimi).
-- Incremental indexing sayesinde yeni belge eklenince onceki belgeler tekrar embed edilmez.
-
-### 4) Uygulamayi Baslatin
+Onerilen siralama:
 
 ```bash
-python -m chainlit run app.py -w
+.venv-gpu/bin/python scripts/baseline_gate.py
+.venv-gpu/bin/python scripts/lang_gate.py
+.venv-gpu/bin/python scripts/eval_retrieval.py --pdf test_data/Case_Study_20260205.pdf
+.venv-gpu/bin/python scripts/eval_case_study.py --pdf test_data/Case_Study_20260205.pdf
 ```
 
-Tarayicida `http://localhost:8000` adresini acin.
-
-**Not:** Uygulama acilir acilmaz direkt yazabilirsiniz (belge yuklemek zorunlu degil).
-
-- Belge yuklemek icin PDF/PNG/JPG dosyasini **surukleyip birakabilir** veya **paperclip** ikonuyla yukleyebilirsiniz.
-- Belge olmadan sohbet icin: `/chat`
-- Belge sorulari icin: `/doc`
-- Birden fazla belge varsa aktif belge secmek icin: `/use <dosya>`
-- Ayni dosyayi (icerik ayni) **ayni oturumda** tekrar yuklerseniz sistem yeniden OCR/VLM + embedding yapmaz; sadece dokumani aktif hale getirir (hizli). Dosya degisirse veya OCR/VLM ayarlari degisirse yeniden islenir.
-
-### UI (Chainlit)
-
-- UI Chainlit tabanlidir ve `.chainlit/config.toml` ile ozellestirilir (tema/logo/custom JS).
-- `custom_css` ile `public/stylesheet.css` yuklenir; arayuz vurgusu mavi yerine daha koyu/teal tona alinmistir.
-- Sol tarafta (desktop genislikte) tarayici `localStorage` icinde tutulan mini **Gecmis Sohbetler** paneli vardir (`public/history_sidebar.js`).
-  - Bu panel sadece arayuz kolayligidir; sunucu tarafinda DB/persistence yapmaz.
-  - Bir sohbeti tiklayinca istemci, Chainlit'e `/open_thread <id>` komutunu gondererek o thread'in hafizadan yeniden oynatilmasini ister.
-- Sagdaki **Belge Durumu** panelinde su bilgiler anlik gosterilir:
-  - `Mod`, `LLM`
-  - `Embedding` (model + device)
-  - `VLM` (provider + mode + max pages)
-  - `Aktif Belge`, `Yuklu Belgeler`
-- Sol ustteki profil secicisinden LLM profili degistirilebilir: `Gemini` / `OpenAI` / `Local (Ollama)` / `Extractive (LLM yok)`.
-  - Profil secimi RAG mimarisini degistirmez; sadece `llm_provider` secimini degistirir (retrieval/indeksleme ayni kalir).
-- Chat ayar panelinden runtime kontrol:
-  - `Embedding Model`: `auto`, `intfloat/multilingual-e5-small`, `intfloat/multilingual-e5-base`
-  - `Embedding Device`: `auto`, `cpu`, `cuda`
-  - `VLM Mode`: `off`, `auto`, `force`
-  - `VLM Provider`: `gemini`, `local`
-  - `VLM Max Pages`: `0-200`
-- Runtime ayar etkisi:
-  - Embedding model/device degisirse yuklu chunk'lar icin index yeniden kurulur.
-  - VLM ayarlari bir sonraki dosya yuklemelerinde uygulanir.
-- UI tarafinda dogal scrollbar gostergeleri gizlenmistir (gorunumu sade tutmak icin).
-
-### Mod Davranisi (Kisa)
-
-- **Doc modu**: Belge sorularinda sadece belgelerden cevap verir; baglam yoksa “Belgede bu bilgi bulunamadı.” der.
-- **Chat modu**: Genel sohbet (belgeye dayali iddia uretmez).
-- Doc moddayken **kisa small-talk** (selam, tesekkur, “ben nasilim”, “aferin” vb.) otomatik sohbet cevabi alabilir.
-
-## Kabul Testi (Case Study)
-
-Case study dokumani icin katı kabul kriterlerini otomatik kontrol etmek icin:
+Hizli smoke:
 
 ```bash
-python scripts/eval_case_study.py --pdf Case_Study_20260205.pdf
+.venv-gpu/bin/python scripts/smoke_suite.py test_data/Case_Study_20260205.pdf
 ```
 
-### LLM gerektirmeyen hizli regresyon (onerilen)
+Tum test notlari icin `TESTING.md`.
 
-LLM anahtari olmadan, sentetik PDF’ler uzerinden core pipeline’i (ingestion/structure/indexing/retrieval)
-kontrol etmek icin:
+## CI
+
+Workflow: `.github/workflows/ci.yml`
+
+- `baseline_gate.py`
+- `lang_gate.py`
+- `eval_case_study.py` `GEMINI_API_KEY` veya uygun Gemini auth varsa opsiyonel
+
+## Troubleshooting
+
+### 401 UNAUTHENTICATED
+
+Tipik neden: AI Studio API key ile Vertex endpoint'ine gitmek.
+
+Kontrol et:
+
+- `VERTEX_ENABLED`
+- `GOOGLE_APPLICATION_CREDENTIALS`
+- shell icindeki eski `GOOGLE_GENAI_USE_VERTEXAI`
+
+AI Studio kullanacaksan Vertex'i kapat. Vertex kullanacaksan service account ile devam et.
+
+### 404 NOT_FOUND / model bulunamadi
+
+Tipik nedenler:
+
+- model ilgili proje/hesap icin acik degil
+- yanlis region
+- preview model erisimi yok
+
+Oneri:
+
+- `VERTEX_LOCATION=global`
+- primary: `gemini-3.1-pro-preview`
+- fallback: `gemini-2.5-pro`
+
+### Port 8000 dolu
+
+Farkli portla baslat:
 
 ```bash
-python scripts/baseline_gate.py
+PORT=8001 ./run.sh
 ```
 
-### Retrieval kalite metrikleri (LLM-free)
+### Belge yuklendi ama indeks olusmadi
 
-25 soruluk eval set uzerinde intent accuracy, section hit, evidence recall olcumu:
+Kontrol et:
 
-```bash
-python scripts/eval_retrieval.py --pdf Case_Study_20260205.pdf
-```
+- extraction bossa VLM/OCR gerekli olabilir
+- `VLM_MAX_PAGES` limiti dusuk olabilir
+- taranmis PDF ise `OCR_ENABLED=1` ve Tesseract kurulu mu bak
 
-Son calistirma sonuclari (guncel kosu):
+### Lokal GPU gorunuyor ama hizlanma yok
 
-```
-Intent Accuracy : 25/25 (100%)
-Heading Hit     : 15/15 (100%)
-Section Hit     : 6/6  (100%)
-Evidence Met    : 25/25 (100%)
-Avg Latency     : 19 ms
-```
-
-### Halusinasyon Testi (Gemini gerekir)
-
-25 soruluk (10 pozitif + 15 negatif) kapsamli halusinasyon ve sadakat testi:
-
-```bash
-python scripts/hallucination_test.py --pdf test_data/Case_Study_20260205.pdf
-```
-
-Son calistirma sonuclari (2026-02-11, Faz 9 — confidence guard sonrasi):
-
-| Metrik | Deger |
-|--------|-------|
-| Pozitif dogru yanit | 10/10 (100%) |
-| Negatif dogru red | **15/15 (100%)** |
-| Halusinasyon orani | **0/15 (0%)** |
-| Citation uyumu | 10/10 (100%) |
-
-### (Opsiyonel) Test klasoru + loglama (onerilen)
-
-Birden fazla PDF ile hizli denemek icin `test_data/` altina PDF’leri koyup:
-
-```bash
-python scripts/folder_suite.py --dir test_data --mode retrieval --isolate 1 --max_pdfs 1
-```
-
-LLM cevaplari + soru/cevap loglari icin (Gemini gerekir):
-
-```bash
-python scripts/folder_suite.py --dir test_data --mode ask --isolate 1 --max_pdfs 1
-```
-
-Soru/cevap loglarini acmak icin `.env` icine:
-
-```ini
-RAG_LOG=1
-RAG_LOG_DIR=./data/logs
-```
-
-Loglar JSONL formatinda yazilir:
-- `data/logs/rag_<YYYYMMDD>_session_<id>.jsonl`
-- `data/logs/by_doc/<dosya>.jsonl`
-
-> Not: `--isolate 1` her PDF’i ayri indeksledigi icin (coklu PDF’de) daha hizli ve daha “deterministik” test verir.
-> Ilk calistirmada embedding modeli indirilecegi icin sure uzayabilir.
-
-### Troubleshooting (Windows)
-
-- **Chainlit "config.toml outdated" hatasi**:
-  - Hata ornegi: `ValueError: ... .chainlit/config.toml is outdated`
-  - Cozum: `.chainlit/config.toml` dosyasini silin ve `python -m chainlit run app.py` ile yeniden baslatin (Chainlit dosyayi yeniden uretir). Sonra gerekiyorsa UI ozellestirmelerini tekrar uygulayin.
-- **Port 8000 zaten kullanimda / tab kapandi ama process durmadi**:
-  - Hızlı cozum: farkli portla baslatin:
-
-    ```bash
-    python -m chainlit run app.py -w --port 8001
-    ```
-
-  - Gelistirme kolayligi (onerilen): tab/connection kapaninca process’in otomatik cikmasi icin `.env` icine ekleyin:
-
-    ```ini
-    AUTO_EXIT_ON_NO_CLIENTS=1
-    AUTO_EXIT_GRACE_SECONDS=8
-    ```
-
-- **HuggingFace symlink uyarisi**: Embedding modeli ilk calistirmada indirilebilir ve Windows’ta symlink desteklenmiyorsa uyarı gorebilirsiniz. Developer Mode acmak veya admin olarak calistirmak uyarıyı azaltır; islevsel olarak calismaya devam eder.
-- **Model 404 / NOT_FOUND**: `GEMINI_MODEL` hesabinizda aktif degilse `.env` icinde `gemini-2.0-flash` gibi daha yaygin bir modele gecin.
-- **`Collection expecting embedding with dimension of 384, got 768`**: Daha once baska bir embedding modeliyle olusturulmus kalici Chroma index'i kullaniyorsunuz (orn. e5-small=384 → e5-base=768). Cozum:
-  - `CHROMA_DIR`'i yeni/bos bir klasore alin (ornegin `CHROMA_DIR=./data/chroma_768`) ve yeniden indeksleyin, veya
-  - `data/chroma/` klasorunu temizleyip yeniden build edin.
+Bu normal olabilir. Varsayilan profil uzak Gemini embedding kullaniyor. Lokal GPU sadece lokal embedding/Ollama yolunda fark yaratir.
 
 ## Proje Yapisi
 
-```
-.
-├── app.py                      # Chainlit UI
-├── chainlit.md                 # UI acilis ekrani
-├── .env.example                # Ornek konfigrasyon
-├── requirements.txt            # Python bagimliliklari
-├── GPU_REQUIREMENTS.md         # (Opsiyonel) GPU kurulum ve dogrulama
-├── DEVLOG.md                   # Gelistirme sureci kaydi
-├── TESTING.md                  # Test senaryolari ve sonuclari
-├── public/                     # UI tema/logo/custom JS (Chainlit static)
-├── src/
-│   ├── config.py               # Ortam degiskenleri yukleyici
-│   └── core/
-│       ├── models.py           # Veri modelleri (PageText, Chunk, ...)
-│       ├── utils.py            # Yardimci fonksiyonlar (sha256, normalize)
-│       ├── ingestion.py        # PDF/image okuma + OCR
-│       ├── structure.py        # Heading detection + section tree + chunking
-│       ├── embedding.py        # SentenceTransformer wrapper
-│       ├── eventlog.py         # (Opsiyonel) JSONL event logging (env ile acilir)
-│       ├── vectorstore.py      # ChromaDB persistent store
-│       ├── sparse.py           # BM25 sparse index (kalici, disk'e kaydedilir)
-│       ├── hybrid.py           # RRF fusion
-│       ├── indexing.py         # LocalIndex (Chroma + BM25)
-│       ├── retrieval.py        # Query routing + section fetch + coverage
-│       ├── generation.py       # Gemini LLM + guardrails + citation + extractive QA
-│       └── pipeline.py         # RAGPipeline (tum adimlari birlestirir)
-├── scripts/
-│   ├── extract_text.py         # CLI: metin cikarma testi
-│   ├── preview_structure.py    # CLI: section tree goruntuleme
-│   ├── build_index.py          # CLI: index olusturma
-│   ├── search_index.py         # CLI: hybrid search testi
-│   ├── baseline_gate.py        # LLM-free core RAG gate (sentetik PDF)
-│   ├── lang_gate.py            # LLM-free dil secimi gate
-│   ├── eval_retrieval.py       # LLM-free retrieval kalite metrikleri
-│   ├── folder_suite.py         # Klasordeki PDF'leri toplu test + opsiyonel log
-│   ├── smoke_suite.py          # Multi-doc izolasyon smoke testleri
-│   ├── eval_case_study.py      # Case Study kabul kapisi (Gemini gerekir)
-│   ├── hallucination_test.py   # Halusinasyon & sadakat testi (25 soru, Gemini gerekir)
-│   ├── test_retrieval.py       # CLI: retrieval pipeline testi
-│   └── test_generation.py      # CLI: uctan uca generation testi
-├── test_data/
-│   └── eval_questions.json     # 25 soruluk retrieval eval seti
-├── .github/
+```text
+app.py
+run.sh
+requirements.txt
+README.md
+TESTING.md
+GPU_REQUIREMENTS.md
+chainlit.md
+.env.example
 
-### Mod Davranisi (Kisa)
+scripts/
+  baseline_gate.py
+  eval_case_study.py
+  eval_retrieval.py
+  hallucination_test.py
+  preflight.py
+  smoke_suite.py
 
-- **Doc modu**: Belge sorularinda sadece belgelerden cevap verir; baglam yoksa “Belgede bu bilgi bulunamadı.” der.
-- **Chat modu**: Genel sohbet (belgeye dayali iddia uretmez).
-- Doc moddayken **kisa small-talk** (selam, tesekkur, “ben nasilim”, “aferin” vb.) otomatik sohbet cevabi alabilir.
-
-## Kabul Testi (Case Study)
-
-Case study dokumani icin katı kabul kriterlerini otomatik kontrol etmek icin:
-
-```bash
-python scripts/eval_case_study.py --pdf Case_Study_20260205.pdf
+src/
+  config.py
+  core/
+    embedding.py
+    gemini_client.py
+    generation.py
+    indexing.py
+    ingestion.py
+    pipeline.py
+    retrieval.py
+    structure.py
+    vlm_extract.py
 ```
 
-### LLM gerektirmeyen hizli regresyon (onerilen)
+## Not
 
-LLM anahtari olmadan, sentetik PDF’ler uzerinden core pipeline’i (ingestion/structure/indexing/retrieval)
-kontrol etmek icin:
-
-```bash
-python scripts/baseline_gate.py
-```
-
-### Retrieval kalite metrikleri (LLM-free)
-
-25 soruluk eval set uzerinde intent accuracy, section hit, evidence recall olcumu:
-
-```bash
-python scripts/eval_retrieval.py --pdf Case_Study_20260205.pdf
-```
-
-Son calistirma sonuclari (guncel kosu):
-
-```
-Intent Accuracy : 25/25 (100%)
-Heading Hit     : 15/15 (100%)
-Section Hit     : 6/6  (100%)
-Evidence Met    : 25/25 (100%)
-Avg Latency     : 19 ms
-```
-
-### Halusinasyon Testi (Gemini gerekir)
-
-25 soruluk (10 pozitif + 15 negatif) kapsamli halusinasyon ve sadakat testi:
-
-```bash
-python scripts/hallucination_test.py --pdf test_data/Case_Study_20260205.pdf
-```
-
-Son calistirma sonuclari (2026-02-11, Faz 9 — confidence guard sonrasi):
-
-| Metrik | Deger |
-|--------|-------|
-| Pozitif dogru yanit | 10/10 (100%) |
-| Negatif dogru red | **15/15 (100%)** |
-| Halusinasyon orani | **0/15 (0%)** |
-| Citation uyumu | 10/10 (100%) |
-
-### (Opsiyonel) Test klasoru + loglama (onerilen)
-
-Birden fazla PDF ile hizli denemek icin `test_data/` altina PDF’leri koyup:
-
-```bash
-python scripts/folder_suite.py --dir test_data --mode retrieval --isolate 1 --max_pdfs 1
-```
-
-LLM cevaplari + soru/cevap loglari icin (Gemini gerekir):
-
-```bash
-python scripts/folder_suite.py --dir test_data --mode ask --isolate 1 --max_pdfs 1
-```
-
-Soru/cevap loglarini acmak icin `.env` icine:
-
-```ini
-RAG_LOG=1
-RAG_LOG_DIR=./data/logs
-```
-
-Loglar JSONL formatinda yazilir:
-- `data/logs/rag_<YYYYMMDD>_session_<id>.jsonl`
-- `data/logs/by_doc/<dosya>.jsonl`
-
-> Not: `--isolate 1` her PDF’i ayri indeksledigi icin (coklu PDF’de) daha hizli ve daha “deterministik” test verir.
-> Ilk calistirmada embedding modeli indirilecegi icin sure uzayabilir.
-
-### Troubleshooting (Windows)
-
-- **Chainlit "config.toml outdated" hatasi**:
-  - Hata ornegi: `ValueError: ... .chainlit/config.toml is outdated`
-  - Cozum: `.chainlit/config.toml` dosyasini silin ve `python -m chainlit run app.py` ile yeniden baslatin (Chainlit dosyayi yeniden uretir). Sonra gerekiyorsa UI ozellestirmelerini tekrar uygulayin.
-- **Port 8000 zaten kullanimda / tab kapandi ama process durmadi**:
-  - Hızlı cozum: farkli portla baslatin:
-
-    ```bash
-    python -m chainlit run app.py -w --port 8001
-    ```
-
-  - Gelistirme kolayligi (onerilen): tab/connection kapaninca process’in otomatik cikmasi icin `.env` icine ekleyin:
-
-    ```ini
-    AUTO_EXIT_ON_NO_CLIENTS=1
-    AUTO_EXIT_GRACE_SECONDS=8
-    ```
-
-- **HuggingFace symlink uyarisi**: Embedding modeli ilk calistirmada indirilebilir ve Windows’ta symlink desteklenmiyorsa uyarı gorebilirsiniz. Developer Mode acmak veya admin olarak calistirmak uyarıyı azaltır; islevsel olarak calismaya devam eder.
-- **Model 404 / NOT_FOUND**: `GEMINI_MODEL` hesabinizda aktif degilse `.env` icinde `gemini-2.0-flash` gibi daha yaygin bir modele gecin.
-- **`Collection expecting embedding with dimension of 384, got 768`**: Daha once baska bir embedding modeliyle olusturulmus kalici Chroma index'i kullaniyorsunuz (orn. e5-small=384 → e5-base=768). Cozum:
-  - `CHROMA_DIR`'i yeni/bos bir klasore alin (ornegin `CHROMA_DIR=./data/chroma_768`) ve yeniden indeksleyin, veya
-  - `data/chroma/` klasorunu temizleyip yeniden build edin.
-
-## Proje Yapisi
-
-```
-.
-├── app.py                      # Chainlit UI
-├── chainlit.md                 # UI acilis ekrani
-├── .env.example                # Ornek konfigrasyon
-├── requirements.txt            # Python bagimliliklari
-├── GPU_REQUIREMENTS.md         # (Opsiyonel) GPU kurulum ve dogrulama
-├── DEVLOG.md                   # Gelistirme sureci kaydi
-├── TESTING.md                  # Test senaryolari ve sonuclari
-├── public/                     # UI tema/logo/custom JS (Chainlit static)
-├── src/
-│   ├── config.py               # Ortam degiskenleri yukleyici
-│   └── core/
-│       ├── models.py           # Veri modelleri (PageText, Chunk, ...)
-│       ├── utils.py            # Yardimci fonksiyonlar (sha256, normalize)
-│       ├── ingestion.py        # PDF/image okuma + OCR
-│       ├── structure.py        # Heading detection + section tree + chunking
-│       ├── embedding.py        # SentenceTransformer wrapper
-│       ├── eventlog.py         # (Opsiyonel) JSONL event logging (env ile acilir)
-│       ├── vectorstore.py      # ChromaDB persistent store
-│       ├── sparse.py           # BM25 sparse index (kalici, disk'e kaydedilir)
-│       ├── hybrid.py           # RRF fusion
-│       ├── indexing.py         # LocalIndex (Chroma + BM25)
-│       ├── retrieval.py        # Query routing + section fetch + coverage
-│       ├── generation.py       # Gemini LLM + guardrails + citation + extractive QA
-│       └── pipeline.py         # RAGPipeline (tum adimlari birlestirir)
-├── scripts/
-│   ├── extract_text.py         # CLI: metin cikarma testi
-│   ├── preview_structure.py    # CLI: section tree goruntuleme
-│   ├── build_index.py          # CLI: index olusturma
-│   ├── search_index.py         # CLI: hybrid search testi
-│   ├── baseline_gate.py        # LLM-free core RAG gate (sentetik PDF)
-│   ├── lang_gate.py            # LLM-free dil secimi gate
-│   ├── eval_retrieval.py       # LLM-free retrieval kalite metrikleri
-│   ├── folder_suite.py         # Klasordeki PDF'leri toplu test + opsiyonel log
-│   ├── smoke_suite.py          # Multi-doc izolasyon smoke testleri
-│   ├── eval_case_study.py      # Case Study kabul kapisi (Gemini gerekir)
-│   ├── hallucination_test.py   # Halusinasyon & sadakat testi (25 soru, Gemini gerekir)
-│   ├── test_retrieval.py       # CLI: retrieval pipeline testi
-│   └── test_generation.py      # CLI: uctan uca generation testi
-├── test_data/
-│   └── eval_questions.json     # 25 soruluk retrieval eval seti
-├── .github/
-│   └── workflows/ci.yml        # GitHub Actions CI (baseline + opsiyonel Gemini eval)
-└── data/
-    └── chroma/                 # ChromaDB + BM25 kalici depolama
-```
+Bu repo halen case-study / MVP karakterinde. Guclu taraflari retrieval tasarimi, kaynakli cevap ve coklu calisma modlari. Uretim ortamina tasinacaksa auth, tenancy, observability ve cost control taraflari ayrica sertlestirilmelidir.
