@@ -9,6 +9,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 import json
@@ -41,6 +42,15 @@ def _openai_retryable(e: Exception) -> bool:
     )
 
 
+def _openai_chat_url() -> str:
+    base_url = (os.getenv("OPENAI_BASE_URL", "") or "").strip().rstrip("/")
+    if not base_url:
+        return "https://api.openai.com/v1/chat/completions"
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    return f"{base_url}/chat/completions"
+
+
 def _openai_chat_completion(
     api_key: str,
     model: str,
@@ -52,7 +62,7 @@ def _openai_chat_completion(
     """
     Minimal OpenAI Chat Completions call via stdlib urllib (no extra dependency).
     """
-    url = "https://api.openai.com/v1/chat/completions"
+    url = _openai_chat_url()
     payload = {
         "model": model,
         "messages": [
@@ -100,7 +110,7 @@ def _openai_chat_completion_stream(
     OpenAI streaming call (SSE data lines) with token callback.
     Returns full accumulated answer text.
     """
-    url = "https://api.openai.com/v1/chat/completions"
+    url = _openai_chat_url()
     payload = {
         "model": model,
         "messages": [

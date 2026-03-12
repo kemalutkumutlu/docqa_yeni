@@ -23,6 +23,7 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 DEBUG="${DEBUG:-0}"
 RUN_PREFLIGHT="${RUN_PREFLIGHT:-1}"
+OLLAMA_AUTO_START="${OLLAMA_AUTO_START:-1}"
 
 case "${DEBUG,,}" in
   1|0|true|false|yes|no|on|off|y|n|t|f|"")
@@ -33,6 +34,23 @@ case "${DEBUG,,}" in
 esac
 
 mkdir -p "${DATA_DIR:-$PROJECT_ROOT/data}"
+
+if [[ "$OLLAMA_AUTO_START" == "1" ]] && command -v ollama >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  if ! curl -fsS "http://127.0.0.1:11434/api/tags" >/dev/null 2>&1; then
+    echo "[run.sh] starting ollama..."
+    if command -v setsid >/dev/null 2>&1; then
+      setsid ollama serve > "${DATA_DIR:-$PROJECT_ROOT/data}/ollama.log" 2>&1 < /dev/null &
+    else
+      nohup ollama serve > "${DATA_DIR:-$PROJECT_ROOT/data}/ollama.log" 2>&1 < /dev/null &
+    fi
+    for _ in {1..30}; do
+      if curl -fsS "http://127.0.0.1:11434/api/tags" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+  fi
+fi
 
 if [[ "$RUN_PREFLIGHT" == "1" ]]; then
   echo "[run.sh] running preflight..."

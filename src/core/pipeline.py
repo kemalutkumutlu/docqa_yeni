@@ -29,6 +29,7 @@ from .generation import (
     generate_chat_answer_local,
     generate_extractive_answer,
 )
+from .doc_cache import CachedDocument, DocumentCache
 from .local_llm import OllamaConfig
 from .eventlog import JsonlEventLogger
 from .indexing import LocalIndex
@@ -38,6 +39,7 @@ from .models import Chunk
 from .retrieval import RetrievalResult, retrieve, classify_query
 from .structure import build_section_tree, section_tree_to_chunks
 from .utils import sha256_file
+from .vectorstore import ChromaStore
 
 
 @dataclass
@@ -49,6 +51,8 @@ class DocumentState:
     page_count: int
     warnings: List[str]
     build_fingerprint: str = ""
+    collection_name: str = ""
+    restored_from_cache: bool = False
 
 
 @dataclass
@@ -85,6 +89,48 @@ class RAGPipeline:
             return self._logger
         self._logger = JsonlEventLogger.from_env()
         return self._logger
+
+    def _doc_cache(self) -> DocumentCache:
+        return DocumentCache(self.chroma_dir.parent / "doc_cache")
+
+    def _persisted_doc_available(self, state: CachedDocument | DocumentState) -> bool:
+        if not state.chunks:
+            return True
+        probe_chunk_id = state.chunks[0].chunk_id
+        store = ChromaStore(
+            persist_dir=str(self.chroma_dir),
+            collection_name=state.collection_name or "chunks",
+        )
+        try:
+            existing = store.get([probe_chunk_id])
+        except Exception:
+            return False
+        ids = existing.get("ids") or []
+        return probe_chunk_id in ids
+
+    def _hydrate_index_from_persisted(self) -> None:
+        if not self._all_chunks:
+            self._index = None
+            return
+        collection_name = next(
+            (
+                st.collection_name
+                for st in self._documents.values()
+                if st.chunks and st.collection_name
+            ),
+            next(
+                (st.collection_name for st in self._documents.values() if st.collection_name),
+                "chunks",
+            ),
+        )
+        self._index = LocalIndex.from_persisted(
+            chroma_dir=self.chroma_dir,
+            embedding_model=self.embedding_model,
+            embedding_device=self.embedding_device,
+            allowed_doc_ids=set(self._documents.keys()),
+            collection_name=collection_name,
+            chunks=self._all_chunks,
+        )
 
     @property
     def session_id(self) -> str:
@@ -154,6 +200,27 @@ class RAGPipeline:
             _progress("Ayni belge bulundu, yeniden isleme atlandi.")
             return existing
 
+        cached = self._doc_cache().load(doc_id, fp)
+        if cached and self._persisted_doc_available(cached):
+            _progress("Ayni belge icin kalici cache bulundu, yeniden isleme atlandi.")
+            state = DocumentState(
+                doc_id=cached.doc_id,
+                file_name=cached.file_name,
+                chunks=cached.chunks,
+                page_count=cached.page_count,
+                warnings=cached.warnings,
+                build_fingerprint=cached.build_fingerprint,
+                collection_name=cached.collection_name,
+                restored_from_cache=True,
+            )
+            self._documents[state.doc_id] = state
+            self._active_doc_id = state.doc_id
+            self._all_chunks = []
+            for doc_state in self._documents.values():
+                self._all_chunks.extend(doc_state.chunks)
+            self._hydrate_index_from_persisted()
+            return state
+
         _progress("Metin cikarma basladi (PDF/OCR/VLM)...")
         ingest = ingest_any(
             file_path,
@@ -189,6 +256,16 @@ class RAGPipeline:
                 "Bu belgeden metin/bolum cikarilamadi (bos veya OCR gerektiriyor olabilir)."
             ]
             self._index = None
+            state.collection_name = "chunks"
+            self._doc_cache().save(
+                doc_id=state.doc_id,
+                file_name=state.file_name,
+                page_count=state.page_count,
+                warnings=state.warnings,
+                build_fingerprint=state.build_fingerprint,
+                collection_name=state.collection_name,
+                chunks=state.chunks,
+            )
             _progress("Belgeden indekslenebilir metin cikmadi.")
             lg = self._get_logger()
             if lg:
@@ -219,8 +296,19 @@ class RAGPipeline:
                 embedding_model=self.embedding_model,
                 embedding_device=self.embedding_device,
             )
+        state.collection_name = self._index.store.collection_name if self._index else "chunks"
         _index_ms = (time.perf_counter() - _t0) * 1000
         _progress("Belge isleme tamamlandi.")
+
+        self._doc_cache().save(
+            doc_id=state.doc_id,
+            file_name=state.file_name,
+            page_count=state.page_count,
+            warnings=state.warnings,
+            build_fingerprint=state.build_fingerprint,
+            collection_name=state.collection_name,
+            chunks=state.chunks,
+        )
 
         lg = self._get_logger()
         if lg:

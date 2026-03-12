@@ -80,6 +80,34 @@ class LocalIndex:
             bm25.save(idx.bm25_path)
         return idx
 
+    @classmethod
+    def from_persisted(
+        cls,
+        *,
+        chroma_dir: Path,
+        embedding_model: str,
+        embedding_device: str = "auto",
+        allowed_doc_ids: Set[str],
+        collection_name: str = "chunks",
+        chunks: Optional[List[Chunk]] = None,
+    ) -> "LocalIndex":
+        embedder = Embedder(model_name=embedding_model, device=embedding_device)  # type: ignore[arg-type]
+        store = ChromaStore(persist_dir=str(chroma_dir), collection_name=collection_name)
+        bm25_path = Path(chroma_dir) / "bm25_index.pkl"
+        if bm25_path.exists():
+            bm25 = BM25Index.load(str(bm25_path))
+        else:
+            bm25 = BM25Index.build(chunks or [])
+            if chunks:
+                bm25.save(str(bm25_path))
+        return cls(
+            embedder=embedder,
+            store=store,
+            bm25=bm25,
+            allowed_doc_ids=set(allowed_doc_ids),
+            chroma_dir=str(chroma_dir),
+        )
+
     def add_chunks(self, new_chunks: List[Chunk]) -> None:
         """
         Incrementally add chunks from a new document WITHOUT re-embedding
@@ -149,7 +177,12 @@ class LocalIndex:
         return {"$or": [{"doc_id": did} for did in sorted(doc_ids)]}
 
     def sparse_search(self, query: str, top_k: int, *, doc_ids: Optional[Set[str]] = None) -> List[str]:
-        return [cid for cid, _ in self.bm25.search(query, top_k=top_k, doc_ids=doc_ids)]
+        allowed = set(self.allowed_doc_ids)
+        if doc_ids is None:
+            doc_ids_use = allowed
+        else:
+            doc_ids_use = allowed & set(doc_ids)
+        return [cid for cid, _ in self.bm25.search(query, top_k=top_k, doc_ids=doc_ids_use)]
 
     def hybrid_search(
         self,

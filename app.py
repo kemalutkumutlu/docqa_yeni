@@ -695,6 +695,8 @@ async def _process_uploaded_file(file_path: str, file_name: str) -> str:
             f"- Chunk sayisi: {len(state.chunks)}",
             f"- Toplam indekslenen chunk: {pipeline.total_chunks}",
         ]
+        if state.restored_from_cache:
+            lines.append("- Bu belge kalici cache'den geri yuklendi; OCR/VLM/embedding tekrar calismadi.")
         if state.warnings:
             lines.append(f"- Uyarilar: {'; '.join(state.warnings)}")
         return "\n".join(lines)
@@ -718,7 +720,7 @@ async def set_chat_profiles(_current_user, _language):
         cl.ChatProfile(
             name="OpenAI",
             display_name="OpenAI",
-            markdown_description="OpenAI modeli ile RAG + chat.",
+            markdown_description="OpenAI-compatible Chat Completions ile RAG + chat.",
             default=(default_profile == "OpenAI"),
         ),
         cl.ChatProfile(
@@ -890,6 +892,8 @@ def _process_uploaded_file_sync_with_progress(
             f"- Chunk sayisi: {len(state.chunks)}",
             f"- Toplam indekslenen chunk: {pipeline.total_chunks}",
         ]
+        if state.restored_from_cache:
+            lines.append("- Bu belge kalici cache'den geri yuklendi; OCR/VLM/embedding tekrar calismadi.")
         if state.warnings:
             lines.append(f"- Uyarilar: {'; '.join(state.warnings)}")
         return "\n".join(lines)
