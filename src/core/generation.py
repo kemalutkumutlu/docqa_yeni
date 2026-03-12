@@ -20,6 +20,7 @@ from typing import Callable, List, Optional
 from google import genai
 from google.genai import types
 
+from .gemini_client import build_gemini_client
 from .retrieval import CoverageInfo, Evidence, QueryIntent, RetrievalResult
 
 
@@ -590,7 +591,7 @@ def generate_chat_answer(
     last_err: Optional[Exception] = None
     for attempt in range(1, 5):
         try:
-            client = genai.Client(api_key=gemini_api_key)
+            client = build_gemini_client(gemini_api_key)
             resp = client.models.generate_content(
                 model=gemini_model,
                 contents=f"SORU: {query}",
@@ -723,7 +724,7 @@ def generate_answer(
         last_err: Optional[Exception] = None
         for attempt in range(1, 5):
             try:
-                client = genai.Client(api_key=gemini_api_key)
+                client = build_gemini_client(gemini_api_key)
                 response = client.models.generate_content(
                     model=gemini_model,
                     contents=user_contents,
@@ -1025,7 +1026,7 @@ def generate_answer_stream(
         f"SORU: {query}"
     )
 
-    client = genai.Client(api_key=gemini_api_key)
+    client = build_gemini_client(gemini_api_key)
     chunks: list[str] = []
     for event in client.models.generate_content_stream(
         model=gemini_model,

@@ -49,7 +49,7 @@ def main() -> int:
 
     print("[1/4] Ingesting document...")
     ocr = OCRConfig(
-        enabled=True,
+        enabled=getattr(settings, "ocr_enabled", True),
         lang="tur+eng",
         tesseract_cmd=settings.tesseract_cmd,
         tessdata_prefix=settings.tessdata_prefix,

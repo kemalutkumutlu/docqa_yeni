@@ -28,6 +28,7 @@ class Settings:
     data_dir: Path
     chroma_dir: Path
 
+    ocr_enabled: bool
     tesseract_cmd: Optional[str]
     tessdata_prefix: Optional[str]
     tesseract_config: Optional[str]
@@ -63,6 +64,8 @@ def load_settings() -> Settings:
     data_dir = Path(os.getenv("DATA_DIR", "./data"))
     chroma_dir = Path(os.getenv("CHROMA_DIR", str(data_dir / "chroma")))
 
+    ocr_enabled_raw = (os.getenv("OCR_ENABLED", "1") or "1").strip().lower()
+    ocr_enabled = ocr_enabled_raw in ("1", "true", "yes", "y", "on")
     tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip() or None
     tessdata_prefix = os.getenv("TESSDATA_PREFIX", "").strip() or None
     tesseract_config = os.getenv("TESSERACT_CONFIG", "").strip() or None
@@ -100,11 +103,11 @@ def load_settings() -> Settings:
     )
 
     # Embedding model selection:
-    # - If EMBEDDING_MODEL is explicitly set to a model name, use it.
-    # - If EMBEDDING_MODEL is missing or set to "auto", choose:
+    # - Default: Gemini embedding for highest remote quality.
+    # - "auto" keeps the previous local behavior:
     #     - CUDA available (and not forced cpu) -> multilingual-e5-base
     #     - otherwise -> multilingual-e5-small
-    embedding_model_raw = (os.getenv("EMBEDDING_MODEL", "auto") or "auto").strip()
+    embedding_model_raw = (os.getenv("EMBEDDING_MODEL", "gemini-embedding-001") or "gemini-embedding-001").strip()
     if embedding_model_raw.lower() == "auto":
         cuda_ok = _cuda_available() and embedding_device != "cpu"
         embedding_model = "intfloat/multilingual-e5-base" if cuda_ok else "intfloat/multilingual-e5-small"
@@ -121,6 +124,7 @@ def load_settings() -> Settings:
         embedding_device=embedding_device,
         data_dir=data_dir,
         chroma_dir=chroma_dir,
+        ocr_enabled=ocr_enabled,
         tesseract_cmd=tesseract_cmd,
         tessdata_prefix=tessdata_prefix,
         tesseract_config=tesseract_config,

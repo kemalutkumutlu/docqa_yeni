@@ -8,6 +8,8 @@ from google import genai
 from google.genai import types
 from PIL import Image
 
+from .gemini_client import build_gemini_client
+
 
 @dataclass(frozen=True)
 class VLMConfig:
@@ -68,7 +70,7 @@ def _extract_via_gemini(image: Image.Image, cfg: VLMConfig) -> str:
     image.save(buf, format="PNG")
     img_bytes = buf.getvalue()
 
-    client = genai.Client(api_key=cfg.api_key)
+    client = build_gemini_client(cfg.api_key)
     resp = client.models.generate_content(
         model=cfg.model,
         contents=[

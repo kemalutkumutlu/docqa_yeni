@@ -28,7 +28,7 @@ def main() -> int:
         gemini_api_key=settings.gemini_api_key,
         gemini_model=settings.gemini_model,
         ocr_config=OCRConfig(
-            enabled=True,
+            enabled=getattr(settings, "ocr_enabled", True),
             lang="tur+eng",
             tesseract_cmd=settings.tesseract_cmd,
             tessdata_prefix=settings.tessdata_prefix,

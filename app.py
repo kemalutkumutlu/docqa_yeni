@@ -226,6 +226,7 @@ _CHAT_HISTORY_KEY = "recent_user_messages"
 _CHAT_HISTORY_MAX = 12
 _RUNTIME_OVERRIDES_KEY = "runtime_overrides"
 _EMBEDDING_MODEL_PRESETS = [
+    "gemini-embedding-001",
     "auto",
     "intfloat/multilingual-e5-small",
     "intfloat/multilingual-e5-base",
@@ -336,7 +337,7 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
             label="Embedding Model",
             values=embedding_values,
             initial_value=embedding_choice_current,
-            description="auto: CUDA varsa e5-base, yoksa e5-small secilir.",
+            description="Varsayilan: Gemini embedding. auto: lokal e5-base/e5-small secilir.",
         ),
         Select(
             id="embedding_device",
@@ -590,7 +591,7 @@ def _get_pipeline() -> RAGPipeline:
             gemini_api_key=settings.gemini_api_key,
             gemini_model=settings.gemini_model,
             ocr_config=OCRConfig(
-                enabled=True,
+                enabled=getattr(settings, "ocr_enabled", True),
                 lang="tur+eng",
                 tesseract_cmd=settings.tesseract_cmd,
                 tessdata_prefix=settings.tessdata_prefix,
