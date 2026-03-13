@@ -78,6 +78,8 @@ class Evidence:
     page_end: int
     kind: str  # parent / child
     score: float
+    modality: str = "text"
+    image_path: str = ""
 
 
 @dataclass
@@ -105,6 +107,8 @@ def _meta_to_evidence(meta: dict, doc: str, chunk_id: str, score: float) -> Evid
         page_end=meta.get("page_end", 0),
         kind=meta.get("kind", ""),
         score=score,
+        modality=meta.get("modality", "text"),
+        image_path=meta.get("image_path", ""),
     )
 
 
@@ -226,6 +230,8 @@ def _pick_best_section(
     # (doc_id, section_id) -> (best_hybrid_score, heading_overlap)
     candidates: Dict[tuple[str, str], Tuple[float, float]] = {}
     for cid, meta in zip(got_ids, got_metas):
+        if (meta or {}).get("modality") == "visual" or (meta or {}).get("kind") == "visual":
+            continue
         did = meta.get("doc_id", "")
         sid = meta.get("section_id", "")
         if not did or not sid or sid == "root":
@@ -240,6 +246,8 @@ def _pick_best_section(
     if not candidates:
         # Fallback: some documents have no detected headings; allow selecting root.
         for cid, meta in zip(got_ids, got_metas):
+            if (meta or {}).get("modality") == "visual" or (meta or {}).get("kind") == "visual":
+                continue
             did = meta.get("doc_id", "")
             sid = meta.get("section_id", "")
             if not did or sid != "root":

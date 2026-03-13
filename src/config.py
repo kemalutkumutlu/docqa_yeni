@@ -12,6 +12,7 @@ LLMProvider = Literal["none", "openai", "gemini", "local"]
 VLMProvider = Literal["gemini", "local"]
 VLMMode = Literal["off", "auto", "force"]
 EmbeddingDevice = Literal["auto", "cpu", "cuda"]
+ProcessingMode = Literal["classic", "multimodal"]
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class Settings:
 
     embedding_model: str
     embedding_device: EmbeddingDevice
+    processing_mode: ProcessingMode
 
     data_dir: Path
     chroma_dir: Path
@@ -102,6 +104,13 @@ def load_settings() -> Settings:
         else "auto"
     )
 
+    processing_mode_raw = (os.getenv("DOC_PROCESSING_MODE", "classic") or "classic").strip().lower()
+    processing_mode: ProcessingMode = (
+        processing_mode_raw  # type: ignore[assignment]
+        if processing_mode_raw in ("classic", "multimodal")
+        else "classic"
+    )
+
     # Embedding model selection:
     # - Default: Gemini embedding for highest remote quality.
     # - "auto" keeps the previous local behavior:
@@ -122,6 +131,7 @@ def load_settings() -> Settings:
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
         embedding_model=embedding_model,
         embedding_device=embedding_device,
+        processing_mode=processing_mode,
         data_dir=data_dir,
         chroma_dir=chroma_dir,
         ocr_enabled=ocr_enabled,
@@ -136,4 +146,3 @@ def load_settings() -> Settings:
         ollama_vlm_model=ollama_vlm_model,
         ollama_timeout=ollama_timeout,
     )
-

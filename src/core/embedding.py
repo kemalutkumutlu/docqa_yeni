@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import mimetypes
 import os
+from pathlib import Path
 from typing import Iterable, List, Literal, Optional
 
 from .gemini_client import build_gemini_client
+from .models import Chunk
 
 EmbeddingDevice = Literal["auto", "cpu", "cuda"]
 
@@ -74,7 +77,10 @@ class Embedder:
         if self._gemini_client is not None:
             return self._gemini_client
 
-        self._gemini_client = build_gemini_client(os.getenv("GEMINI_API_KEY", ""))
+        self._gemini_client = build_gemini_client(
+            os.getenv("GEMINI_API_KEY", ""),
+            model_name=self.model_name,
+        )
         return self._gemini_client
 
     @staticmethod
@@ -126,6 +132,36 @@ class Embedder:
             out.extend(self._extract_embedding_values(resp))
         return [self._normalize(vec) for vec in out]
 
+    def _embed_chunk_via_gemini(self, chunk: Chunk, task_type: str) -> List[float]:
+        from google.genai import types
+
+        client = self._load_gemini_client()
+        dim = self._gemini_dimension()
+        text_payload = (chunk.text or "").strip() or f"{chunk.file_name} page {chunk.page_start}"
+
+        if chunk.modality == "visual" and chunk.image_path and "embedding-2" in (self.model_name or "").lower():
+            try:
+                path = Path(chunk.image_path)
+                mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+                image_bytes = path.read_bytes()
+                resp = client.models.embed_content(
+                    model=self.model_name,
+                    contents=[
+                        types.Part.from_text(text=text_payload),
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    ],
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=dim,
+                    ),
+                )
+                return self._normalize(self._extract_embedding_values(resp)[0])
+            except Exception:
+                # Fall back to text-only embedding when multimodal embedding is unavailable.
+                pass
+
+        return self._embed_via_gemini([text_payload], task_type=task_type)[0]
+
     def embed_texts(self, texts: Iterable[str]) -> List[List[float]]:
         texts_list = list(texts)
         if self._uses_gemini():
@@ -135,6 +171,17 @@ class Embedder:
         # normalize_embeddings improves cosine similarity behavior.
         embs = model.encode(texts_list, normalize_embeddings=True)
         return embs.tolist()
+
+    def embed_chunks(self, chunks: Iterable[Chunk]) -> List[List[float]]:
+        chunk_list = list(chunks)
+        if not chunk_list:
+            return []
+        if self._uses_gemini():
+            return [
+                self._embed_chunk_via_gemini(chunk, task_type="RETRIEVAL_DOCUMENT")
+                for chunk in chunk_list
+            ]
+        return self.embed_texts([chunk.text for chunk in chunk_list])
 
     def embed_query(self, text: str) -> List[float]:
         if self._uses_gemini():

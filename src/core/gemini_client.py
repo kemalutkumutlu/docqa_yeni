@@ -56,12 +56,22 @@ def _resolve_project_id() -> str:
     )
 
 
-def _resolve_vertex_location() -> str:
-    return (
+def _resolve_vertex_location(model_name: str = "") -> str:
+    primary = (
         (os.getenv("VERTEX_LOCATION", "") or "").strip()
-        or (os.getenv("GOOGLE_CLOUD_LOCATION", "") or "").strip()
         or "global"
     )
+    fallback = (
+        (os.getenv("VERTEX_FALLBACK_LOCATION", "") or "").strip()
+        or (os.getenv("GOOGLE_CLOUD_LOCATION", "") or "").strip()
+        or primary
+    )
+    model = (model_name or "").strip().lower()
+    if "gemini-2.5-pro" in model:
+        return fallback
+    if "gemini-3.1-pro" in model:
+        return primary
+    return primary
 
 
 def _resolve_timeout_ms() -> int:
@@ -77,7 +87,7 @@ def _resolve_timeout_ms() -> int:
     return max(1000, min(600000, timeout_ms))
 
 
-def build_gemini_client(api_key: str = ""):
+def build_gemini_client(api_key: str = "", model_name: str = ""):
     """
     Build a Google GenAI client for either:
     - Gemini Developer API (AI Studio) via API key, or
@@ -89,7 +99,7 @@ def build_gemini_client(api_key: str = ""):
 
     if use_vertex_ai():
         project = _resolve_project_id()
-        location = _resolve_vertex_location()
+        location = _resolve_vertex_location(model_name=model_name)
         timeout_ms = _resolve_timeout_ms()
         return genai.Client(
             vertexai=True,
@@ -114,6 +124,10 @@ def gemini_model_candidates(primary_model: str, fallback_env: str = "GEMINI_FALL
         if item and item not in out:
             out.append(item)
     return out
+
+
+def vertex_location_for_model(model_name: str) -> str:
+    return _resolve_vertex_location(model_name=model_name)
 
 
 def is_model_not_found_error(exc: Exception) -> bool:

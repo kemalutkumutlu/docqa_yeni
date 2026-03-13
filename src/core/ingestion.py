@@ -10,7 +10,9 @@ import fitz  # PyMuPDF
 from PIL import Image
 from PIL import ImageFilter, ImageOps
 
-from .models import IngestResult, PageText
+from .content_normalization import normalize_extracted_text
+from .models import IngestResult, PageText, VisualAsset
+from .multimodal import MultimodalConfig
 from .utils import normalize_whitespace, sha256_file
 from .vlm_extract import VLMConfig, extract_text_from_image
 
@@ -104,6 +106,13 @@ def _pick_best_candidate(cands: list[tuple[str, str]]) -> tuple[str, str]:
         if sc > best_score + 0.5:
             best_text, best_source, best_score = txt, src, sc
     return best_text, best_source
+
+
+def _finalize_extracted_text(text: str, *, source: str) -> str:
+    text_norm = normalize_whitespace(text)
+    if not text_norm:
+        return ""
+    return normalize_extracted_text(text_norm, source=source)
 
 
 def _configure_tesseract(tesseract_cmd: Optional[str], tessdata_prefix: Optional[str]) -> None:
@@ -207,11 +216,69 @@ def _ocr_image_text(img: Image.Image, lang: str, cfg: OCRConfig) -> str:
     return pytesseract.image_to_string(img, lang=lang, config=config) or ""
 
 
+def _save_visual_asset_image(img: Image.Image, *, out_path: Path) -> tuple[int, int]:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, format="PNG")
+    return img.size
+
+
+def _pdf_page_visual_asset(
+    page: fitz.Page,
+    *,
+    ingest_doc_id: str,
+    file_name: str,
+    page_number: int,
+    summary_text: str,
+    multimodal: Optional[MultimodalConfig],
+) -> Optional[VisualAsset]:
+    if not multimodal or not multimodal.enabled or multimodal.assets_dir is None:
+        return None
+    pix = page.get_pixmap(dpi=160)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}.png"
+    width, height = _save_visual_asset_image(img, out_path=out_path)
+    return VisualAsset(
+        doc_id=ingest_doc_id,
+        file_name=file_name,
+        page_number=page_number,
+        image_path=str(out_path),
+        summary_text=summary_text,
+        mime_type="image/png",
+        width=width,
+        height=height,
+    )
+
+
+def _image_visual_asset(
+    img_rgb: Image.Image,
+    *,
+    ingest_doc_id: str,
+    file_name: str,
+    summary_text: str,
+    multimodal: Optional[MultimodalConfig],
+) -> Optional[VisualAsset]:
+    if not multimodal or not multimodal.enabled or multimodal.assets_dir is None:
+        return None
+    out_path = multimodal.assets_dir / ingest_doc_id / f"page_{1:04d}.png"
+    width, height = _save_visual_asset_image(img_rgb, out_path=out_path)
+    return VisualAsset(
+        doc_id=ingest_doc_id,
+        file_name=file_name,
+        page_number=1,
+        image_path=str(out_path),
+        summary_text=summary_text,
+        mime_type="image/png",
+        width=width,
+        height=height,
+    )
+
+
 def ingest_pdf(
     path: Path,
     ocr: OCRConfig,
     display_name: Optional[str] = None,
     vlm: Optional[VLMConfig] = None,
+    multimodal: Optional[MultimodalConfig] = None,
 ) -> IngestResult:
     """
     Extract page-bounded text from a PDF.
@@ -230,6 +297,7 @@ def ingest_pdf(
     file_name = display_name or path.name
     warnings: list[str] = []
     pages: list[PageText] = []
+    visual_assets: list[VisualAsset] = []
 
     pdf = fitz.open(str(path))
     try:
@@ -239,7 +307,8 @@ def ingest_pdf(
             page_no = i + 1
 
             pdf_text = page.get_text("text") or ""
-            pdf_text_norm = normalize_whitespace(pdf_text)
+            pdf_text_raw = normalize_whitespace(pdf_text)
+            pdf_text_norm = _finalize_extracted_text(pdf_text, source="pdf_text")
             text_norm = pdf_text_norm
 
             # Heuristic: if text layer is missing/too small, try OCR.
@@ -248,7 +317,7 @@ def ingest_pdf(
             # NOTE: some PDFs have a "text layer" that is present but unusable (broken layout,
             # single-token-per-line, etc.). Treat those pages as OCR candidates too.
             should_try_ocr = ocr.enabled and (
-                len(pdf_text_norm) < 40 or _text_quality_low(pdf_text_norm)
+                len(pdf_text_raw) < 40 or _text_quality_low(pdf_text_raw)
             )
             if should_try_ocr:
                 try:
@@ -257,7 +326,7 @@ def ingest_pdf(
                     pix = page.get_pixmap(dpi=200)  # good speed/quality tradeoff
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_text = pytesseract.image_to_string(img, lang=ocr.lang) or ""
-                    ocr_text_norm = normalize_whitespace(ocr_text)
+                    ocr_text_norm = _finalize_extracted_text(ocr_text, source="ocr")
                     # Choose between pdf_text and ocr by structure score (not just length).
                     text_norm, source = _pick_best_candidate(
                         [(pdf_text_norm, "pdf_text"), (ocr_text_norm, "ocr")]
@@ -279,7 +348,7 @@ def ingest_pdf(
                         pix = page.get_pixmap(dpi=200)
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         vlm_text = extract_text_from_image(img, cfg=vlm)
-                        vlm_text_norm = normalize_whitespace(vlm_text)
+                        vlm_text_norm = _finalize_extracted_text(vlm_text, source="vlm")
                         # Dual-quality selection: keep whichever preserves structure better.
                         text_norm, source = _pick_best_candidate([(text_norm, source), (vlm_text_norm, "vlm")])
                         vlm_pages_used += 1
@@ -295,10 +364,26 @@ def ingest_pdf(
                     source=source,  # type: ignore[arg-type]
                 )
             )
+            asset = _pdf_page_visual_asset(
+                page,
+                ingest_doc_id=doc_id,
+                file_name=file_name,
+                page_number=page_no,
+                summary_text=text_norm,
+                multimodal=multimodal,
+            )
+            if asset is not None:
+                visual_assets.append(asset)
     finally:
         pdf.close()
 
-    return IngestResult(doc_id=doc_id, file_name=file_name, pages=pages, warnings=warnings)
+    return IngestResult(
+        doc_id=doc_id,
+        file_name=file_name,
+        pages=pages,
+        visual_assets=visual_assets,
+        warnings=warnings,
+    )
 
 
 def ingest_image(
@@ -306,6 +391,7 @@ def ingest_image(
     ocr: OCRConfig,
     display_name: Optional[str] = None,
     vlm: Optional[VLMConfig] = None,
+    multimodal: Optional[MultimodalConfig] = None,
 ) -> IngestResult:
     """OCR a single image file into one 'page'."""
     if not path.exists():
@@ -316,6 +402,7 @@ def ingest_image(
     doc_id = sha256_file(path)
     file_name = display_name or path.name
     warnings: list[str] = []
+    visual_assets: list[VisualAsset] = []
 
     text_norm = ""
     # Load image once; reuse for OCR/VLM candidates.
@@ -333,7 +420,7 @@ def ingest_image(
     ):
         try:
             vlm_text = extract_text_from_image(img_rgb, cfg=vlm)
-            vlm_text_norm = normalize_whitespace(vlm_text)
+            vlm_text_norm = _finalize_extracted_text(vlm_text, source="vlm")
             cands.append((vlm_text_norm, "vlm"))
         except Exception as e:  # noqa: BLE001
             warnings.append(f"VLM image extract failed: {e}")
@@ -348,7 +435,7 @@ def ingest_image(
             ocr_variants = ocr_variants[:4]
             for im in ocr_variants:
                 ocr_text = _ocr_image_text(im, lang=ocr.lang, cfg=ocr)
-                ocr_text_norm = normalize_whitespace(ocr_text)
+                ocr_text_norm = _finalize_extracted_text(ocr_text, source="image_ocr")
                 if ocr_text_norm:
                     cands.append((ocr_text_norm, "image_ocr"))
         except Exception as e:  # noqa: BLE001
@@ -376,7 +463,23 @@ def ingest_image(
             source=source,  # type: ignore[arg-type]
         )
     ]
-    return IngestResult(doc_id=doc_id, file_name=file_name, pages=pages, warnings=warnings)
+    if img_rgb is not None:
+        asset = _image_visual_asset(
+            img_rgb,
+            ingest_doc_id=doc_id,
+            file_name=file_name,
+            summary_text=text_norm,
+            multimodal=multimodal,
+        )
+        if asset is not None:
+            visual_assets.append(asset)
+    return IngestResult(
+        doc_id=doc_id,
+        file_name=file_name,
+        pages=pages,
+        visual_assets=visual_assets,
+        warnings=warnings,
+    )
 
 
 def ingest_any(
@@ -384,11 +487,12 @@ def ingest_any(
     ocr: OCRConfig,
     display_name: Optional[str] = None,
     vlm: Optional[VLMConfig] = None,
+    multimodal: Optional[MultimodalConfig] = None,
 ) -> IngestResult:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return ingest_pdf(path, ocr=ocr, display_name=display_name, vlm=vlm)
+        return ingest_pdf(path, ocr=ocr, display_name=display_name, vlm=vlm, multimodal=multimodal)
     if suffix in (".png", ".jpg", ".jpeg"):
-        return ingest_image(path, ocr=ocr, display_name=display_name, vlm=vlm)
+        return ingest_image(path, ocr=ocr, display_name=display_name, vlm=vlm, multimodal=multimodal)
     raise ValueError(f"Unsupported file type: {suffix}")
 

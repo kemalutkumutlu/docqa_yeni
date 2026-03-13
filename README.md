@@ -9,6 +9,7 @@ PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Pipeline, belg
 - Query routing: `section_list` ve `normal_qa`
 - Generation: Gemini, OpenAI, local Ollama veya extractive mod
 - VLM extraction: Gemini veya local vision model
+- Processing mode: `classic` veya `multimodal`
 - Demo icin onerilen profil: Vertex AI + Gemini
 
 ## Onerilen Demo Profili
@@ -20,6 +21,7 @@ LLM_PROVIDER=gemini
 GEMINI_MODEL=gemini-3.1-pro-preview
 GEMINI_FALLBACK_MODEL=gemini-2.5-pro
 
+DOC_PROCESSING_MODE=classic
 EMBEDDING_MODEL=gemini-embedding-001
 EMBEDDING_DIMENSION=3072
 
@@ -38,7 +40,9 @@ Bu profilin mantigi:
 
 - generation: `gemini-3.1-pro-preview`
 - fallback: `gemini-2.5-pro`
+- processing: `classic`
 - embedding: `gemini-embedding-001` `3072d`
+- alternatif preview: `gemini-embedding-2-preview`
 - VLM extraction: Gemini, varsayilan olarak acik
 - klasik Tesseract OCR: kapali
 
@@ -52,6 +56,17 @@ PDF/Image
   -> Indexing (Chroma + BM25)
   -> Retrieval (Hybrid + RRF + section fetch)
   -> Generation (Gemini/OpenAI/Ollama/Extractive)
+```
+
+`multimodal` mode secilirse ek olarak:
+
+```text
+PDF/Image
+  -> Page Image Asset Extraction
+  -> Visual Page Chunks
+  -> Multimodal Embedding (Embedding 2 ise image+text denenir)
+  -> Hybrid Retrieval (text + visual evidence)
+  -> Gemini answer generation icin secili gorseller prompt'a eklenir
 ```
 
 Ana teknik kararlar:
@@ -96,6 +111,7 @@ LLM_PROVIDER=gemini
 GEMINI_MODEL=gemini-3.1-pro-preview
 GEMINI_FALLBACK_MODEL=gemini-2.5-pro
 
+DOC_PROCESSING_MODE=classic
 EMBEDDING_MODEL=gemini-embedding-001
 EMBEDDING_DIMENSION=3072
 
@@ -106,9 +122,16 @@ OCR_ENABLED=0
 VERTEX_ENABLED=1
 VERTEX_PROJECT_ID=your-gcp-project
 VERTEX_LOCATION=global
+VERTEX_FALLBACK_LOCATION=europe-west4
 VERTEX_REQUEST_TIMEOUT_MS=120000
 GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
 ```
+
+Not:
+
+- Kod tarafinda model-bazli Vertex location secimi vardir.
+- `gemini-3.1-pro-*` icin `VERTEX_LOCATION`
+- `gemini-2.5-pro-*` icin `VERTEX_FALLBACK_LOCATION`
 
 Gerekli GCP adimlari:
 
@@ -127,6 +150,7 @@ GEMINI_API_KEY=your-ai-studio-key
 GEMINI_MODEL=gemini-3.1-pro-preview
 GEMINI_FALLBACK_MODEL=gemini-2.5-pro
 
+DOC_PROCESSING_MODE=classic
 EMBEDDING_MODEL=gemini-embedding-001
 EMBEDDING_DIMENSION=3072
 
@@ -141,6 +165,30 @@ Not:
 
 - Vertex env degiskenleri set ise AI Studio key ile `401 UNAUTHENTICATED` alirsin.
 - AI Studio ile calisacaksan `VERTEX_ENABLED=0` ve eski `GOOGLE_GENAI_USE_VERTEXAI` benzeri shell env'leri kapat.
+
+#### Multimodal profil
+
+Gercek multimodal MVP akisini denemek istersen:
+
+```ini
+DOC_PROCESSING_MODE=multimodal
+EMBEDDING_MODEL=gemini-embedding-2-preview
+VLM_PROVIDER=gemini
+VLM_MODE=force
+```
+
+Bu modun davranisi:
+
+- klasik text chunk'lar korunur
+- sayfa goruntuleri asset olarak saklanir
+- page-level `visual` chunk uretilir
+- `gemini-embedding-2-preview` seciliyse visual chunk icin image+text embedding denenir
+- Gemini generation yolunda secili visual evidence'lar prompt'a eklenir
+
+Sinirlar:
+
+- Bu ilk surum `page-level` multimodal moddur; region/table crop seviyesinde degildir
+- UI'dan mode degistirmek mevcut yuklu belgeleri geriye donuk cevirmez; belgeyi yeniden yuklemek gerekir
 
 #### Tamamen lokal mod
 
@@ -196,6 +244,7 @@ Preflight su kontrolleri yapar:
 
 Chainlit UI runtime ayarlari sunar:
 
+- `Processing Mode`
 - `Embedding Model`
 - `Embedding Device`
 - `VLM Mode`
@@ -205,6 +254,7 @@ Chainlit UI runtime ayarlari sunar:
 Ancak demo sirasinda bunlari degistirmemen tavsiye edilir. Ozellikle:
 
 - embedding model degisirse indeks yeniden olusturulur
+- processing mode degisirse yeni belge yuklemelerinde fark yaratir
 - VLM ayarlari yeni yuklemelerde fark yaratir
 - provider degisikligi, state'i karmasiklastirir
 

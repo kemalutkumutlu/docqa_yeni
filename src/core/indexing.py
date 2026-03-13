@@ -44,7 +44,7 @@ class LocalIndex:
     ) -> "LocalIndex":
         embedder = Embedder(model_name=embedding_model, device=embedding_device)  # type: ignore[arg-type]
         # Embed first so we can derive embedding dimension deterministically.
-        embeddings = embedder.embed_texts([c.text for c in chunks])
+        embeddings = embedder.embed_chunks(chunks)
         emb_dim = len(embeddings[0]) if embeddings else 0
 
         # Automation: avoid "384 vs 768" dimension mismatches when reusing the same persistent
@@ -135,7 +135,7 @@ class LocalIndex:
             self.bm25.remove_doc_ids(already_indexed)
 
         # Embed only the NEW chunks.
-        embeddings = self.embedder.embed_texts([c.text for c in new_chunks])
+        embeddings = self.embedder.embed_chunks(new_chunks)
         self.store.upsert_chunks(new_chunks, embeddings=embeddings)
 
         # Extend BM25 incrementally.

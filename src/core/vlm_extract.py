@@ -70,10 +70,10 @@ def _extract_via_gemini(image: Image.Image, cfg: VLMConfig) -> str:
     image.save(buf, format="PNG")
     img_bytes = buf.getvalue()
 
-    client = build_gemini_client(cfg.api_key)
     last_model_error: Exception | None = None
     for model_name in gemini_model_candidates(cfg.model):
         try:
+            client = build_gemini_client(cfg.api_key, model_name=model_name)
             resp = client.models.generate_content(
                 model=model_name,
                 contents=[

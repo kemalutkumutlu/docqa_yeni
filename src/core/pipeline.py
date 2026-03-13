@@ -29,11 +29,13 @@ from .generation import (
     generate_chat_answer_local,
     generate_extractive_answer,
 )
+from .content_normalization import CONTENT_NORMALIZER_VERSION
 from .doc_cache import CachedDocument, DocumentCache
 from .local_llm import OllamaConfig
 from .eventlog import JsonlEventLogger
 from .indexing import LocalIndex
 from .ingestion import OCRConfig, ingest_any, IngestResult
+from .multimodal import MultimodalConfig, visual_chunks_from_ingest
 from .vlm_extract import VLMConfig
 from .models import Chunk
 from .retrieval import RetrievalResult, retrieve, classify_query
@@ -67,11 +69,13 @@ class RAGPipeline:
     gemini_model: str
     ocr_config: OCRConfig
     embedding_device: str = "auto"
+    processing_mode: str = "classic"
     vlm_config: Optional[VLMConfig] = None
     llm_provider: str = "gemini"  # "gemini" | "openai" | "local" | "none"
     ollama_config: Optional[OllamaConfig] = None
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    multimodal_assets_dir: Optional[Path] = None
 
     # State
     _documents: Dict[str, DocumentState] = field(default_factory=dict)
@@ -172,6 +176,8 @@ class RAGPipeline:
             parts = [
                 f"emb_model={self.embedding_model}",
                 f"emb_dev={self.embedding_device}",
+                f"processing_mode={self.processing_mode}",
+                f"content_norm={CONTENT_NORMALIZER_VERSION}",
                 f"ocr_enabled={bool(o.enabled)}",
                 f"ocr_lang={o.lang}",
                 f"tess_cmd={o.tesseract_cmd or ''}",
@@ -222,16 +228,23 @@ class RAGPipeline:
             return state
 
         _progress("Metin cikarma basladi (PDF/OCR/VLM)...")
+        assets_dir = self.multimodal_assets_dir or (self.chroma_dir.parent / "multimodal_assets")
         ingest = ingest_any(
             file_path,
             ocr=self.ocr_config,
             display_name=display_name,
             vlm=self.vlm_config,
+            multimodal=MultimodalConfig(
+                enabled=self.processing_mode == "multimodal",
+                assets_dir=assets_dir,
+            ),
         )
         _progress("Belge yapisi analiz ediliyor...")
         root = build_section_tree(ingest)
         _progress("Chunk'lar olusturuluyor...")
         chunks = section_tree_to_chunks(ingest, root)
+        if self.processing_mode == "multimodal":
+            chunks.extend(visual_chunks_from_ingest(ingest))
 
         state = DocumentState(
             doc_id=ingest.doc_id,
@@ -478,6 +491,7 @@ class RAGPipeline:
         *,
         embedding_model: Optional[str] = None,
         embedding_device: Optional[str] = None,
+        processing_mode: Optional[str] = None,
         vlm_mode: Optional[str] = None,
         vlm_provider: Optional[str] = None,
         vlm_max_pages: Optional[int] = None,
@@ -498,6 +512,12 @@ class RAGPipeline:
         if device_next and device_next != self.embedding_device:
             self.embedding_device = device_next
             embedding_changed = True
+
+        processing_mode_changed = False
+        mode_next = (processing_mode or "").strip().lower()
+        if mode_next in ("classic", "multimodal") and mode_next != self.processing_mode:
+            self.processing_mode = mode_next
+            processing_mode_changed = True
 
         if self.vlm_config is None:
             self.vlm_config = VLMConfig(
@@ -536,6 +556,7 @@ class RAGPipeline:
 
         return {
             "embedding_changed": embedding_changed,
+            "processing_mode_changed": processing_mode_changed,
             "vlm_changed": vlm_changed,
             "index_rebuilt": index_rebuilt,
         }

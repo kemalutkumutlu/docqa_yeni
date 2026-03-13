@@ -226,8 +226,10 @@ _CHAT_PROFILE_TO_PROVIDER = {
 _CHAT_HISTORY_KEY = "recent_user_messages"
 _CHAT_HISTORY_MAX = 12
 _RUNTIME_OVERRIDES_KEY = "runtime_overrides"
+_PROCESSING_MODE_VALUES = ["classic", "multimodal"]
 _EMBEDDING_MODEL_PRESETS = [
     "gemini-embedding-001",
+    "gemini-embedding-2-preview",
     "auto",
     "intfloat/multilingual-e5-small",
     "intfloat/multilingual-e5-base",
@@ -361,6 +363,11 @@ def _resolve_vlm_provider_choice(requested_provider: str, settings, ollama_cfg: 
 
 def _settings_widgets(pipeline: RAGPipeline) -> list:
     vlm_cfg = pipeline.vlm_config
+    processing_mode_current = _sanitize_select_value(
+        _get_runtime_value("processing_mode", getattr(pipeline, "processing_mode", "classic")),
+        _PROCESSING_MODE_VALUES,
+        getattr(pipeline, "processing_mode", "classic"),
+    )
     embedding_device_current = _sanitize_select_value(
         _get_runtime_value("embedding_device", pipeline.embedding_device),
         _EMBEDDING_DEVICE_VALUES,
@@ -395,6 +402,13 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
     )
 
     return [
+        Select(
+            id="processing_mode",
+            label="Processing Mode",
+            values=_PROCESSING_MODE_VALUES,
+            initial_value=processing_mode_current,
+            description="classic: mevcut text-first akış. multimodal: visual page chunk + multimodal retrieval.",
+        ),
         Select(
             id="embedding_model",
             label="Embedding Model",
@@ -450,6 +464,11 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
     vlm_pages_default = vlm_cfg.max_pages if vlm_cfg else _VLM_MAX_PAGES_DEFAULT
 
     pipeline.reconfigure_runtime(
+        processing_mode=_sanitize_select_value(
+            overrides.get("processing_mode"),
+            _PROCESSING_MODE_VALUES,
+            getattr(pipeline, "processing_mode", "classic"),
+        ),
         embedding_model=model_resolved,
         embedding_device=device,
         vlm_mode=_sanitize_select_value(overrides.get("vlm_mode"), _VLM_MODE_VALUES, vlm_mode_default),
@@ -659,6 +678,7 @@ def _get_pipeline() -> RAGPipeline:
                 tesseract_config=getattr(settings, "tesseract_config", None),
             ),
             embedding_device=getattr(settings, "embedding_device", "auto"),
+            processing_mode=getattr(settings, "processing_mode", "classic"),
             vlm_config=VLMConfig(
                 api_key=settings.gemini_api_key,
                 model=settings.gemini_model,
@@ -778,6 +798,11 @@ async def on_settings_update(values: dict):
         _EMBEDDING_DEVICE_VALUES,
         pipeline.embedding_device,
     )
+    selected_processing_mode = _sanitize_select_value(
+        values.get("processing_mode"),
+        _PROCESSING_MODE_VALUES,
+        getattr(pipeline, "processing_mode", "classic"),
+    )
     selected_model_choice = str(values.get("embedding_model") or pipeline.embedding_model).strip()
     if not selected_model_choice:
         selected_model_choice = pipeline.embedding_model
@@ -818,6 +843,7 @@ async def on_settings_update(values: dict):
         {
             "embedding_model_choice": selected_model_choice,
             "embedding_device": selected_device,
+            "processing_mode": selected_processing_mode,
             "vlm_mode": selected_vlm_mode,
             "vlm_provider": resolved_vlm_provider,
             "vlm_max_pages": selected_vlm_pages,
@@ -825,6 +851,7 @@ async def on_settings_update(values: dict):
     )
 
     result = pipeline.reconfigure_runtime(
+        processing_mode=selected_processing_mode,
         embedding_model=resolved_model,
         embedding_device=selected_device,
         vlm_mode=selected_vlm_mode,
@@ -832,9 +859,10 @@ async def on_settings_update(values: dict):
         vlm_max_pages=selected_vlm_pages,
     )
 
-    if result.get("embedding_changed") or result.get("vlm_changed"):
+    if result.get("embedding_changed") or result.get("vlm_changed") or result.get("processing_mode_changed"):
         messages = [
             "**Runtime ayarlari guncellendi**",
+            f"- Processing: `{getattr(pipeline, 'processing_mode', 'classic')}`",
             f"- Embedding: `{pipeline.embedding_model}` | `{pipeline.embedding_device}`",
             f"- VLM: `{resolved_vlm_provider}` | `{selected_vlm_mode}` | max_pages=`{selected_vlm_pages}`",
         ]
@@ -844,6 +872,8 @@ async def on_settings_update(values: dict):
             messages.append("- Embedding ayari degisti; indeks yeni ayarlarla hazir.")
         if result.get("vlm_changed"):
             messages.append("- VLM ayarlari bir sonraki dosya yuklemelerinde uygulanir.")
+        if result.get("processing_mode_changed"):
+            messages.append("- Processing mode bir sonraki belge yuklemelerinde uygulanir. Mevcut belgeleri yeniden yuklemeniz gerekir.")
         if vlm_warning:
             messages.append(f"- Not: {vlm_warning}")
         await cl.Message(content="\n".join(messages)).send()

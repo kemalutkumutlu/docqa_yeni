@@ -15,6 +15,7 @@ from src.core.gemini_client import (  # noqa: E402
     gemini_model_candidates,
     is_model_not_found_error,
     use_vertex_ai,
+    vertex_location_for_model,
 )
 from src.core.vlm_extract import VLMConfig, extract_text_from_image  # noqa: E402
 
@@ -24,10 +25,10 @@ def _print(msg: str) -> None:
 
 
 def _test_generation(settings) -> str:
-    client = build_gemini_client(settings.gemini_api_key)
     last_error: Exception | None = None
     for model_name in gemini_model_candidates(settings.gemini_model):
         try:
+            client = build_gemini_client(settings.gemini_api_key, model_name=model_name)
             resp = client.models.generate_content(
                 model=model_name,
                 contents="Reply with exactly: ok",
@@ -35,7 +36,8 @@ def _test_generation(settings) -> str:
             text = (resp.text or "").strip()
             if not text:
                 raise RuntimeError(f"Empty response from model {model_name}")
-            _print(f"[OK] generation model={model_name} response={text!r}")
+            location = vertex_location_for_model(model_name) if use_vertex_ai() else "ai_studio"
+            _print(f"[OK] generation model={model_name} location={location} response={text!r}")
             if model_name != settings.gemini_model:
                 _print(f"[WARN] primary model unavailable, fallback used: {model_name}")
             return model_name

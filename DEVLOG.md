@@ -1,5 +1,23 @@
 # DEVLOG
 
+## Faz 10.0 — Multimodal Mode (MVP)
+
+- Amaç: mevcut `classic` text-first akisi bozmadan, UI'dan secilebilen ayri bir `multimodal` mode eklemek.
+- Yeni runtime ayari:
+  - `DOC_PROCESSING_MODE=classic|multimodal`
+  - Chainlit settings panelinde `Processing Mode`
+- MVP kapsam:
+  - PDF / image sayfalari icin page-level visual asset uretimi
+  - `visual` chunk tipi
+  - metadata'da `modality` ve `image_path`
+  - `gemini-embedding-2-preview` ile visual chunk icin image+text embedding denemesi
+  - visual evidence varsa Gemini generation prompt'una secili goruntulerin eklenmesi
+- Bilincli sinir:
+  - region/table crop seviyesinde degil, page-level
+  - Graph RAG yok
+  - Agentic RAG yok
+  - mode degisikligi mevcut yuklu belgeleri geriye donuk cevirmez; belge yeniden yuklenmelidir
+
 Bu dosya, projenin gelistirme surecini kronolojik olarak belgelemektedir.
 
 ## Faz 0 — Proje Iskeleti

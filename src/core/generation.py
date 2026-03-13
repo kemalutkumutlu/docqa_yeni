@@ -13,6 +13,7 @@ import os
 import re
 import time
 import json
+from pathlib import Path
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -324,6 +325,30 @@ def _build_context(evidences: List[Evidence]) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
+def _visual_parts(evidences: List[Evidence], limit: int = 2) -> list[types.Part]:
+    parts: list[types.Part] = []
+    seen_paths: set[str] = set()
+    for ev in evidences:
+        if ev.modality != "visual" or not ev.image_path or ev.image_path in seen_paths:
+            continue
+        try:
+            img_bytes = Path(ev.image_path).read_bytes()
+        except Exception:
+            continue
+        parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+        seen_paths.add(ev.image_path)
+        if len(parts) >= limit:
+            break
+    return parts
+
+
+def _build_gemini_user_contents(user_message: str, evidences: List[Evidence]) -> str | list[types.Part]:
+    image_parts = _visual_parts(evidences)
+    if not image_parts:
+        return user_message
+    return [types.Part.from_text(text=user_message)] + image_parts
+
+
 # ── Deterministic section-list rendering (doc-agnostic) ───────────────────────
 
 def _extract_file_name_from_heading_path(heading_path: str) -> str:
@@ -601,10 +626,10 @@ def generate_chat_answer(
     last_err: Optional[Exception] = None
     for attempt in range(1, 5):
         try:
-            client = build_gemini_client(gemini_api_key)
             last_model_error: Optional[Exception] = None
             for model_name in gemini_model_candidates(gemini_model):
                 try:
+                    client = build_gemini_client(gemini_api_key, model_name=model_name)
                     resp = client.models.generate_content(
                         model=model_name,
                         contents=f"SORU: {query}",
@@ -723,7 +748,14 @@ def generate_answer(
         f"SORU: {query}"
     )
 
-    def _call(system_instruction: str, user_contents: str, temperature: float, max_tokens: int = 4096) -> str:
+    gemini_contents = _build_gemini_user_contents(user_message, retrieval.evidences)
+
+    def _call(
+        system_instruction: str,
+        user_contents: str | list[types.Part],
+        temperature: float,
+        max_tokens: int = 4096,
+    ) -> str:
         def _retryable(e: Exception) -> bool:
             msg = str(e)
             return any(
@@ -743,10 +775,10 @@ def generate_answer(
         last_err: Optional[Exception] = None
         for attempt in range(1, 5):
             try:
-                client = build_gemini_client(gemini_api_key)
                 last_model_error: Optional[Exception] = None
                 for model_name in gemini_model_candidates(gemini_model):
                     try:
+                        client = build_gemini_client(gemini_api_key, model_name=model_name)
                         response = client.models.generate_content(
                             model=model_name,
                             contents=user_contents,
@@ -772,7 +804,7 @@ def generate_answer(
         raise last_err  # type: ignore[misc]
 
     # Call Gemini
-    answer = _call(system, user_message, temperature=0.1) or "Belgede bu bilgi bulunamadı."
+    answer = _call(system, gemini_contents, temperature=0.1) or "Belgede bu bilgi bulunamadı."
 
     # Count citations in the answer
     # Accept a few common citation renderings:
@@ -794,7 +826,7 @@ def generate_answer(
             + "- Kaynaksız hiçbir cümle yazma.\n"
             + "- İçerik ekleme/çıkarma yapma; sadece formatı düzelt.\n"
         )
-        answer_retry = _call(system_retry, user_message, temperature=0.0).strip()
+        answer_retry = _call(system_retry, gemini_contents, temperature=0.0).strip()
         if answer_retry:
             answer = answer_retry
             citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
@@ -819,7 +851,7 @@ def generate_answer(
                 + "- Özetleme yapma; bağlamdaki öğeleri tek tek dök.\n"
                 + "- Her satırın sonunda kaynak formatı olsun: [DosyaAdı - Sayfa X]\n"
             )
-            answer_retry2 = _call(system_retry2, user_message, temperature=0.0).strip()
+            answer_retry2 = _call(system_retry2, gemini_contents, temperature=0.0).strip()
             if answer_retry2:
                 answer = answer_retry2
                 citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
@@ -1053,15 +1085,16 @@ def generate_answer_stream(
         f"---\n\n"
         f"SORU: {query}"
     )
+    gemini_contents = _build_gemini_user_contents(user_message, retrieval.evidences)
 
-    client = build_gemini_client(gemini_api_key)
     chunks: list[str] = []
     last_model_error: Optional[Exception] = None
     for model_name in gemini_model_candidates(gemini_model):
         try:
+            client = build_gemini_client(gemini_api_key, model_name=model_name)
             for event in client.models.generate_content_stream(
                 model=model_name,
-                contents=user_message,
+                contents=gemini_contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system,
                     temperature=0.1,

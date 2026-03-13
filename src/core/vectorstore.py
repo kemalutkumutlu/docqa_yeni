@@ -20,6 +20,8 @@ def _chunk_metadata(c: Chunk) -> Dict[str, Any]:
         "page_start": c.page_start,
         "page_end": c.page_end,
         "kind": c.kind,
+        "modality": c.modality,
+        "image_path": c.image_path,
     }
 
 

@@ -18,11 +18,12 @@ Preflight su alanlari dogrular:
 - secili generation modeli
 - embedding cagrisi
 - VLM extraction cagrisi
+- Vertex kullaniliyorsa secilen location bilgisi
 
 Beklenen:
 
 - `mode=vertex` veya `mode=ai_studio`
-- `[OK] generation ...`
+- `[OK] generation model=... location=...`
 - `[OK] embedding ...`
 - `[OK] vlm ...`
 - `[OK] preflight passed`
@@ -88,6 +89,29 @@ Genel smoke icin:
 .venv-gpu/bin/python scripts/smoke_suite.py test_data/Case_Study_20260205.pdf
 ```
 
+### 5. Multimodal mode sanity check
+
+`multimodal` mode icin minimum kontrol:
+
+```ini
+DOC_PROCESSING_MODE=multimodal
+EMBEDDING_MODEL=gemini-embedding-2-preview
+```
+
+Kontrol:
+
+1. `./run.sh`
+2. UI runtime ayarinda `Processing Mode=multimodal` gorunuyor mu
+3. Belgeyi yeniden yukle
+4. Karmaşık sayfa / tablo / gorsel iceren bir soru sor
+
+Beklenen:
+
+- belge yukleme classic moda gore daha yavas olabilir
+- ayni belge yeni mode ile tekrar yuklenince cache yeniden kullanilmaz
+- retrieval/generation classic akisi bozmadan calismaya devam eder
+- Gemini generation yolunda visual evidence varsa cevap kalitesi artabilir
+
 ## Demo Oncesi Checklist
 
 Mülakat ya da canli demo oncesi minimum kontrol:
@@ -107,6 +131,12 @@ Beklenen davranis:
 - ortadakiler normal QA
 - sonuncusu negatif guard
 - cevaplarda citation olsun
+
+Ek multimodal kontrol:
+
+- runtime settings'te `Processing Mode`
+- `Embedding Model=gemini-embedding-2-preview`
+- belge yeniden yuklendikten sonra soru-cevap halen calisiyor mu
 
 ## Tavsiye Edilen Calistirma Sekli
 
@@ -131,7 +161,8 @@ Kontrol et:
 
 - `GEMINI_MODEL`
 - `GEMINI_FALLBACK_MODEL`
-- Vertex kullaniyorsan `VERTEX_LOCATION=global`
+- Vertex kullaniyorsan `VERTEX_LOCATION`
+- fallback model kullaniyorsan `VERTEX_FALLBACK_LOCATION`
 - auth dosyasi / API key dogru mu
 
 ### Embedding fail
@@ -158,6 +189,7 @@ Kontrol et:
 - `VLM_MAX_PAGES`
 - `OCR_ENABLED`
 - scan PDF ise Tesseract gerekli mi
+- `DOC_PROCESSING_MODE=multimodal` ise belgeyi mode degisimi sonrasinda yeniden yukledin mi
 
 ## Not
 
