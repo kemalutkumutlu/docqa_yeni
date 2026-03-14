@@ -3,7 +3,6 @@
 [UI]
 # Arayüz başlığı (Chainlit yerine TUSAS DOCQA)
 name = "TUSAS DOCQA"
-custom_js = "/public/history_sidebar.js"
 custom_css = "/public/stylesheet.css"
 
 # Logo: TUSAS logosu (public/ altında)

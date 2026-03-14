@@ -21,4 +21,6 @@ google-genai==1.62.0
 
 # UI
 chainlit==2.9.6
+sqlalchemy
+aiosqlite
 

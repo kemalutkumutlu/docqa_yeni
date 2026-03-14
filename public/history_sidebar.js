@@ -11,9 +11,19 @@
   let lastCaptured = { text: "", ts: 0 };
   let suppressGlobalNewUntil = 0;
   let lastNewThreadAt = 0;
+  let nativeMode = false;
 
   const now = () => Date.now();
   const threadTag = (id) => `<!--THREAD:${id}-->`;
+  const normalizeLabel = (text) => (text || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+  const NATIVE_HISTORY_LABELS = [
+    "new chat",
+    "create new chat",
+    "yeni sohbet",
+    "thread history",
+    "chat history"
+  ];
 
   const shorten = (text, limit = TITLE_LIMIT) => {
     const clean = (text || "").replace(/\s+/g, " ").trim();
@@ -164,7 +174,61 @@
     document.head.appendChild(style);
   };
 
+  const ensureNativeResetStyle = () => {
+    if (document.getElementById("docqa-history-native-reset")) return;
+    const style = document.createElement("style");
+    style.id = "docqa-history-native-reset";
+    style.textContent = `
+      #docqa-history-panel {
+        display: none !important;
+      }
+      #root {
+        margin-left: 0 !important;
+        width: 100% !important;
+      }
+    `;
+    document.head.appendChild(style);
+  };
+
+  const hasNativeHistoryUI = () => {
+    const controls = Array.from(document.querySelectorAll('button, [role="button"], a'));
+    for (const node of controls) {
+      if (rootEl && rootEl.contains(node)) continue;
+      const label = normalizeLabel(
+        `${node.getAttribute("aria-label") || ""} ${node.getAttribute("title") || ""} ${node.textContent || ""}`
+      );
+      if (NATIVE_HISTORY_LABELS.some((needle) => label.includes(needle))) {
+        return true;
+      }
+    }
+
+    const landmarks = Array.from(document.querySelectorAll("nav, aside, [data-testid], [class]"));
+    for (const node of landmarks) {
+      if (rootEl && rootEl.contains(node)) continue;
+      const hint = normalizeLabel(
+        `${node.getAttribute("data-testid") || ""} ${node.getAttribute("class") || ""} ${node.getAttribute("aria-label") || ""}`
+      );
+      if (hint.includes("docqa-history")) continue;
+      if (hint.includes("thread") || hint.includes("history")) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const enableNativeMode = () => {
+    nativeMode = true;
+    if (rootEl) {
+      rootEl.remove();
+      rootEl = null;
+      listEl = null;
+      emptyEl = null;
+    }
+    ensureNativeResetStyle();
+  };
+
   const render = () => {
+    if (nativeMode) return;
     if (!listEl || !emptyEl) return;
     const threads = sortThreads(loadThreads());
     const activeId = getActiveId();
@@ -316,6 +380,7 @@
   };
 
   const bindComposer = () => {
+    if (nativeMode) return;
     const textarea = document.querySelector("textarea");
     if (!textarea || textarea.dataset.docqaHistoryBound === "1") return;
 
@@ -360,6 +425,7 @@
   };
 
   const ensurePanel = () => {
+    if (nativeMode) return;
     if (rootEl) return;
     rootEl = document.createElement("aside");
     rootEl.id = "docqa-history-panel";
@@ -394,6 +460,7 @@
   };
 
   const bindGlobalClicks = () => {
+    if (nativeMode) return;
     if (document.body.dataset.docqaHistoryGlobalBound === "1") return;
     document.body.dataset.docqaHistoryGlobalBound = "1";
 
@@ -410,6 +477,10 @@
   };
 
   const init = () => {
+    if (hasNativeHistoryUI()) {
+      enableNativeMode();
+      return;
+    }
     ensureStyles();
     ensurePanel();
     bindGlobalClicks();
@@ -419,6 +490,11 @@
 
     // SPA surfaces are dynamic; keep bindings fresh.
     setInterval(() => {
+      if (!nativeMode && hasNativeHistoryUI()) {
+        enableNativeMode();
+        return;
+      }
+      if (nativeMode) return;
       bindComposer();
       render();
     }, 1200);

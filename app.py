@@ -11,12 +11,17 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 from queue import Empty, SimpleQueue
 from pathlib import Path
+from typing import Any
 
 import chainlit as cl
 from chainlit.input_widget import Select, Slider
+from chainlit.types import ThreadDict
+from chainlit.user import User
+from chainlit.context import ChainlitContextException, context as cl_context
 
 from src.config import load_settings
 from src.core.ingestion import OCRConfig
@@ -24,6 +29,13 @@ from src.core.local_llm import OllamaConfig, ollama_is_available
 from src.core.pipeline import RAGPipeline
 from src.core.vlm_extract import VLMConfig
 from src.core.gemini_client import use_vertex_ai
+
+try:
+    from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
+except Exception as _native_history_import_error:  # pragma: no cover - optional dependency path
+    SQLAlchemyDataLayer = None
+else:
+    _native_history_import_error = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -39,6 +51,9 @@ _THREAD_MEMORY: dict[str, list[dict[str, str]]] = {}
 _THREAD_PIPELINES: dict[str, RAGPipeline] = {}
 _THREAD_MEMORY_MAX_MSGS = 120
 _SIDEBAR_REV_KEY = "sidebar_render_rev"
+_THREAD_STATE_KEY = "docqa_thread_state"
+_THREAD_STATE_VERSION = 1
+_NATIVE_HISTORY_BOOTSTRAP_DONE = False
 
 
 def _auto_exit_enabled() -> bool:
@@ -53,6 +68,346 @@ def _auto_exit_grace_seconds() -> float:
     except Exception:
         sec = 8.0
     return max(0.0, min(120.0, sec))
+
+
+def _env_truthy(name: str, default: str = "") -> bool:
+    value = (os.getenv(name, default) or "").strip().lower()
+    return value in ("1", "true", "yes", "y", "on")
+
+
+def _native_history_requested() -> bool:
+    return _env_truthy("CHAINLIT_NATIVE_HISTORY", "0")
+
+
+def _native_history_auth_enabled() -> bool:
+    return bool((os.getenv("CHAINLIT_AUTH_USERNAME", "") or "").strip()) and bool(
+        (os.getenv("CHAINLIT_AUTH_PASSWORD", "") or "").strip()
+    )
+
+
+def _native_history_conninfo() -> str | None:
+    explicit = (os.getenv("CHAINLIT_HISTORY_DATABASE_URL", "") or "").strip()
+    if explicit:
+        return explicit
+
+    database_url = (os.getenv("DATABASE_URL", "") or "").strip()
+    if database_url:
+        return database_url
+
+    db_path = (os.getenv("CHAINLIT_DB_PATH", "") or "").strip()
+    if not db_path:
+        data_dir = Path(os.getenv("DATA_DIR", "./data"))
+        db_path = str(data_dir / "chainlit_history.db")
+
+    path = Path(db_path).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return f"sqlite+aiosqlite:///{path}"
+
+
+def _native_history_ready() -> tuple[bool, str | None]:
+    if not _native_history_requested():
+        return False, "disabled"
+    if SQLAlchemyDataLayer is None:
+        detail = str(_native_history_import_error or "sqlalchemy data layer unavailable")
+        return False, detail
+    conninfo = _native_history_conninfo()
+    if not conninfo:
+        return False, "missing database url"
+    if conninfo.startswith("sqlite+aiosqlite:"):
+        try:
+            import aiosqlite  # noqa: F401,WPS433
+        except Exception as exc:  # pragma: no cover - optional dependency path
+            return False, str(exc)
+    return True, None
+
+
+def _native_history_sqlite_path(conninfo: str) -> Path | None:
+    prefix = "sqlite+aiosqlite:///"
+    if not conninfo.startswith(prefix):
+        return None
+    raw = conninfo[len(prefix):]
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
+def _bootstrap_native_history_sqlite(conninfo: str) -> None:
+    global _NATIVE_HISTORY_BOOTSTRAP_DONE
+    if _NATIVE_HISTORY_BOOTSTRAP_DONE:
+        return
+    db_path = _native_history_sqlite_path(conninfo)
+    if db_path is None:
+        _NATIVE_HISTORY_BOOTSTRAP_DONE = True
+        return
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    ddl = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            identifier TEXT NOT NULL UNIQUE,
+            "createdAt" TEXT NOT NULL,
+            metadata TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS threads (
+            id TEXT PRIMARY KEY,
+            "createdAt" TEXT,
+            name TEXT,
+            "userId" TEXT,
+            "userIdentifier" TEXT,
+            tags TEXT,
+            metadata TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS steps (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            type TEXT,
+            "threadId" TEXT,
+            "parentId" TEXT,
+            streaming INTEGER,
+            "waitForAnswer" INTEGER,
+            "isError" INTEGER,
+            metadata TEXT,
+            tags TEXT,
+            input TEXT,
+            output TEXT,
+            "createdAt" TEXT,
+            start TEXT,
+            "end" TEXT,
+            "defaultOpen" INTEGER,
+            generation TEXT,
+            "showInput" TEXT,
+            language TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS feedbacks (
+            id TEXT PRIMARY KEY,
+            "forId" TEXT,
+            value REAL,
+            comment TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS elements (
+            id TEXT PRIMARY KEY,
+            "threadId" TEXT,
+            type TEXT,
+            "chainlitKey" TEXT,
+            url TEXT,
+            "objectKey" TEXT,
+            name TEXT,
+            display TEXT,
+            size TEXT,
+            language TEXT,
+            page INTEGER,
+            "forId" TEXT,
+            mime TEXT,
+            props TEXT,
+            "autoPlay" INTEGER,
+            "playerConfig" TEXT
+        )
+        """,
+        'CREATE INDEX IF NOT EXISTS idx_users_identifier ON users(identifier)',
+        'CREATE INDEX IF NOT EXISTS idx_threads_user_id ON threads("userId")',
+        'CREATE INDEX IF NOT EXISTS idx_steps_thread_id ON steps("threadId")',
+        'CREATE INDEX IF NOT EXISTS idx_feedbacks_for_id ON feedbacks("forId")',
+        'CREATE INDEX IF NOT EXISTS idx_elements_thread_id ON elements("threadId")',
+    ]
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        for statement in ddl:
+            conn.execute(statement)
+        step_columns = {row[1] for row in conn.execute('PRAGMA table_info("steps")')}
+        if "defaultOpen" not in step_columns:
+            conn.execute('ALTER TABLE steps ADD COLUMN "defaultOpen" INTEGER')
+        conn.commit()
+    _NATIVE_HISTORY_BOOTSTRAP_DONE = True
+
+
+def _native_history_backfill_user_binding(conninfo: str, identifier: str) -> None:
+    db_path = _native_history_sqlite_path(conninfo)
+    if db_path is None or not identifier:
+        return
+
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM users WHERE identifier = ? ORDER BY rowid DESC LIMIT 1",
+            (identifier,),
+        ).fetchone()
+        if not row:
+            return
+        user_id = row[0]
+        cur.execute(
+            'UPDATE threads SET "userId" = ?, "userIdentifier" = ? WHERE ("userId" IS NULL OR "userId" = "")',
+            (user_id, identifier),
+        )
+        unnamed = cur.execute(
+            'SELECT id, metadata FROM threads WHERE (name IS NULL OR name = "")'
+        ).fetchall()
+        for thread_id, raw_metadata in unnamed:
+            metadata = {}
+            if isinstance(raw_metadata, str) and raw_metadata.strip():
+                try:
+                    metadata = json.loads(raw_metadata)
+                except Exception:
+                    metadata = {}
+            elif isinstance(raw_metadata, dict):
+                metadata = raw_metadata
+            title = _thread_name_from_metadata(metadata)
+            if title:
+                cur.execute('UPDATE threads SET name = ? WHERE id = ?', (title, thread_id))
+        conn.commit()
+
+
+class NativeHistoryDataLayer(SQLAlchemyDataLayer):  # type: ignore[misc]
+    async def _resolve_current_user_binding(self) -> tuple[str | None, str | None]:
+        try:
+            session_user = cl_context.session.user
+        except ChainlitContextException:
+            session_user = None
+        except Exception:
+            session_user = None
+
+        if session_user is None:
+            return None, None
+
+        identifier = getattr(session_user, "identifier", None)
+        user_id = getattr(session_user, "id", None)
+        if user_id:
+            return str(user_id), str(identifier or "")
+
+        if identifier:
+            persisted = await self.get_user(str(identifier))
+            if persisted and getattr(persisted, "id", None):
+                return str(persisted.id), str(identifier)
+            return None, str(identifier)
+        return None, None
+
+    async def update_thread(
+        self,
+        thread_id: str,
+        name: str | None = None,
+        user_id: str | None = None,
+        metadata: dict | None = None,
+        tags: list[str] | None = None,
+    ):
+        resolved_name = name or _thread_name_from_metadata(metadata)
+        resolved_user_id = user_id
+        resolved_identifier = None
+        if not resolved_user_id:
+            resolved_user_id, resolved_identifier = await self._resolve_current_user_binding()
+        merged_metadata = None
+        if metadata is not None:
+            existing = await self.execute_sql(
+                query='SELECT "metadata" FROM threads WHERE "id" = :id',
+                parameters={"id": thread_id},
+            )
+            base_metadata = {}
+            if isinstance(existing, list) and existing:
+                raw_existing = existing[0].get("metadata") or {}
+                if isinstance(raw_existing, str):
+                    try:
+                        base_metadata = json.loads(raw_existing)
+                    except json.JSONDecodeError:
+                        base_metadata = {}
+                elif isinstance(raw_existing, dict):
+                    base_metadata = raw_existing
+            incoming_metadata = {k: v for k, v in metadata.items() if v is not None}
+            merged_metadata = {**base_metadata, **incoming_metadata}
+
+        effective_name = resolved_name
+        if effective_name is None and isinstance(merged_metadata, dict):
+            meta_name = merged_metadata.get("name")
+            if meta_name is not None:
+                effective_name = str(meta_name).strip() or None
+
+        payload = {
+            "id": thread_id,
+            "createdAt": await self.get_current_timestamp(),
+            "name": effective_name,
+            "userId": resolved_user_id,
+            "userIdentifier": resolved_identifier,
+            "tags": json.dumps(tags) if tags is not None else None,
+            "metadata": json.dumps(merged_metadata) if merged_metadata is not None else None,
+        }
+        parameters = {key: value for key, value in payload.items() if value is not None}
+        columns = ", ".join(f'"{key}"' for key in parameters.keys())
+        values = ", ".join(f":{key}" for key in parameters.keys())
+        updates = ", ".join(
+            f'"{key}" = :{key}' for key in parameters.keys() if key != "id"
+        )
+        query = f"""
+            INSERT INTO threads ({columns})
+            VALUES ({values})
+            ON CONFLICT ("id") DO UPDATE
+            SET {updates};
+        """
+        await self.execute_sql(query=query, parameters=parameters)
+
+    async def create_step(self, step_dict):
+        step_copy = dict(step_dict)
+        if isinstance(step_copy.get("tags"), list):
+            step_copy["tags"] = json.dumps(step_copy["tags"])
+        await super().create_step(step_copy)
+
+
+def _native_history_status_note() -> str | None:
+    if not _native_history_requested():
+        return None
+    ready, detail = _native_history_ready()
+    if not ready:
+        return f"Native history backend hazir degil: {detail or 'unknown'}"
+    if not _native_history_auth_enabled():
+        return (
+            "Native history backend hazir, ancak login tanimli degil. "
+            "Gercek thread listeleme/resume icin `CHAINLIT_AUTH_USERNAME` ve "
+            "`CHAINLIT_AUTH_PASSWORD` tanimlaman gerekir."
+        )
+    return None
+
+
+_NATIVE_HISTORY_READY, _NATIVE_HISTORY_ERROR = _native_history_ready()
+
+if _NATIVE_HISTORY_READY and SQLAlchemyDataLayer is not None:
+    @cl.data_layer
+    def get_data_layer():
+        conninfo = _native_history_conninfo()
+        assert conninfo is not None
+        _bootstrap_native_history_sqlite(conninfo)
+        connect_args = {"timeout": 30} if conninfo.startswith("sqlite+aiosqlite:///") else None
+        return NativeHistoryDataLayer(
+            conninfo=conninfo,
+            connect_args=connect_args,
+            storage_provider=None,
+            user_thread_limit=5000,
+            show_logger=False,
+        )
+
+
+if _native_history_requested() and _native_history_auth_enabled():
+    @cl.password_auth_callback
+    async def password_auth(username: str, password: str):
+        expected_user = (os.getenv("CHAINLIT_AUTH_USERNAME", "") or "").strip()
+        expected_pass = os.getenv("CHAINLIT_AUTH_PASSWORD", "") or ""
+        display_name = (os.getenv("CHAINLIT_AUTH_DISPLAY_NAME", "") or "").strip() or expected_user
+        if username != expected_user or password != expected_pass:
+            return None
+        return User(
+            identifier=expected_user,
+            display_name=display_name,
+            metadata={"provider": "local-password"},
+        )
 
 
 def _extract_thread_marker(text: str) -> tuple[str | None, str]:
@@ -80,6 +435,37 @@ def _thread_history_path(thread_id: str | None) -> Path | None:
     return _thread_history_dir() / f"{tid}.json"
 
 
+def _thread_history_payload_load(thread_id: str | None) -> dict[str, Any]:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return {}
+    path = _thread_history_path(tid)
+    if path is None or not path.exists():
+        return {"thread_id": tid}
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"thread_id": tid}
+    return raw if isinstance(raw, dict) else {"thread_id": tid}
+
+
+def _thread_history_payload_save(thread_id: str | None, payload: dict[str, Any]) -> None:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return
+    path = _thread_history_path(tid)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = dict(payload or {})
+        data["thread_id"] = tid
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
 def _thread_memory_load(thread_id: str | None) -> list[dict[str, str]]:
     tid = (thread_id or "").strip()
     if not tid:
@@ -88,15 +474,7 @@ def _thread_memory_load(thread_id: str | None) -> list[dict[str, str]]:
     if cached is not None:
         return cached
 
-    path = _thread_history_path(tid)
-    if path is None or not path.exists():
-        return []
-
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
+    raw = _thread_history_payload_load(tid)
     items = raw.get("messages") if isinstance(raw, dict) else None
     if not isinstance(items, list):
         return []
@@ -119,18 +497,15 @@ def _thread_memory_persist(thread_id: str | None) -> None:
     tid = (thread_id or "").strip()
     if not tid:
         return
-    path = _thread_history_path(tid)
-    if path is None:
-        return
     messages = _THREAD_MEMORY.get(tid, [])
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _thread_history_payload_load(tid)
         payload = {
-            "thread_id": tid,
+            **payload,
             "message_count": len(messages),
             "messages": messages[-_THREAD_MEMORY_MAX_MSGS:],
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _thread_history_payload_save(tid, payload)
     except Exception:
         # Thread persistence is best-effort and must not break chat flow.
         return
@@ -163,6 +538,136 @@ def _thread_pipeline_set(thread_id: str | None, pipeline: RAGPipeline | None) ->
     if not tid or pipeline is None:
         return
     _THREAD_PIPELINES[tid] = pipeline
+
+
+def _normalize_thread_state(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    mode = (raw.get("mode") or "").strip().lower()
+    if mode not in ("chat", "doc"):
+        mode = "doc"
+    runtime_overrides = raw.get("runtime_overrides")
+    if not isinstance(runtime_overrides, dict):
+        runtime_overrides = {}
+    documents = raw.get("documents")
+    if not isinstance(documents, list):
+        documents = []
+    documents = [str(item).strip() for item in documents if str(item or "").strip()]
+    return {
+        "version": int(raw.get("version") or _THREAD_STATE_VERSION),
+        "mode": mode,
+        "active_doc": str(raw.get("active_doc") or "").strip(),
+        "documents": documents,
+        "runtime_overrides": runtime_overrides,
+        "profile_warning": str(raw.get("profile_warning") or "").strip(),
+    }
+
+
+def _thread_name_from_metadata(metadata: Any) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    recent = metadata.get("recent_user_messages")
+    if isinstance(recent, list):
+        for item in reversed(recent):
+            text = str(item or "").strip()
+            if text:
+                return _shorten_for_sidebar(text, limit=72)
+    state = metadata.get(_THREAD_STATE_KEY)
+    if isinstance(state, dict):
+        docs = state.get("documents")
+        if isinstance(docs, list) and docs:
+            text = str(docs[-1] or "").strip()
+            if text:
+                return _shorten_for_sidebar(text, limit=72)
+    return None
+
+
+def _collect_thread_state(pipeline: RAGPipeline | None = None) -> dict[str, Any]:
+    pipeline = _resolve_sidebar_pipeline(pipeline)
+    docs = pipeline.list_documents() if pipeline else []
+    return _normalize_thread_state(
+        {
+            "version": _THREAD_STATE_VERSION,
+            "mode": cl.user_session.get("mode") or "doc",
+            "active_doc": pipeline.active_document_name if pipeline else "",
+            "documents": docs,
+            "runtime_overrides": _runtime_overrides(),
+            "profile_warning": cl.user_session.get(_PROFILE_WARNING_KEY) or "",
+        }
+    )
+
+
+def _thread_state_load(thread_id: str | None) -> dict[str, Any]:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return {}
+    payload = _thread_history_payload_load(tid)
+    return _normalize_thread_state(payload.get("thread_state"))
+
+
+def _thread_state_persist(thread_id: str | None, pipeline: RAGPipeline | None = None) -> None:
+    tid = (thread_id or "").strip()
+    state = _collect_thread_state(pipeline)
+    cl.user_session.set(_THREAD_STATE_KEY, state)
+    if not tid:
+        return
+    payload = _thread_history_payload_load(tid)
+    payload["thread_state"] = state
+    _thread_history_payload_save(tid, payload)
+
+
+def _thread_state_from_metadata(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    return _normalize_thread_state(metadata.get(_THREAD_STATE_KEY))
+
+
+def _restore_thread_state(
+    thread_id: str | None,
+    *,
+    metadata: Any = None,
+    pipeline: RAGPipeline | None = None,
+) -> RAGPipeline | None:
+    tid = (thread_id or "").strip()
+    state = _thread_state_from_metadata(metadata)
+    if not state:
+        state = _thread_state_load(tid)
+
+    if not state:
+        if tid:
+            cl.user_session.set("ui_thread_id", tid)
+        return pipeline
+
+    if tid:
+        cl.user_session.set("ui_thread_id", tid)
+    cl.user_session.set("mode", state.get("mode") or "doc")
+    cl.user_session.set(_RUNTIME_OVERRIDES_KEY, state.get("runtime_overrides") or {})
+    cl.user_session.set(_THREAD_STATE_KEY, state)
+    cl.user_session.set(_PROFILE_WARNING_KEY, state.get("profile_warning") or "")
+
+    if pipeline is None:
+        pipeline = _thread_pipeline_get(tid) or cl.user_session.get("pipeline")
+    if pipeline is None:
+        pipeline = _get_pipeline()
+        cl.user_session.set("pipeline", pipeline)
+    else:
+        # Thread/session state may be restored onto an already-live pipeline object.
+        # Re-apply runtime overrides so sidebar and runtime stay aligned after reload/resume.
+        _apply_runtime_overrides_to_pipeline(pipeline)
+        cl.user_session.set("pipeline", pipeline)
+
+    active_doc = (state.get("active_doc") or "").strip()
+    if active_doc and pipeline and pipeline.has_documents:
+        pipeline.set_active_document(active_doc)
+
+    if tid and pipeline is not None:
+        _thread_pipeline_set(tid, pipeline)
+    return pipeline
+
+
+def _active_thread_id() -> str | None:
+    tid = (cl.user_session.get("ui_thread_id") or "").strip()
+    return tid or None
 
 
 def _resolve_sidebar_pipeline(preferred: RAGPipeline | None = None) -> RAGPipeline | None:
@@ -908,6 +1413,18 @@ async def on_chat_start():
     cl.user_session.set(_CHAT_HISTORY_KEY, [])
     pipeline = _get_pipeline()
     profile_warning = _apply_chat_profile_to_pipeline(pipeline)
+    native_history_note = _native_history_status_note()
+    if native_history_note:
+        print(f"[ui] {native_history_note}", flush=True)
+    if _NATIVE_HISTORY_READY:
+        try:
+            session_user = cl_context.session.user
+            identifier = str(getattr(session_user, "identifier", "") or "").strip()
+            conninfo = _native_history_conninfo()
+            if conninfo and identifier:
+                _native_history_backfill_user_binding(conninfo, identifier)
+        except Exception:
+            pass
 
     # Track active sessions for optional auto-exit behavior.
     async with _EXIT_LOCK:
@@ -925,6 +1442,25 @@ async def on_chat_start():
         await cl.Message(content=profile_warning).send()
     cl.user_session.set(_PROFILE_WARNING_KEY, profile_warning or "")
     await cl.ChatSettings(_settings_widgets(pipeline)).send()
+    await _update_documents_sidebar(pipeline)
+
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: ThreadDict):
+    thread_id = str(thread.get("id") or "").strip()
+    metadata = thread.get("metadata") or {}
+    if _NATIVE_HISTORY_READY:
+        try:
+            session_user = cl_context.session.user
+            identifier = str(getattr(session_user, "identifier", "") or "").strip()
+            conninfo = _native_history_conninfo()
+            if conninfo and identifier:
+                _native_history_backfill_user_binding(conninfo, identifier)
+        except Exception:
+            pass
+    pipeline = _restore_thread_state(thread_id, metadata=metadata)
+    if pipeline is not None:
+        await _sync_profile_to_pipeline(pipeline)
     await _update_documents_sidebar(pipeline)
 
 
@@ -1009,6 +1545,8 @@ async def on_settings_update(values: dict):
         vlm_provider=resolved_vlm_provider,
         vlm_max_pages=selected_vlm_pages,
     )
+    cl.user_session.set("pipeline", pipeline)
+    _thread_pipeline_set(_active_thread_id(), pipeline)
 
     if (
         result.get("embedding_changed")
@@ -1110,6 +1648,7 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
     """
     try:
         pipeline = _resolve_sidebar_pipeline(pipeline)
+        _thread_state_persist(_active_thread_id(), pipeline)
 
         mode = cl.user_session.get("mode") or "doc"
         docs = pipeline.list_documents() if pipeline else []
@@ -1143,6 +1682,7 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
             docs=docs,
         )
         await cl.ElementSidebar.set_title("Belge Durumu")
+        sidebar_key = f"belge-durumu-{_next_sidebar_rev()}"
         await cl.ElementSidebar.set_elements(
             [
                 cl.Text(
@@ -1150,7 +1690,8 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
                     content=content,
                     display="inline",
                 )
-            ]
+            ],
+            key=sidebar_key,
         )
     except Exception as err:
         # Sidebar updates are best-effort and must not break chat flow.
@@ -1496,6 +2037,7 @@ async def on_message(message: cl.Message):
             cl.user_session.set("ui_thread_id", forced_thread_id)
             active_ui_thread_id = forced_thread_id
         if active_ui_thread_id:
+            pipeline = _restore_thread_state(active_ui_thread_id, pipeline=pipeline)
             pipeline_for_thread = _thread_pipeline_get(active_ui_thread_id)
             if pipeline_for_thread is not None:
                 pipeline = pipeline_for_thread
