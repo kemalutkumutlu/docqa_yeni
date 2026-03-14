@@ -624,6 +624,14 @@ def _shorten_for_sidebar(text: str, limit: int = 84) -> str:
     return clean[: max(0, limit - 3)] + "..."
 
 
+def _embedding_runtime_label(model_name: str | None, device: str | None) -> str:
+    model = (model_name or "").strip().lower()
+    dev = (device or "").strip().lower() or "-"
+    if model.startswith("gemini-embedding-"):
+        return "remote api"
+    return dev
+
+
 def _get_chat_history() -> list[str]:
     raw = cl.user_session.get(_CHAT_HISTORY_KEY)
     if not isinstance(raw, list):
@@ -968,7 +976,7 @@ async def on_settings_update(values: dict):
             "**Runtime ayarlari guncellendi**",
             f"- Processing: `{getattr(pipeline, 'processing_mode', 'classic')}`",
             f"- Multimodal Answer Gen: `{getattr(pipeline, 'multimodal_answer_mode', 'auto')}`",
-            f"- Embedding: `{pipeline.embedding_model}` | `{pipeline.embedding_device}`",
+            f"- Embedding: `{pipeline.embedding_model}` | `{_embedding_runtime_label(pipeline.embedding_model, pipeline.embedding_device)}`",
             f"- VLM: `{resolved_vlm_provider}` | `{selected_vlm_mode}` | max_pages=`{selected_vlm_pages}`",
         ]
         if result.get("index_rebuilt"):
@@ -1065,7 +1073,10 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
         llm_provider = (pipeline.llm_provider if pipeline else "gemini") or "gemini"
         llm_model = _active_llm_model(pipeline)
         embedding_model = pipeline.embedding_model if pipeline else "-"
-        embedding_device = pipeline.embedding_device if pipeline else "-"
+        embedding_runtime = _embedding_runtime_label(
+            pipeline.embedding_model if pipeline else "-",
+            pipeline.embedding_device if pipeline else "-",
+        )
         vlm_provider = (pipeline.vlm_config.provider if (pipeline and pipeline.vlm_config) else "-")
         vlm_mode = (pipeline.vlm_config.mode if (pipeline and pipeline.vlm_config) else "-")
         vlm_max_pages = (pipeline.vlm_config.max_pages if (pipeline and pipeline.vlm_config) else "-")
@@ -1078,7 +1089,7 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
         lines = [
             f"**Mod**: `{mode}`",
             f"**LLM**: `{llm_provider}` | `{llm_model}`",
-            f"**Embedding**: `{embedding_model}` | `{embedding_device}`",
+            f"**Embedding**: `{embedding_model}` | `{embedding_runtime}`",
             f"**VLM**: `{vlm_provider}` | `{vlm_mode}` | pages `{vlm_max_pages}`",
             "",
         ]
