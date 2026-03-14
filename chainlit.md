@@ -81,7 +81,11 @@ Sidebar'da tipik olarak su bilgiler gorunur:
 
 ## Gecmis Sohbetler
 
-UI thread bazli hafiza tutar. Bu hafiza sunucu restart sonrasi kalici garanti vermez; runtime bellegine dayalidir.
+UI thread bazli hafiza tutar.
+
+- Gecmis thread mesajlari varsayilan olarak `DATA_DIR/thread_history/*.json` altina yazilir
+- Sidebar'dan eski bir sohbet secildiginde, icerik RAM'de yoksa diskten geri yuklenir
+- Istersen dizini `THREAD_HISTORY_DIR` ile override edebilirsin
 
 ## Not
 

@@ -7,6 +7,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -64,18 +65,90 @@ def _extract_thread_marker(text: str) -> tuple[str | None, str]:
     return (thread_id or None), rest
 
 
+def _thread_history_dir() -> Path:
+    configured = (os.getenv("THREAD_HISTORY_DIR", "") or "").strip()
+    if configured:
+        return Path(configured)
+    data_dir = Path(os.getenv("DATA_DIR", "./data"))
+    return data_dir / "thread_history"
+
+
+def _thread_history_path(thread_id: str | None) -> Path | None:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return None
+    return _thread_history_dir() / f"{tid}.json"
+
+
+def _thread_memory_load(thread_id: str | None) -> list[dict[str, str]]:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return []
+    cached = _THREAD_MEMORY.get(tid)
+    if cached is not None:
+        return cached
+
+    path = _thread_history_path(tid)
+    if path is None or not path.exists():
+        return []
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    items = raw.get("messages") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return []
+
+    loaded: list[dict[str, str]] = []
+    for item in items[-_THREAD_MEMORY_MAX_MSGS:]:
+        if not isinstance(item, dict):
+            continue
+        role = (item.get("role") or "").strip()
+        content = re.sub(r"\s+", " ", (item.get("content") or "").strip())
+        if role not in ("user", "assistant") or not content:
+            continue
+        loaded.append({"role": role, "content": content})
+    if loaded:
+        _THREAD_MEMORY[tid] = loaded
+    return loaded
+
+
+def _thread_memory_persist(thread_id: str | None) -> None:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return
+    path = _thread_history_path(tid)
+    if path is None:
+        return
+    messages = _THREAD_MEMORY.get(tid, [])
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "thread_id": tid,
+            "message_count": len(messages),
+            "messages": messages[-_THREAD_MEMORY_MAX_MSGS:],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        # Thread persistence is best-effort and must not break chat flow.
+        return
+
+
 def _thread_memory_add(thread_id: str | None, role: str, content: str) -> None:
     tid = (thread_id or "").strip()
     msg = re.sub(r"\s+", " ", (content or "").strip())
     if not tid or not msg or role not in ("user", "assistant"):
         return
-    buf = _THREAD_MEMORY.get(tid, [])
+    buf = list(_thread_memory_load(tid))
     if buf and buf[-1].get("role") == role and buf[-1].get("content") == msg:
         return
     buf.append({"role": role, "content": msg})
     if len(buf) > _THREAD_MEMORY_MAX_MSGS:
         buf = buf[-_THREAD_MEMORY_MAX_MSGS:]
     _THREAD_MEMORY[tid] = buf
+    _thread_memory_persist(tid)
 
 
 def _thread_pipeline_get(thread_id: str | None) -> RAGPipeline | None:
@@ -1378,7 +1451,7 @@ async def on_message(message: cl.Message):
             if pipeline_for_thread is not None:
                 pipeline = pipeline_for_thread
                 cl.user_session.set("pipeline", pipeline)
-        entries = _THREAD_MEMORY.get((active_ui_thread_id or "").strip(), [])
+        entries = _thread_memory_load((active_ui_thread_id or "").strip())
         if entries:
             for item in entries:
                 role = item.get("role", "assistant")
