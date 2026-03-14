@@ -70,6 +70,7 @@ class RAGPipeline:
     ocr_config: OCRConfig
     embedding_device: str = "auto"
     processing_mode: str = "classic"
+    multimodal_answer_mode: str = "auto"
     vlm_config: Optional[VLMConfig] = None
     llm_provider: str = "gemini"  # "gemini" | "openai" | "local" | "none"
     ollama_config: Optional[OllamaConfig] = None
@@ -492,6 +493,7 @@ class RAGPipeline:
         embedding_model: Optional[str] = None,
         embedding_device: Optional[str] = None,
         processing_mode: Optional[str] = None,
+        multimodal_answer_mode: Optional[str] = None,
         vlm_mode: Optional[str] = None,
         vlm_provider: Optional[str] = None,
         vlm_max_pages: Optional[int] = None,
@@ -518,6 +520,12 @@ class RAGPipeline:
         if mode_next in ("classic", "multimodal") and mode_next != self.processing_mode:
             self.processing_mode = mode_next
             processing_mode_changed = True
+
+        multimodal_answer_mode_changed = False
+        answer_mode_next = (multimodal_answer_mode or "").strip().lower()
+        if answer_mode_next in ("off", "auto", "on") and answer_mode_next != self.multimodal_answer_mode:
+            self.multimodal_answer_mode = answer_mode_next
+            multimodal_answer_mode_changed = True
 
         if self.vlm_config is None:
             self.vlm_config = VLMConfig(
@@ -557,6 +565,7 @@ class RAGPipeline:
         return {
             "embedding_changed": embedding_changed,
             "processing_mode_changed": processing_mode_changed,
+            "multimodal_answer_mode_changed": multimodal_answer_mode_changed,
             "vlm_changed": vlm_changed,
             "index_rebuilt": index_rebuilt,
         }
@@ -590,6 +599,7 @@ class RAGPipeline:
                     query=query,
                     gemini_api_key=self.gemini_api_key,
                     gemini_model=self.gemini_model,
+                    multimodal_answer_mode=self.multimodal_answer_mode,
                 )
             lg = self._get_logger()
             if lg:
@@ -609,6 +619,7 @@ class RAGPipeline:
                         "coverage_actual": None,
                         "coverage_ok": None,
                         "citations_found": result.citations_found,
+                        "multimodal_answer_mode": self.multimodal_answer_mode,
                         "answer": result.answer,
                         **(
                             {"context_preview": result.context_preview}
@@ -646,6 +657,7 @@ class RAGPipeline:
                 query=query,
                 gemini_api_key=self.gemini_api_key,
                 gemini_model=self.gemini_model,
+                multimodal_answer_mode=self.multimodal_answer_mode,
             )
         _gen_ms = (time.perf_counter() - _t_gen) * 1000
         lg = self._get_logger()
@@ -666,6 +678,7 @@ class RAGPipeline:
                     "coverage_actual": result.coverage_actual,
                     "coverage_ok": result.coverage_ok,
                     "citations_found": result.citations_found,
+                    "multimodal_answer_mode": self.multimodal_answer_mode,
                     "answer": result.answer,
                     "retrieval_ms": round(_retrieval_ms, 1),
                     "generation_ms": round(_gen_ms, 1),
@@ -716,6 +729,7 @@ class RAGPipeline:
                     query=query,
                     gemini_api_key=self.gemini_api_key,
                     gemini_model=self.gemini_model,
+                    multimodal_answer_mode=self.multimodal_answer_mode,
                     on_token=on_token,
                 )
             return result
@@ -751,6 +765,7 @@ class RAGPipeline:
                 query=query,
                 gemini_api_key=self.gemini_api_key,
                 gemini_model=self.gemini_model,
+                multimodal_answer_mode=self.multimodal_answer_mode,
                 on_token=on_token,
             )
         _gen_ms = (time.perf_counter() - _t_gen) * 1000
@@ -773,6 +788,7 @@ class RAGPipeline:
                     "coverage_actual": result.coverage_actual,
                     "coverage_ok": result.coverage_ok,
                     "citations_found": result.citations_found,
+                    "multimodal_answer_mode": self.multimodal_answer_mode,
                     "answer_len": len(result.answer or ""),
                     "retrieval_ms": round(_retrieval_ms, 1),
                     "generation_ms": round(_gen_ms, 1),

@@ -13,6 +13,7 @@ VLMProvider = Literal["gemini", "local"]
 VLMMode = Literal["off", "auto", "force"]
 EmbeddingDevice = Literal["auto", "cpu", "cuda"]
 ProcessingMode = Literal["classic", "multimodal"]
+MultimodalAnswerMode = Literal["off", "auto", "on"]
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class Settings:
     embedding_model: str
     embedding_device: EmbeddingDevice
     processing_mode: ProcessingMode
+    multimodal_answer_mode: MultimodalAnswerMode
 
     data_dir: Path
     chroma_dir: Path
@@ -111,6 +113,13 @@ def load_settings() -> Settings:
         else "classic"
     )
 
+    multimodal_answer_mode_raw = (os.getenv("MULTIMODAL_ANSWER_MODE", "auto") or "auto").strip().lower()
+    multimodal_answer_mode: MultimodalAnswerMode = (
+        multimodal_answer_mode_raw  # type: ignore[assignment]
+        if multimodal_answer_mode_raw in ("off", "auto", "on")
+        else "auto"
+    )
+
     # Embedding model selection:
     # - Default: Gemini embedding for highest remote quality.
     # - "auto" keeps the previous local behavior:
@@ -132,6 +141,7 @@ def load_settings() -> Settings:
         embedding_model=embedding_model,
         embedding_device=embedding_device,
         processing_mode=processing_mode,
+        multimodal_answer_mode=multimodal_answer_mode,
         data_dir=data_dir,
         chroma_dir=chroma_dir,
         ocr_enabled=ocr_enabled,

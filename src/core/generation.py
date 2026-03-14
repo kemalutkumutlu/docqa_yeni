@@ -342,7 +342,45 @@ def _visual_parts(evidences: List[Evidence], limit: int = 2) -> list[types.Part]
     return parts
 
 
-def _build_gemini_user_contents(user_message: str, evidences: List[Evidence]) -> str | list[types.Part]:
+_VISUAL_QUERY_PATTERNS = [
+    re.compile(r"\b(tablo|table|satır|satir|row|sütun|sutun|column|hücre|hucre|cell)\b", re.IGNORECASE),
+    re.compile(r"\b(şekil|sekil|figure|diagram|diyagram|grafik|chart|caption)\b", re.IGNORECASE),
+    re.compile(r"\b(form|alan|field|kutu|box|checkbox|label|değer|deger|value)\b", re.IGNORECASE),
+    re.compile(r"\b(görsel|gorsel|resim|image|layout|yerleşim|yerlesim|sayfadaki|page)\b", re.IGNORECASE),
+]
+
+
+def _query_prefers_visual_reasoning(query: str) -> bool:
+    text = (query or "").strip()
+    if not text:
+        return False
+    return any(pat.search(text) for pat in _VISUAL_QUERY_PATTERNS)
+
+
+def _should_use_multimodal_answer_generation(
+    query: str,
+    evidences: List[Evidence],
+    multimodal_answer_mode: str,
+) -> bool:
+    mode = (multimodal_answer_mode or "auto").strip().lower()
+    has_visual = any(ev.modality == "visual" and ev.image_path for ev in evidences)
+    if not has_visual or mode == "off":
+        return False
+    if mode == "on":
+        return True
+    if not any(ev.modality == "text" for ev in evidences):
+        return True
+    return _query_prefers_visual_reasoning(query)
+
+
+def _build_gemini_user_contents(
+    user_message: str,
+    query: str,
+    evidences: List[Evidence],
+    multimodal_answer_mode: str = "auto",
+) -> str | list[types.Part]:
+    if not _should_use_multimodal_answer_generation(query, evidences, multimodal_answer_mode):
+        return user_message
     image_parts = _visual_parts(evidences)
     if not image_parts:
         return user_message
@@ -695,6 +733,7 @@ def generate_answer(
     query: str,
     gemini_api_key: str,
     gemini_model: str = "gemini-2.0-flash",
+    multimodal_answer_mode: str = "auto",
 ) -> GenerationResult:
     """
     Given retrieval results + user query, call Gemini and return a
@@ -748,7 +787,12 @@ def generate_answer(
         f"SORU: {query}"
     )
 
-    gemini_contents = _build_gemini_user_contents(user_message, retrieval.evidences)
+    gemini_contents = _build_gemini_user_contents(
+        user_message,
+        query,
+        retrieval.evidences,
+        multimodal_answer_mode=multimodal_answer_mode,
+    )
 
     def _call(
         system_instruction: str,
@@ -1023,6 +1067,7 @@ def generate_answer_stream(
     query: str,
     gemini_api_key: str,
     gemini_model: str = "gemini-2.0-flash",
+    multimodal_answer_mode: str = "auto",
     on_token: Optional[Callable[[str], None]] = None,
 ) -> GenerationResult:
     """
@@ -1085,7 +1130,12 @@ def generate_answer_stream(
         f"---\n\n"
         f"SORU: {query}"
     )
-    gemini_contents = _build_gemini_user_contents(user_message, retrieval.evidences)
+    gemini_contents = _build_gemini_user_contents(
+        user_message,
+        query,
+        retrieval.evidences,
+        multimodal_answer_mode=multimodal_answer_mode,
+    )
 
     chunks: list[str] = []
     last_model_error: Optional[Exception] = None

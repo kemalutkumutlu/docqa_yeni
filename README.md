@@ -172,6 +172,7 @@ Gercek multimodal MVP akisini denemek istersen:
 
 ```ini
 DOC_PROCESSING_MODE=multimodal
+MULTIMODAL_ANSWER_MODE=auto
 EMBEDDING_MODEL=gemini-embedding-2-preview
 VLM_PROVIDER=gemini
 VLM_MODE=force
@@ -183,7 +184,9 @@ Bu modun davranisi:
 - sayfa goruntuleri asset olarak saklanir
 - page-level `visual` chunk uretilir
 - `gemini-embedding-2-preview` seciliyse visual chunk icin image+text embedding denenir
-- Gemini generation yolunda secili visual evidence'lar prompt'a eklenir
+- `MULTIMODAL_ANSWER_MODE=auto` ise yalnizca tablo/form/figure/layout tipi sorularda secili visual evidence Gemini prompt'una eklenir
+- `MULTIMODAL_ANSWER_MODE=on` ise visual evidence varsa her zaman multimodal answer generation kullanilir
+- `MULTIMODAL_ANSWER_MODE=off` ise retrieval multimodal kalsa bile generation text-only kalir
 
 Sinirlar:
 
