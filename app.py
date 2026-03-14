@@ -806,6 +806,7 @@ _CHAT_HISTORY_MAX = 12
 _RUNTIME_OVERRIDES_KEY = "runtime_overrides"
 _PROCESSING_MODE_VALUES = ["classic", "multimodal"]
 _MULTIMODAL_ANSWER_MODE_VALUES = ["off", "auto", "on"]
+_VISUAL_CHUNK_LEVEL_VALUES = ["page", "region"]
 _EMBEDDING_MODEL_PRESETS = [
     "gemini-embedding-001",
     "gemini-embedding-2-preview",
@@ -978,6 +979,11 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
         _VLM_PROVIDER_VALUES,
         vlm_cfg.provider if vlm_cfg else "gemini",
     )
+    visual_chunk_level_current = _sanitize_select_value(
+        _get_runtime_value("visual_chunk_level", getattr(pipeline, "visual_chunk_level", "page")),
+        _VISUAL_CHUNK_LEVEL_VALUES,
+        getattr(pipeline, "visual_chunk_level", "page"),
+    )
     vlm_pages_current = _clamp_int(
         _get_runtime_value("vlm_max_pages", vlm_cfg.max_pages if vlm_cfg else _VLM_MAX_PAGES_DEFAULT),
         vlm_cfg.max_pages if vlm_cfg else _VLM_MAX_PAGES_DEFAULT,
@@ -999,6 +1005,13 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
             values=_MULTIMODAL_ANSWER_MODE_VALUES,
             initial_value=multimodal_answer_mode_current,
             description="Sadece multimodal mode + Gemini icin anlamli. off: text-only. auto: gorsel/layout sorularinda. on: visual evidence varsa her zaman.",
+        ),
+        Select(
+            id="visual_chunk_level",
+            label="Visual Chunk Level",
+            values=_VISUAL_CHUNK_LEVEL_VALUES,
+            initial_value=visual_chunk_level_current,
+            description="multimodal icin visual granularity. page: mevcut kararlı akış. region: deneysel crop tabanlı akış.",
         ),
         Select(
             id="embedding_model",
@@ -1064,6 +1077,11 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
             overrides.get("multimodal_answer_mode"),
             _MULTIMODAL_ANSWER_MODE_VALUES,
             getattr(pipeline, "multimodal_answer_mode", "auto"),
+        ),
+        visual_chunk_level=_sanitize_select_value(
+            overrides.get("visual_chunk_level"),
+            _VISUAL_CHUNK_LEVEL_VALUES,
+            getattr(pipeline, "visual_chunk_level", "page"),
         ),
         embedding_model=model_resolved,
         embedding_device=device,
@@ -1151,6 +1169,7 @@ def _render_sidebar_panel(
     vlm_provider: str,
     vlm_mode: str,
     vlm_max_pages: str,
+    visual_chunk_level: str,
     active_doc: str | None,
     docs: list[str],
 ) -> str:
@@ -1163,6 +1182,7 @@ def _render_sidebar_panel(
             f"- **LLM**: {_sidebar_chip(llm_provider)} {_sidebar_chip(llm_model)}",
             f"- **Embedding**: {_sidebar_chip(embedding_model)} {_sidebar_chip(embedding_runtime)}",
             f"- **VLM**: {_sidebar_chip(vlm_provider)} {_sidebar_chip(vlm_mode)} {_sidebar_chip(f'pages {vlm_max_pages}')}",
+            f"- **Visual Level**: {_sidebar_chip(visual_chunk_level)}",
             "",
             "---",
             "",
@@ -1328,6 +1348,7 @@ def _get_pipeline() -> RAGPipeline:
             embedding_device=getattr(settings, "embedding_device", "auto"),
             processing_mode=getattr(settings, "processing_mode", "classic"),
             multimodal_answer_mode=getattr(settings, "multimodal_answer_mode", "auto"),
+            visual_chunk_level=getattr(settings, "visual_chunk_level", "page"),
             vlm_config=VLMConfig(
                 api_key=settings.gemini_api_key,
                 model=settings.gemini_model,
@@ -1488,6 +1509,11 @@ async def on_settings_update(values: dict):
         _MULTIMODAL_ANSWER_MODE_VALUES,
         getattr(pipeline, "multimodal_answer_mode", "auto"),
     )
+    selected_visual_chunk_level = _sanitize_select_value(
+        values.get("visual_chunk_level"),
+        _VISUAL_CHUNK_LEVEL_VALUES,
+        getattr(pipeline, "visual_chunk_level", "page"),
+    )
     selected_model_choice = str(values.get("embedding_model") or pipeline.embedding_model).strip()
     if not selected_model_choice:
         selected_model_choice = pipeline.embedding_model
@@ -1530,6 +1556,7 @@ async def on_settings_update(values: dict):
             "embedding_device": selected_device,
             "processing_mode": selected_processing_mode,
             "multimodal_answer_mode": selected_multimodal_answer_mode,
+            "visual_chunk_level": selected_visual_chunk_level,
             "vlm_mode": selected_vlm_mode,
             "vlm_provider": resolved_vlm_provider,
             "vlm_max_pages": selected_vlm_pages,
@@ -1539,6 +1566,7 @@ async def on_settings_update(values: dict):
     result = pipeline.reconfigure_runtime(
         processing_mode=selected_processing_mode,
         multimodal_answer_mode=selected_multimodal_answer_mode,
+        visual_chunk_level=selected_visual_chunk_level,
         embedding_model=resolved_model,
         embedding_device=selected_device,
         vlm_mode=selected_vlm_mode,
@@ -1553,11 +1581,13 @@ async def on_settings_update(values: dict):
         or result.get("vlm_changed")
         or result.get("processing_mode_changed")
         or result.get("multimodal_answer_mode_changed")
+        or result.get("visual_chunk_level_changed")
     ):
         messages = [
             "**Runtime ayarlari guncellendi**",
             f"- Processing: `{getattr(pipeline, 'processing_mode', 'classic')}`",
             f"- Multimodal Answer Gen: `{getattr(pipeline, 'multimodal_answer_mode', 'auto')}`",
+            f"- Visual Chunk Level: `{getattr(pipeline, 'visual_chunk_level', 'page')}`",
             f"- Embedding: `{pipeline.embedding_model}` | `{_embedding_runtime_label(pipeline.embedding_model, pipeline.embedding_device)}`",
             f"- VLM: `{resolved_vlm_provider}` | `{selected_vlm_mode}` | max_pages=`{selected_vlm_pages}`",
         ]
@@ -1571,6 +1601,8 @@ async def on_settings_update(values: dict):
             messages.append("- Processing mode bir sonraki belge yuklemelerinde uygulanir. Mevcut belgeleri yeniden yuklemeniz gerekir.")
         if result.get("multimodal_answer_mode_changed"):
             messages.append("- Multimodal answer generation ayari aninda uygulanir; reindex gerekmez.")
+        if result.get("visual_chunk_level_changed"):
+            messages.append("- Visual chunk level deneysel bir ayardir; mevcut belgeler icin yeniden yukleme gerekir.")
         if vlm_warning:
             messages.append(f"- Not: {vlm_warning}")
         await cl.Message(content="\n".join(messages)).send()
@@ -1663,6 +1695,7 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
         vlm_provider = (pipeline.vlm_config.provider if (pipeline and pipeline.vlm_config) else "-")
         vlm_mode = (pipeline.vlm_config.mode if (pipeline and pipeline.vlm_config) else "-")
         vlm_max_pages = (pipeline.vlm_config.max_pages if (pipeline and pipeline.vlm_config) else "-")
+        visual_chunk_level = getattr(pipeline, "visual_chunk_level", "page") if pipeline else "-"
 
         print(
             f"[ui] sidebar update: docs={docs}, active={active}, mode={mode}",
@@ -1678,6 +1711,7 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
             vlm_provider=vlm_provider,
             vlm_mode=vlm_mode,
             vlm_max_pages=str(vlm_max_pages),
+            visual_chunk_level=str(visual_chunk_level),
             active_doc=active,
             docs=docs,
         )

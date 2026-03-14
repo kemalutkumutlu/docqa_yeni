@@ -71,6 +71,7 @@ class RAGPipeline:
     embedding_device: str = "auto"
     processing_mode: str = "classic"
     multimodal_answer_mode: str = "auto"
+    visual_chunk_level: str = "page"
     vlm_config: Optional[VLMConfig] = None
     llm_provider: str = "gemini"  # "gemini" | "openai" | "local" | "none"
     ollama_config: Optional[OllamaConfig] = None
@@ -178,6 +179,7 @@ class RAGPipeline:
                 f"emb_model={self.embedding_model}",
                 f"emb_dev={self.embedding_device}",
                 f"processing_mode={self.processing_mode}",
+                f"visual_chunk_level={self.visual_chunk_level}",
                 f"content_norm={CONTENT_NORMALIZER_VERSION}",
                 f"ocr_enabled={bool(o.enabled)}",
                 f"ocr_lang={o.lang}",
@@ -238,6 +240,7 @@ class RAGPipeline:
             multimodal=MultimodalConfig(
                 enabled=self.processing_mode == "multimodal",
                 assets_dir=assets_dir,
+                chunk_level=self.visual_chunk_level,
             ),
         )
         _progress("Belge yapisi analiz ediliyor...")
@@ -494,6 +497,7 @@ class RAGPipeline:
         embedding_device: Optional[str] = None,
         processing_mode: Optional[str] = None,
         multimodal_answer_mode: Optional[str] = None,
+        visual_chunk_level: Optional[str] = None,
         vlm_mode: Optional[str] = None,
         vlm_provider: Optional[str] = None,
         vlm_max_pages: Optional[int] = None,
@@ -526,6 +530,12 @@ class RAGPipeline:
         if answer_mode_next in ("off", "auto", "on") and answer_mode_next != self.multimodal_answer_mode:
             self.multimodal_answer_mode = answer_mode_next
             multimodal_answer_mode_changed = True
+
+        visual_chunk_level_changed = False
+        visual_level_next = (visual_chunk_level or "").strip().lower()
+        if visual_level_next in ("page", "region") and visual_level_next != self.visual_chunk_level:
+            self.visual_chunk_level = visual_level_next
+            visual_chunk_level_changed = True
 
         if self.vlm_config is None:
             self.vlm_config = VLMConfig(
@@ -566,6 +576,7 @@ class RAGPipeline:
             "embedding_changed": embedding_changed,
             "processing_mode_changed": processing_mode_changed,
             "multimodal_answer_mode_changed": multimodal_answer_mode_changed,
+            "visual_chunk_level_changed": visual_chunk_level_changed,
             "vlm_changed": vlm_changed,
             "index_rebuilt": index_rebuilt,
         }

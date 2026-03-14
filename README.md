@@ -174,6 +174,7 @@ Gercek multimodal MVP akisini denemek istersen:
 ```ini
 DOC_PROCESSING_MODE=multimodal
 MULTIMODAL_ANSWER_MODE=auto
+VISUAL_CHUNK_LEVEL=page
 EMBEDDING_MODEL=gemini-embedding-2-preview
 VLM_PROVIDER=gemini
 VLM_MODE=force
@@ -184,6 +185,7 @@ Bu modun davranisi:
 - klasik text chunk'lar korunur
 - sayfa goruntuleri asset olarak saklanir
 - page-level `visual` chunk uretilir
+- `VISUAL_CHUNK_LEVEL=region` secilirse deneysel olarak dikey crop tabanli region chunk'lar uretilir
 - `gemini-embedding-2-preview` seciliyse visual chunk icin image+text embedding denenir
 - `MULTIMODAL_ANSWER_MODE=auto` ise yalnizca tablo/form/figure/layout tipi sorularda secili visual evidence Gemini prompt'una eklenir
 - `MULTIMODAL_ANSWER_MODE=on` ise visual evidence varsa her zaman multimodal answer generation kullanilir
@@ -191,7 +193,8 @@ Bu modun davranisi:
 
 Sinirlar:
 
-- Bu ilk surum `page-level` multimodal moddur; region/table crop seviyesinde degildir
+- Varsayilan akış `page-level` multimodal moddur
+- `VISUAL_CHUNK_LEVEL=region` deneysel bir akistir; sabit dikey crop'lar kullanir, layout-aware bbox/region detector degildir
 - UI'dan mode degistirmek mevcut yuklu belgeleri geriye donuk cevirmez; belgeyi yeniden yuklemek gerekir
 
 #### Tamamen lokal mod

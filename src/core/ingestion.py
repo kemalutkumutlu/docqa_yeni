@@ -222,7 +222,134 @@ def _save_visual_asset_image(img: Image.Image, *, out_path: Path) -> tuple[int, 
     return img.size
 
 
-def _pdf_page_visual_asset(
+def _region_labels(region_count: int) -> list[str]:
+    if region_count <= 1:
+        return [""]
+    if region_count == 2:
+        return ["top", "bottom"]
+    return ["top", "middle", "bottom"][:region_count]
+
+
+def _target_region_count(img: Image.Image, summary_text: str) -> int:
+    lines = [line.strip() for line in (summary_text or "").splitlines() if line.strip()]
+    height = int(getattr(img, "height", 0) or 0)
+    if height >= 1500 and len(lines) >= 12:
+        return 3
+    if height >= 900 and len(lines) >= 6:
+        return 2
+    return 1
+
+
+def _split_summary_for_regions(summary_text: str, region_count: int) -> list[str]:
+    clean = (summary_text or "").strip()
+    if region_count <= 1:
+        return [clean]
+
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    if lines:
+        chunk_size = max(1, (len(lines) + region_count - 1) // region_count)
+        out = ["\n".join(lines[idx: idx + chunk_size]).strip() for idx in range(0, len(lines), chunk_size)]
+        out = [item for item in out if item]
+        if len(out) >= region_count:
+            return out[:region_count]
+
+    words = clean.split()
+    if words:
+        chunk_size = max(1, (len(words) + region_count - 1) // region_count)
+        out = [" ".join(words[idx: idx + chunk_size]).strip() for idx in range(0, len(words), chunk_size)]
+        out = [item for item in out if item]
+        if len(out) >= region_count:
+            return out[:region_count]
+
+    return [clean] if clean else [""]
+
+
+def _vertical_region_boxes(width: int, height: int, region_count: int) -> list[tuple[int, int, int, int]]:
+    if region_count <= 1:
+        return [(0, 0, width, height)]
+    boxes: list[tuple[int, int, int, int]] = []
+    step = max(1, height // region_count)
+    for idx in range(region_count):
+        top = idx * step
+        bottom = height if idx == region_count - 1 else min(height, (idx + 1) * step)
+        boxes.append((0, top, width, bottom))
+    return boxes
+
+
+def _build_visual_assets(
+    img: Image.Image,
+    *,
+    ingest_doc_id: str,
+    file_name: str,
+    page_number: int,
+    summary_text: str,
+    multimodal: Optional[MultimodalConfig],
+) -> list[VisualAsset]:
+    if not multimodal or not multimodal.enabled or multimodal.assets_dir is None:
+        return []
+
+    chunk_level = (multimodal.chunk_level or "page").strip().lower()
+    if chunk_level != "region":
+        out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}.png"
+        width, height = _save_visual_asset_image(img, out_path=out_path)
+        return [
+            VisualAsset(
+                doc_id=ingest_doc_id,
+                file_name=file_name,
+                page_number=page_number,
+                image_path=str(out_path),
+                summary_text=summary_text,
+                mime_type="image/png",
+                width=width,
+                height=height,
+            )
+        ]
+
+    region_count = _target_region_count(img, summary_text)
+    if region_count <= 1:
+        out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}.png"
+        width, height = _save_visual_asset_image(img, out_path=out_path)
+        return [
+            VisualAsset(
+                doc_id=ingest_doc_id,
+                file_name=file_name,
+                page_number=page_number,
+                image_path=str(out_path),
+                summary_text=summary_text,
+                mime_type="image/png",
+                width=width,
+                height=height,
+            )
+        ]
+
+    summaries = _split_summary_for_regions(summary_text, region_count)
+    labels = _region_labels(region_count)
+    boxes = _vertical_region_boxes(img.width, img.height, region_count)
+    assets: list[VisualAsset] = []
+    for idx, box in enumerate(boxes, start=1):
+        crop = img.crop(box)
+        out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}_r{idx:02d}.png"
+        width, height = _save_visual_asset_image(crop, out_path=out_path)
+        summary = summaries[idx - 1] if idx - 1 < len(summaries) else (summary_text or "").strip()
+        assets.append(
+            VisualAsset(
+                doc_id=ingest_doc_id,
+                file_name=file_name,
+                page_number=page_number,
+                image_path=str(out_path),
+                summary_text=summary,
+                mime_type="image/png",
+                width=width,
+                height=height,
+                region_label=labels[idx - 1] if idx - 1 < len(labels) else f"region-{idx}",
+                region_index=idx,
+                region_count=region_count,
+            )
+        )
+    return assets
+
+
+def _pdf_page_visual_assets(
     page: fitz.Page,
     *,
     ingest_doc_id: str,
@@ -230,46 +357,34 @@ def _pdf_page_visual_asset(
     page_number: int,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
-) -> Optional[VisualAsset]:
-    if not multimodal or not multimodal.enabled or multimodal.assets_dir is None:
-        return None
+) -> list[VisualAsset]:
     pix = page.get_pixmap(dpi=160)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}.png"
-    width, height = _save_visual_asset_image(img, out_path=out_path)
-    return VisualAsset(
-        doc_id=ingest_doc_id,
+    return _build_visual_assets(
+        img,
+        ingest_doc_id=ingest_doc_id,
         file_name=file_name,
         page_number=page_number,
-        image_path=str(out_path),
         summary_text=summary_text,
-        mime_type="image/png",
-        width=width,
-        height=height,
+        multimodal=multimodal,
     )
 
 
-def _image_visual_asset(
+def _image_visual_assets(
     img_rgb: Image.Image,
     *,
     ingest_doc_id: str,
     file_name: str,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
-) -> Optional[VisualAsset]:
-    if not multimodal or not multimodal.enabled or multimodal.assets_dir is None:
-        return None
-    out_path = multimodal.assets_dir / ingest_doc_id / f"page_{1:04d}.png"
-    width, height = _save_visual_asset_image(img_rgb, out_path=out_path)
-    return VisualAsset(
-        doc_id=ingest_doc_id,
+) -> list[VisualAsset]:
+    return _build_visual_assets(
+        img_rgb,
+        ingest_doc_id=ingest_doc_id,
         file_name=file_name,
         page_number=1,
-        image_path=str(out_path),
         summary_text=summary_text,
-        mime_type="image/png",
-        width=width,
-        height=height,
+        multimodal=multimodal,
     )
 
 
@@ -364,7 +479,7 @@ def ingest_pdf(
                     source=source,  # type: ignore[arg-type]
                 )
             )
-            asset = _pdf_page_visual_asset(
+            assets = _pdf_page_visual_assets(
                 page,
                 ingest_doc_id=doc_id,
                 file_name=file_name,
@@ -372,8 +487,8 @@ def ingest_pdf(
                 summary_text=text_norm,
                 multimodal=multimodal,
             )
-            if asset is not None:
-                visual_assets.append(asset)
+            if assets:
+                visual_assets.extend(assets)
     finally:
         pdf.close()
 
@@ -464,15 +579,15 @@ def ingest_image(
         )
     ]
     if img_rgb is not None:
-        asset = _image_visual_asset(
+        assets = _image_visual_assets(
             img_rgb,
             ingest_doc_id=doc_id,
             file_name=file_name,
             summary_text=text_norm,
             multimodal=multimodal,
         )
-        if asset is not None:
-            visual_assets.append(asset)
+        if assets:
+            visual_assets.extend(assets)
     return IngestResult(
         doc_id=doc_id,
         file_name=file_name,

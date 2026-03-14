@@ -11,6 +11,7 @@ import os
 LLMProvider = Literal["none", "openai", "gemini", "local"]
 VLMProvider = Literal["gemini", "local"]
 VLMMode = Literal["off", "auto", "force"]
+VisualChunkLevel = Literal["page", "region"]
 EmbeddingDevice = Literal["auto", "cpu", "cuda"]
 ProcessingMode = Literal["classic", "multimodal"]
 MultimodalAnswerMode = Literal["off", "auto", "on"]
@@ -41,6 +42,7 @@ class Settings:
     vlm_mode: VLMMode
     vlm_max_pages: int
     vlm_provider: VLMProvider
+    visual_chunk_level: VisualChunkLevel
 
     # Ollama (local LLM/VLM) settings
     ollama_base_url: str
@@ -89,6 +91,12 @@ def load_settings() -> Settings:
 
     vlm_provider_raw = os.getenv("VLM_PROVIDER", "gemini").strip().lower()
     vlm_provider: VLMProvider = vlm_provider_raw if vlm_provider_raw in ("gemini", "local") else "gemini"  # type: ignore[assignment]
+    visual_chunk_level_raw = (os.getenv("VISUAL_CHUNK_LEVEL", "page") or "page").strip().lower()
+    visual_chunk_level: VisualChunkLevel = (
+        visual_chunk_level_raw  # type: ignore[assignment]
+        if visual_chunk_level_raw in ("page", "region")
+        else "page"
+    )
 
     # Ollama settings (only used when LLM_PROVIDER=local or VLM_PROVIDER=local)
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
@@ -151,6 +159,7 @@ def load_settings() -> Settings:
         vlm_mode=vlm_mode,
         vlm_max_pages=vlm_max_pages,
         vlm_provider=vlm_provider,
+        visual_chunk_level=visual_chunk_level,
         ollama_base_url=ollama_base_url,
         ollama_llm_model=ollama_llm_model,
         ollama_vlm_model=ollama_vlm_model,

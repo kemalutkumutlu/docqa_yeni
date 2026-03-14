@@ -28,6 +28,9 @@ class VisualAsset:
     mime_type: str = "image/png"
     width: int = 0
     height: int = 0
+    region_label: str = ""
+    region_index: int = 0
+    region_count: int = 1
 
 
 @dataclass(frozen=True)
