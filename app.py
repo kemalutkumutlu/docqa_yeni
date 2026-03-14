@@ -7,7 +7,6 @@ Run:
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import os
 import re
@@ -633,25 +632,8 @@ def _embedding_runtime_label(model_name: str | None, device: str | None) -> str:
     return dev
 
 
-def _sidebar_escape(text: str | None) -> str:
-    return html.escape((text or "").strip())
-
-
-def _sidebar_chip(text: str | None, *, accent: bool = False) -> str:
-    classes = "docqa-sidebar-chip"
-    if accent:
-        classes += " accent"
-    return f'<span class="{classes}">{_sidebar_escape(text or "-")}</span>'
-
-
-def _sidebar_row(label: str, values: list[str]) -> str:
-    value_html = "".join(values) if values else _sidebar_chip("-")
-    return (
-        '<div class="docqa-sidebar-row">'
-        f'<div class="docqa-sidebar-label">{_sidebar_escape(label)}</div>'
-        f'<div class="docqa-sidebar-values">{value_html}</div>'
-        "</div>"
-    )
+def _sidebar_chip(text: str | None) -> str:
+    return f"`{(text or '-').strip()}`"
 
 
 def _render_sidebar_panel(
@@ -667,41 +649,30 @@ def _render_sidebar_panel(
     active_doc: str | None,
     docs: list[str],
 ) -> str:
-    active_doc_html = (
-        f'<div class="docqa-sidebar-active">{_sidebar_escape(active_doc)}</div>'
-        if active_doc
-        else '<div class="docqa-sidebar-empty">Aktif belge yok</div>'
-    )
-    docs_html = "".join(
-        f'<li class="docqa-sidebar-doc">{_sidebar_escape(doc)}</li>'
-        for doc in docs[:6]
-    )
-    if not docs_html:
-        docs_html = '<li class="docqa-sidebar-doc empty">Henüz belge yüklenmedi</li>'
-
-    return (
-        '<div class="docqa-sidebar-panel">'
-        '<div class="docqa-sidebar-section">'
-        '<div class="docqa-sidebar-heading">Oturum Durumu</div>'
-        f'{_sidebar_row("Mod", [_sidebar_chip(mode, accent=True)])}'
-        f'{_sidebar_row("LLM", [_sidebar_chip(llm_provider, accent=True), _sidebar_chip(llm_model)])}'
-        f'{_sidebar_row("Embedding", [_sidebar_chip(embedding_model), _sidebar_chip(embedding_runtime)])}'
-        f'{_sidebar_row("VLM", [_sidebar_chip(vlm_provider), _sidebar_chip(vlm_mode), _sidebar_chip(f"pages {vlm_max_pages}")])}'
-        "</div>"
-        '<div class="docqa-sidebar-section">'
-        '<div class="docqa-sidebar-heading">Belge Bağlamı</div>'
-        '<div class="docqa-sidebar-subhead">Aktif Belge</div>'
-        f"{active_doc_html}"
-        '<div class="docqa-sidebar-subhead">Yüklenen Belgeler</div>'
-        f'<ul class="docqa-sidebar-docs">{docs_html}</ul>'
-        "</div>"
-        '<div class="docqa-sidebar-section">'
-        '<div class="docqa-sidebar-heading">Hızlı Komutlar</div>'
-        '<div class="docqa-sidebar-command"><span>Aktif belge seç</span><code>/use &lt;dosya&gt;</code></div>'
-        '<div class="docqa-sidebar-command"><span>Belge modu</span><code>/doc</code></div>'
-        '<div class="docqa-sidebar-command"><span>Sohbet modu</span><code>/chat</code></div>'
-        "</div>"
-        "</div>"
+    loaded_docs = "\n".join(f"- {doc}" for doc in docs[:6]) if docs else "- Henüz belge yüklenmedi"
+    active_doc_text = active_doc or "Aktif belge yok"
+    return "\n".join(
+        [
+            "**Oturum Durumu**",
+            f"- **Mod**: {_sidebar_chip(mode)}",
+            f"- **LLM**: {_sidebar_chip(llm_provider)} {_sidebar_chip(llm_model)}",
+            f"- **Embedding**: {_sidebar_chip(embedding_model)} {_sidebar_chip(embedding_runtime)}",
+            f"- **VLM**: {_sidebar_chip(vlm_provider)} {_sidebar_chip(vlm_mode)} {_sidebar_chip(f'pages {vlm_max_pages}')}",
+            "",
+            "---",
+            "",
+            "**Belge Bağlamı**",
+            f"- **Aktif Belge**: {active_doc_text}",
+            "- **Yüklenen Belgeler**:",
+            loaded_docs,
+            "",
+            "---",
+            "",
+            "**Hızlı Komutlar**",
+            f"- Aktif belge seç: {_sidebar_chip('/use <dosya>')}",
+            f"- Belge modu: {_sidebar_chip('/doc')}",
+            f"- Sohbet modu: {_sidebar_chip('/chat')}",
+        ]
     )
 
 
