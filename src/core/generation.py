@@ -198,7 +198,36 @@ Kurallar:
 - Normal sohbet edebilirsin (selamlaşma, hal hatır, genel sorular).
 - Bu modda "belge içeriğine dayanarak" iddia üretme; belge soruları için kullanıcıdan belge moduna geçmesini iste.
 - Gereksiz yere kaynak/citation yazma.
+- Yanıtı asla yarım bırakma; mutlaka tamamlanmış bir cümle veya paragrafla bitir.
 """
+
+_INCOMPLETE_ENDINGS = (
+    ":",
+    ";",
+    ",",
+    "-",
+    "–",
+    "—",
+    "/",
+    "(",
+    "[",
+    "{",
+    "“",
+    '"',
+)
+
+_COMPLETE_ENDINGS = (
+    ".",
+    "!",
+    "?",
+    "]",
+    ")",
+    "}",
+    '"',
+    "”",
+    "'",
+    "…",
+)
 
 
 def _chat_style_addendum(chat_style: str) -> str:
@@ -218,6 +247,124 @@ def _chat_style_addendum(chat_style: str) -> str:
             "- Samimi ama kısa kal; abartılı ifadelerden kaçın.\n"
         )
     return ""
+
+
+def _response_looks_incomplete(text: str) -> bool:
+    """
+    Heuristic guard against provider answers that end mid-sentence.
+    Conservative for short replies; stricter for longer free-form text.
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    if body.endswith(_COMPLETE_ENDINGS):
+        return False
+    if body.endswith(_INCOMPLETE_ENDINGS):
+        return True
+    if body.count("```") % 2 == 1:
+        return True
+    if body.count("**") % 2 == 1:
+        return True
+    if body.count("(") > body.count(")"):
+        return True
+    if body.count("[") > body.count("]"):
+        return True
+
+    words = body.split()
+    if len(words) < 12:
+        return False
+
+    lines = [ln.rstrip() for ln in body.splitlines() if ln.strip()]
+    if lines:
+        last_line = lines[-1].strip()
+        if re.match(r"^[-*•]\s+\S*$", last_line):
+            return True
+        if re.match(r"^\d+[\.\)]\s+\S+$", last_line):
+            return True
+
+    last_char = body[-1]
+    if last_char.isalnum() and len(body) >= 120:
+        return True
+    return False
+
+
+def _merge_continuation(base: str, addition: str) -> str:
+    base_clean = (base or "").rstrip()
+    extra_clean = (addition or "").strip()
+    if not extra_clean:
+        return base_clean
+
+    if extra_clean in base_clean[-240:]:
+        return base_clean
+
+    max_overlap = min(len(base_clean), len(extra_clean), 160)
+    overlap = 0
+    for size in range(max_overlap, 15, -1):
+        if base_clean[-size:] == extra_clean[:size]:
+            overlap = size
+            break
+    if overlap:
+        extra_clean = extra_clean[overlap:].lstrip()
+
+    if not extra_clean:
+        return base_clean
+    if not base_clean:
+        return extra_clean
+    if base_clean.endswith(("\n", " ")):
+        return f"{base_clean}{extra_clean}"
+    return f"{base_clean} {extra_clean}"
+
+
+def _continuation_suffix(base: str, completed: str) -> str:
+    base_clean = base or ""
+    full_clean = completed or ""
+    if full_clean.startswith(base_clean):
+        return full_clean[len(base_clean):]
+    prefix = 0
+    limit = min(len(base_clean), len(full_clean))
+    while prefix < limit and base_clean[prefix] == full_clean[prefix]:
+        prefix += 1
+    return full_clean[prefix:]
+
+
+def _continue_prompt(query: str, partial_answer: str) -> str:
+    tail = partial_answer[-120:].strip()
+    return (
+        f"SORU: {query}\n\n"
+        f"ONCEKI_YANIT:\n{partial_answer}\n\n"
+        f"KESILEN_SON_BOLUM:\n{tail}\n\n"
+        "Görev:\n"
+        "- Önceki yanıt yarım kaldı.\n"
+        "- Aynı yanıtı kaldığı yerden devam ettir.\n"
+        "- Baştan yazma, tekrar etme, özetleme yapma.\n"
+        "- Sadece eksik kalan devam kısmını ver.\n"
+        "- Yanıtı doğal ve tamamlanmış şekilde bitir.\n"
+        "- Sonu eksik bir ifade, tarih, sezon, sayı veya özel isim ile bitirme.\n"
+    )
+
+
+def _complete_if_incomplete(
+    initial_text: str,
+    *,
+    query: str,
+    continue_fn: Callable[[str], str],
+    max_rounds: int = 3,
+) -> str:
+    text = (initial_text or "").strip()
+    if not text:
+        return text
+
+    for _ in range(max_rounds):
+        if not _response_looks_incomplete(text):
+            break
+        extra = (continue_fn(_continue_prompt(query, text)) or "").strip()
+        if not extra:
+            break
+        merged = _merge_continuation(text, extra)
+        if merged == text:
+            break
+        text = merged
+    return text
 
 
 # ── Language selection (lightweight, document-agnostic) ───────────────────────
@@ -661,37 +808,46 @@ def generate_chat_answer(
             )
         )
 
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 5):
-        try:
-            last_model_error: Optional[Exception] = None
-            for model_name in gemini_model_candidates(gemini_model):
-                try:
-                    client = build_gemini_client(gemini_api_key, model_name=model_name)
-                    resp = client.models.generate_content(
-                        model=model_name,
-                        contents=f"SORU: {query}",
-                        config=types.GenerateContentConfig(
-                            system_instruction=_CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query),
-                            temperature=0.4,
-                            max_output_tokens=1024,
-                        ),
-                    )
-                    return (resp.text or "").strip() or "Anlayamadım, tekrar eder misin?"
-                except Exception as model_exc:
-                    last_model_error = model_exc
-                    if not is_model_not_found_error(model_exc):
-                        raise
-            if last_model_error is not None:
-                raise last_model_error
-        except Exception as e:
-            last_err = e
-            if attempt >= 4 or not _retryable(e):
-                raise
-            time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+    system = _CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query)
 
-    # Should never reach here
-    raise last_err  # type: ignore[misc]
+    def _call_chat(user_contents: str, *, temperature: float = 0.4, max_tokens: int = 4096) -> str:
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 5):
+            try:
+                last_model_error: Optional[Exception] = None
+                for model_name in gemini_model_candidates(gemini_model):
+                    try:
+                        client = build_gemini_client(gemini_api_key, model_name=model_name)
+                        resp = client.models.generate_content(
+                            model=model_name,
+                            contents=user_contents,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system,
+                                temperature=temperature,
+                                max_output_tokens=max_tokens,
+                            ),
+                        )
+                        return (resp.text or "").strip()
+                    except Exception as model_exc:
+                        last_model_error = model_exc
+                        if not is_model_not_found_error(model_exc):
+                            raise
+                if last_model_error is not None:
+                    raise last_model_error
+            except Exception as e:
+                last_err = e
+                if attempt >= 4 or not _retryable(e):
+                    raise
+                time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+        raise last_err  # type: ignore[misc]
+
+    answer = _call_chat(f"SORU: {query}") or "Anlayamadım, tekrar eder misin?"
+    answer = _complete_if_incomplete(
+        answer,
+        query=query,
+        continue_fn=lambda prompt: _call_chat(prompt, temperature=0.2, max_tokens=4096),
+    )
+    return answer or "Anlayamadım, tekrar eder misin?"
 
 
 def generate_chat_answer_openai(
@@ -703,27 +859,37 @@ def generate_chat_answer_openai(
     """
     Chat-only generation via OpenAI Chat Completions.
     """
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 5):
-        try:
-            return (
-                _openai_chat_completion(
-                    api_key=openai_api_key,
-                    model=openai_model,
-                    system_instruction=_CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query),
-                    user_contents=f"SORU: {query}",
-                    temperature=0.4,
-                    max_tokens=1024,
-                )
-                or "Anlayamadım, tekrar eder misin?"
-            )
-        except Exception as e:
-            last_err = e
-            if attempt >= 4 or not _openai_retryable(e):
-                raise
-            time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+    system = _CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query)
 
-    raise last_err  # type: ignore[misc]
+    def _call_chat(user_contents: str, *, temperature: float = 0.4, max_tokens: int = 4096) -> str:
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 5):
+            try:
+                return (
+                    _openai_chat_completion(
+                        api_key=openai_api_key,
+                        model=openai_model,
+                        system_instruction=system,
+                        user_contents=user_contents,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    or ""
+                )
+            except Exception as e:
+                last_err = e
+                if attempt >= 4 or not _openai_retryable(e):
+                    raise
+                time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+        raise last_err  # type: ignore[misc]
+
+    answer = _call_chat(f"SORU: {query}") or "Anlayamadım, tekrar eder misin?"
+    answer = _complete_if_incomplete(
+        answer,
+        query=query,
+        continue_fn=lambda prompt: _call_chat(prompt, temperature=0.2, max_tokens=4096),
+    )
+    return answer or "Anlayamadım, tekrar eder misin?"
 
 
 # ── Main generation function ─────────────────────────────────────────────────
@@ -849,6 +1015,12 @@ def generate_answer(
 
     # Call Gemini
     answer = _call(system, gemini_contents, temperature=0.1) or "Belgede bu bilgi bulunamadı."
+    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+        answer = _complete_if_incomplete(
+            answer,
+            query=query,
+            continue_fn=lambda prompt: _call(system, prompt, temperature=0.0, max_tokens=1024),
+        )
 
     # Count citations in the answer
     # Accept a few common citation renderings:
@@ -982,6 +1154,19 @@ def generate_answer_openai(
         temperature=0.1,
         max_tokens=4096,
     ) or "Belgede bu bilgi bulunamadı."
+    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+        answer = _complete_if_incomplete(
+            answer,
+            query=query,
+            continue_fn=lambda prompt: _openai_chat_completion(
+                api_key=openai_api_key,
+                model=openai_model,
+                system_instruction=system,
+                user_contents=prompt,
+                temperature=0.0,
+                max_tokens=1024,
+            ),
+        )
 
     citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
@@ -1165,6 +1350,47 @@ def generate_answer_stream(
         raise last_model_error
 
     answer = "".join(chunks).strip() or "Belgede bu bilgi bulunamadı."
+    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+        def _continue_call(prompt: str) -> str:
+            last_err: Optional[Exception] = None
+            for attempt in range(1, 5):
+                try:
+                    last_model_error_inner: Optional[Exception] = None
+                    for model_name in gemini_model_candidates(gemini_model):
+                        try:
+                            client = build_gemini_client(gemini_api_key, model_name=model_name)
+                            resp = client.models.generate_content(
+                                model=model_name,
+                                contents=prompt,
+                                config=types.GenerateContentConfig(
+                                    system_instruction=system,
+                                    temperature=0.0,
+                                    max_output_tokens=1024,
+                                ),
+                            )
+                            return (resp.text or "").strip()
+                        except Exception as model_exc:
+                            last_model_error_inner = model_exc
+                            if not is_model_not_found_error(model_exc):
+                                raise
+                    if last_model_error_inner is not None:
+                        raise last_model_error_inner
+                except Exception as e:
+                    last_err = e
+                    if attempt >= 4:
+                        raise
+                    time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+            raise last_err  # type: ignore[misc]
+
+        completed = _complete_if_incomplete(
+            answer,
+            query=query,
+            continue_fn=_continue_call,
+        )
+        suffix = _continuation_suffix(answer, completed)
+        if suffix:
+            _emit(suffix)
+            answer = completed
 
     citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
@@ -1266,6 +1492,23 @@ def generate_answer_openai_stream(
         max_tokens=4096,
         on_token=_emit,
     ) or "Belgede bu bilgi bulunamadı."
+    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+        completed = _complete_if_incomplete(
+            answer,
+            query=query,
+            continue_fn=lambda prompt: _openai_chat_completion(
+                api_key=openai_api_key,
+                model=openai_model,
+                system_instruction=system,
+                user_contents=prompt,
+                temperature=0.0,
+                max_tokens=1024,
+            ),
+        )
+        suffix = _continuation_suffix(answer, completed)
+        if suffix:
+            _emit(suffix)
+            answer = completed
 
     citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
@@ -1309,7 +1552,21 @@ def generate_chat_answer_local(
     from .local_llm import OllamaConfig, ollama_chat  # noqa: F811
 
     system = _CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query)
-    result = ollama_chat(cfg=ollama_cfg, system=system, user_message=f"SORU: {query}", temperature=0.4, max_tokens=1024)
+    def _call_chat(user_message: str, *, temperature: float = 0.4, max_tokens: int = 4096) -> str:
+        return ollama_chat(
+            cfg=ollama_cfg,
+            system=system,
+            user_message=user_message,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    result = _call_chat(f"SORU: {query}") or "Anlayamadım, tekrar eder misin?"
+    result = _complete_if_incomplete(
+        result,
+        query=query,
+        continue_fn=lambda prompt: _call_chat(prompt, temperature=0.2, max_tokens=4096),
+    )
     return result or "Anlayamadım, tekrar eder misin?"
 
 
@@ -1374,6 +1631,12 @@ def generate_answer_local(
         return ollama_chat(cfg=ollama_cfg, system=sys, user_message=msg, temperature=temp, max_tokens=max_tok)
 
     answer = _call_local(system, user_message, 0.1) or "Belgede bu bilgi bulunamadı."
+    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+        answer = _complete_if_incomplete(
+            answer,
+            query=query,
+            continue_fn=lambda prompt: _call_local(system, prompt, 0.0, 1024),
+        )
 
     # Citation counting (same logic as Gemini path)
     citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
@@ -1453,7 +1716,7 @@ def generate_answer_local_stream(
     Keeps the same retrieval/context/prompt logic, but skips post-generation
     rewrite retries for the same reason as generate_answer_stream().
     """
-    from .local_llm import OllamaConfig, ollama_chat_stream  # noqa: F811
+    from .local_llm import OllamaConfig, ollama_chat, ollama_chat_stream  # noqa: F811
 
     def _emit(text: str) -> None:
         if on_token and text:
@@ -1515,6 +1778,22 @@ def generate_answer_local_stream(
         max_tokens=4096,
         on_token=_emit,
     ) or "Belgede bu bilgi bulunamadı."
+    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+        completed = _complete_if_incomplete(
+            answer,
+            query=query,
+            continue_fn=lambda prompt: ollama_chat(
+                cfg=ollama_cfg,
+                system=system,
+                user_message=prompt,
+                temperature=0.0,
+                max_tokens=1024,
+            ),
+        )
+        suffix = _continuation_suffix(answer, completed)
+        if suffix:
+            _emit(suffix)
+            answer = completed
 
     citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)

@@ -21,6 +21,7 @@ http://127.0.0.1:8000
 - Belge geldikten sonra ingestion -> indexing -> retrieval -> generation akisi kurulur
 - Ayni session icinde birden fazla belge tutulabilir
 - `/use <dosya>` ile aktif belge secilebilir
+- Sohbet modunda provider cevabi yarim keserse uygulama devami otomatik tamamlamayi dener
 
 Komutlar:
 

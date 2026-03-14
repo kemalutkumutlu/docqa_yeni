@@ -406,6 +406,12 @@ Bu bolum her fazda degerlendirilen alternatifleri ve neden mevcut yolu sectigimi
 - `README.md` ve `TESTING.md` tablolari yeni sonuclara gore guncellendi.
 - `GPU_REQUIREMENTS.md` icine local LLM/VLM (Ollama) icin VRAM'in neden kritik olduguna dair notlar eklendi.
 
+### 10.9 — Chat Completion Guard (Yarim Cevap Koruması)
+- `src/core/generation.py` icine provider cevabinin cumle ortasinda kesildigini anlamaya calisan hafif bir heuristic eklendi
+- Chat-only yolda (Gemini / OpenAI-compatible / Local Ollama) yarim gorunen cevaplar icin otomatik continuation cagrisi yapiliyor
+- Belge cevabi icin non-streaming ve streaming generation yollarina da ayni koruma eklendi; gerekiyorsa eksik kalan kisim sonradan tamamlanip UI'ye ekleniyor
+- Sohbet modu output token butcesi yukseltildi; provider erken stop verse bile tamamlama akisi devreye girecek sekilde sertlestirildi
+
 ## Sonraki Adimlar
 - ~~Retrieval kalitesi icin mini eval set + metrikler~~ -> TAMAM (Faz 7.2)
 - ~~CI/CD pipeline (GitHub Actions)~~ -> TAMAM (Faz 7.1)

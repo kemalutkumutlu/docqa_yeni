@@ -10,6 +10,7 @@ PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Pipeline, belg
 - Generation: Gemini, OpenAI, local Ollama veya extractive mod
 - VLM extraction: Gemini veya local vision model
 - Processing mode: `classic` veya `multimodal`
+- Sohbet modu: provider erken keserse cevap tamamlanmaya calisilir
 - Demo icin onerilen profil: Vertex AI + Gemini
 
 ## Onerilen Demo Profili
