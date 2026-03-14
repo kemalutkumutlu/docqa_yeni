@@ -131,6 +131,7 @@
         font-size: 13px;
         cursor: pointer;
         transition: border-color .14s ease, background .14s ease;
+        user-select: none;
       }
       .docqa-history-item.active {
         border-color: rgba(20,184,166,0.7);
@@ -138,6 +139,10 @@
       }
       .docqa-history-item:hover {
         border-color: rgba(255,255,255,0.22);
+      }
+      .docqa-history-item:focus-visible {
+        outline: 2px solid rgba(20,184,166,0.85);
+        outline-offset: 2px;
       }
       #docqa-history-empty {
         color: #9ca3af;
@@ -178,20 +183,24 @@
       li.textContent = t.title || "Yeni sohbet";
       li.title = t.title || "Yeni sohbet";
       li.dataset.threadId = t.id;
+      li.tabIndex = 0;
+      li.setAttribute("role", "button");
+      li.setAttribute("aria-label", `Sohbeti ac: ${t.title || "Yeni sohbet"}`);
       listEl.appendChild(li);
     }
   };
 
   const openNewChatFromUI = () => {
     suppressGlobalNewUntil = now() + 1200;
-    const buttons = Array.from(document.querySelectorAll("button"));
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
     for (const btn of buttons) {
       const label = `${btn.getAttribute("aria-label") || ""} ${btn.getAttribute("title") || ""} ${btn.textContent || ""}`.toLowerCase();
       if (label.includes("new chat") || label.includes("yeni sohbet")) {
         btn.click();
-        return;
+        return true;
       }
     }
+    return false;
   };
 
   const ensureActiveThread = (seedTitle = "Yeni sohbet") => {
@@ -208,20 +217,40 @@
 
   const composePayload = (threadId, text) => `${threadTag(threadId)} ${text || ""}`.trim();
 
-  const sendProgrammaticMessage = (rawText) => {
-    const textarea = document.querySelector("textarea");
-    if (!textarea) return false;
+  const setComposerValue = (textarea, rawText) => {
+    const proto = Object.getPrototypeOf(textarea);
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && typeof desc.set === "function") {
+      desc.set.call(textarea, rawText);
+    } else {
+      textarea.value = rawText;
+    }
+    textarea.dispatchEvent(new InputEvent("input", { bubbles: true, data: rawText, inputType: "insertText" }));
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  const submitComposer = (textarea) => {
     const form = textarea.closest("form");
     if (!form) return false;
 
-    textarea.value = rawText;
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    const submitBtn = form.querySelector('button[type="submit"], button[aria-label*="Send" i], button[aria-label*="Gonder" i], button[title*="Send" i], button[title*="Gonder" i]');
+    if (submitBtn && !submitBtn.disabled) {
+      submitBtn.click();
+      return true;
+    }
+
     if (typeof form.requestSubmit === "function") {
       form.requestSubmit();
-    } else {
-      form.submit();
+      return true;
     }
-    return true;
+    return false;
+  };
+
+  const sendProgrammaticMessage = (rawText) => {
+    const textarea = document.querySelector("textarea");
+    if (!textarea) return false;
+    setComposerValue(textarea, rawText);
+    return submitComposer(textarea);
   };
 
   const sendProgrammaticMessageWithRetry = (rawText, remaining = 12) => {
@@ -235,8 +264,11 @@
     setActiveId(threadId);
     render();
     suppressGlobalNewUntil = now() + 1200;
-    openNewChatFromUI();
+    const opened = openNewChatFromUI();
+    const delay = opened ? 240 : 40;
+    setTimeout(() => {
       sendProgrammaticMessageWithRetry(`/open_thread ${threadId}`);
+    }, delay);
   };
 
   const startNewThread = () => {
@@ -345,6 +377,16 @@
     rootEl.addEventListener("click", (ev) => {
       const item = ev.target && ev.target.closest ? ev.target.closest(".docqa-history-item") : null;
       if (!item) return;
+      const id = item.dataset.threadId || "";
+      if (!id) return;
+      openThreadInChat(id);
+    });
+
+    rootEl.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      const item = ev.target && ev.target.closest ? ev.target.closest(".docqa-history-item") : null;
+      if (!item) return;
+      ev.preventDefault();
       const id = item.dataset.threadId || "";
       if (!id) return;
       openThreadInChat(id);
