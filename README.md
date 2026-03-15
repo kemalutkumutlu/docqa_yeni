@@ -1,53 +1,21 @@
 # TUSAS DOCQA
 
-PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Pipeline, belgeyi ingest eder, yapiyi cikartir, hiyerarsik chunk'lara boler, Chroma + BM25 ile retrieval yapar ve cevabi kaynakla birlikte uretir.
+PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Proje, belgeyi ingest eder, gerekirse OCR ve gorsel extract uygular, hiyerarsik chunk'lara boler, Chroma + BM25 ile retrieval yapar ve cevabi kaynaklariyla birlikte uretir.
 
-## Ozet
+## Bugunku Durum
 
 - Belge turleri: `PDF`, `PNG`, `JPG`
 - Retrieval: dense + sparse + RRF
-- Query routing: `section_list` ve `normal_qa`
-- Generation: Gemini, OpenAI, local Ollama veya extractive mod
-- VLM extraction: Gemini veya local vision model
+- Generation: `gemini`, `openai`, `local` veya `extractive`
+- OCR backends: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`
+- Layout detector backends: `none`, `sidecar`, `docai`, `docling`
+- Table structure backends: `off`, `auto`, `docai`, `gemini`, `heuristic`
 - Processing mode: `classic` veya `multimodal`
-- Sohbet modu: provider erken keserse cevap tamamlanmaya calisilir
-- Demo icin onerilen profil: Vertex AI + Gemini
-
-## Onerilen Demo Profili
-
-Mevcut stabil profil:
-
-```ini
-LLM_PROVIDER=gemini
-GEMINI_MODEL=gemini-3.1-pro-preview
-GEMINI_FALLBACK_MODEL=gemini-2.5-pro
-
-DOC_PROCESSING_MODE=classic
-EMBEDDING_MODEL=gemini-embedding-001
-EMBEDDING_DIMENSION=3072
-
-VLM_PROVIDER=gemini
-VLM_MODE=force
-OCR_ENABLED=0
-
-VERTEX_ENABLED=1
-VERTEX_PROJECT_ID=your-gcp-project
-VERTEX_LOCATION=global
-VERTEX_REQUEST_TIMEOUT_MS=120000
-GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
-```
-
-Bu profilin mantigi:
-
-- generation: `gemini-3.1-pro-preview`
-- fallback: `gemini-2.5-pro`
-- processing: `classic`
-- embedding: `gemini-embedding-001` `3072d`
-- alternatif preview: `gemini-embedding-2-preview`
-- VLM extraction: Gemini, varsayilan olarak acik
-- OCR: kapali (`OCR_BACKEND=docai` hazir, ancak aktif degil)
+- UI: Chainlit tabanli; `Basic` ve `Advanced` ayar sekmeleri var
 
 ## Mimari
+
+Ana akis:
 
 ```text
 PDF/Image
@@ -59,29 +27,213 @@ PDF/Image
   -> Generation (Gemini/OpenAI/Ollama/Extractive)
 ```
 
-`multimodal` mode secilirse ek olarak:
+Multimodal akis etkinse:
 
 ```text
 PDF/Image
-  -> Page Image Asset Extraction
-  -> Visual Page Chunks
-  -> Multimodal Embedding (Embedding 2 ise image+text denenir)
-  -> Hybrid Retrieval (text + visual evidence)
-  -> Gemini answer generation icin secili gorseller prompt'a eklenir
+  -> Page/Region Visual Assets
+  -> Layout Regions (heuristic / sidecar / docai / docling)
+  -> OCR and/or VLM Extraction
+  -> Optional Table Structure Stage
+  -> Visual + Text Chunks
+  -> Hybrid Retrieval
+  -> Answer Generation
 ```
 
-Ana teknik kararlar:
+Gercek davranis:
 
-- `Hybrid retrieval`: exact keyword ve semantic intent birlikte yakalansin
-- `Hierarchical chunking`: belge baslik yapisi korunarak section-level retrieval yapilsin
-- `Section-list routing`: "nelerdir", "listele" gibi sorularda tum bolum getirilsin
-- `Guarded generation`: baglam disi cevap engellensin, citation zorunlu olsun
+- `classic`: text-first akis
+- `multimodal`: text akis korunur, buna ek olarak visual chunks ve visual evidence yolu eklenir
+- `VISUAL_CHUNK_LEVEL=region`: detector veya heuristic region planning kullanilir
+- `TABLE_STRUCTURE_ENABLED=1`: sadece tablo gorunen region'larda table extraction denenir
+
+## Online / Local Yol Haritasi
+
+### Online taraf
+
+- `Document AI OCR`
+- `Document AI Layout Parser`
+- `Document AI Form/Table Parser`
+- `Gemini generation`
+- `Gemini VLM extract`
+- `Gemini embedding`
+
+### Local taraf
+
+- `PaddleOCR-VL-1.5`
+- `PaddleOCR`
+- `Tesseract legacy`
+- `Docling layout detector`
+- `Ollama LLM`
+- `Ollama VLM`
+- local `sentence-transformers` embedding
+
+### Hybrid pratikte ne demek?
+
+Bu proje tek bir "online mode" veya "local mode" ile sinirli degil. Ornegin:
+
+- OCR local olabilir, generation Gemini olabilir
+- layout detector local `docling`, table parser `gemini` olabilir
+- generation `local`, embedding `gemini` olabilir
+
+## Onerilen Profiller
+
+### 1. Online Best
+
+Genel demo ve en guclu kalite icin:
+
+```ini
+LLM_PROVIDER=gemini
+GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_FALLBACK_MODEL=gemini-2.5-pro
+
+DOC_PROCESSING_MODE=multimodal
+MULTIMODAL_ANSWER_MODE=auto
+EMBEDDING_MODEL=gemini-embedding-2-preview
+
+OCR_ENABLED=1
+OCR_BACKEND=docai
+
+VISUAL_CHUNK_LEVEL=region
+VISUAL_REGION_SOURCE=detector
+VISUAL_DETECTOR_BACKEND=docai
+
+TABLE_STRUCTURE_ENABLED=1
+TABLE_STRUCTURE_BACKEND=auto
+
+VLM_PROVIDER=gemini
+VLM_MODE=force
+```
+
+Gerekli Google alanlari:
+
+- `DOCAI_PROJECT_ID`
+- `DOCAI_LOCATION`
+- `DOCAI_OCR_PROCESSOR_ID`
+- `DOCAI_LAYOUT_PROCESSOR_ID`
+- opsiyonel `DOCAI_TABLE_PROCESSOR_ID`
+- `GOOGLE_APPLICATION_CREDENTIALS`
+
+### 2. Hybrid Best
+
+OCR local, layout online:
+
+```ini
+LLM_PROVIDER=gemini
+DOC_PROCESSING_MODE=multimodal
+MULTIMODAL_ANSWER_MODE=auto
+
+OCR_ENABLED=1
+OCR_BACKEND=paddle_vl
+OCR_DEVICE=cuda
+
+VISUAL_CHUNK_LEVEL=region
+VISUAL_REGION_SOURCE=detector
+VISUAL_DETECTOR_BACKEND=docai
+
+TABLE_STRUCTURE_ENABLED=1
+TABLE_STRUCTURE_BACKEND=auto
+
+VLM_PROVIDER=gemini
+VLM_MODE=force
+```
+
+Bu profil, Paddle OCR GPU ve Google layout/table servislerini birlikte kullanir.
+
+### 3. Local Best
+
+Maksimum offline taraf:
+
+```ini
+LLM_PROVIDER=local
+VLM_PROVIDER=local
+DOC_PROCESSING_MODE=multimodal
+
+OCR_ENABLED=1
+OCR_BACKEND=paddle_vl
+OCR_DEVICE=cuda
+
+VISUAL_CHUNK_LEVEL=region
+VISUAL_REGION_SOURCE=detector
+VISUAL_DETECTOR_BACKEND=docling
+
+TABLE_STRUCTURE_ENABLED=1
+TABLE_STRUCTURE_BACKEND=heuristic
+
+EMBEDDING_MODEL=auto
+EMBEDDING_DEVICE=cuda
+```
+
+Not:
+
+- Bu profil icin `ollama`, `paddle` ve `docling` kurulumlari ayrica gerekli olabilir.
+- Table stage local tarafta simdilik `heuristic` veya `gemini` fallback ile en guclu hale geliyor; tam local Document AI esleniği yok.
+
+## OCR, Layout ve Table Stage
+
+### OCR
+
+Desteklenen backend'ler:
+
+- `docai`: online OCR
+- `paddle_vl`: `PaddleOCR-VL-1.5`
+- `paddle`: standart PaddleOCR
+- `tesseract_legacy`: son fallback
+
+Gercek fallback zinciri:
+
+- `paddle_vl` secilirse: `paddle_vl -> paddle -> tesseract_legacy`
+- `paddle` secilirse: `paddle -> tesseract_legacy`
+- `docai` secilirse: `docai -> tesseract_legacy`
+
+### Layout detector
+
+Desteklenen backend'ler:
+
+- `none`: detector yok
+- `sidecar`: JSON bbox input
+- `docai`: Google Document AI Layout Parser
+- `docling`: lokal layout detector
+
+Docling backend icin:
+
+- `DOCLING_PYTHON_BIN` ayarlanabilir
+- `DOCLING_LAYOUT_MODEL` varsayilan: `docling-layout-heron-101`
+- detector subprocess ile calisir; ana uygulamayi dusurmez
+
+### Table structure
+
+Table stage artik ayri bir katmandir.
+
+- `TABLE_STRUCTURE_ENABLED=1` ise sadece table benzeri region'larda calisir
+- `TABLE_STRUCTURE_BACKEND=auto` ise oncelik:
+  - `docai`
+  - `gemini`
+  - `heuristic`
+
+Bu stage mevcut text/OCR akisinin yerine gecmez; ona ek bilgi uretir.
+
+## UI
+
+Chainlit UI su an:
+
+- chat/doc modlarini destekler
+- birden fazla belgeyi ayni session icinde tutabilir
+- `Basic` ve `Advanced` settings sekmeleri sunar
+- `Runtime Preset` ile hazir kombinasyon secilebilir
+- disabled alanlarla bagimliliklari gorunur hale getirir
+
+Onemli sinir:
+
+- Chainlit `ChatSettings` paneli degisiklikleri backend'e `Confirm` ile yollar
+- yani ayar zinciri secim aninda backend tarafinda yeniden hesaplanmaz
+- sekmeler anlik gorunur, fakat pipeline degisikligi `Confirm` sonrasi uygulanir
+
+Detay icin: `chainlit.md`
 
 ## Kurulum
 
-### 1) Ortam
-
-Python `3.11+` onerilir.
+### 1. Ortam
 
 ```bash
 python -m venv .venv-gpu
@@ -90,190 +242,43 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
+Opsiyonel OCR/layout bagimliliklari:
+
+```bash
+python -m pip install -r requirements-ocr-offline.txt
+```
+
 Not:
 
-- Varsayilan profil Gemini embedding kullandigi icin lokal GPU zorunlu degildir.
-- Lokal `sentence-transformers` embedding kullanacaksan `GPU_REQUIREMENTS.md` icindeki CUDA PyTorch adimini da uygula.
+- `requirements-ocr-offline.txt` tek basina her seyi bitirmez; `paddlepaddle` ve benzeri platform-spesifik paketleri ayri kurman gerekebilir.
+- `docling` icin ayri bir venv kullanmak tavsiye edilir.
 
-### 2) Konfigurasyon
-
-Ornek dosyayi kopyala:
+### 2. Konfigurasyon
 
 ```bash
 cp .env.example .env
 ```
 
-#### Vertex AI ile calisma
+En kritik alanlar:
 
-Onerilen yol budur.
+- `LLM_PROVIDER`
+- `DOC_PROCESSING_MODE`
+- `OCR_ENABLED`
+- `OCR_BACKEND`
+- `VISUAL_CHUNK_LEVEL`
+- `VISUAL_REGION_SOURCE`
+- `VISUAL_DETECTOR_BACKEND`
+- `TABLE_STRUCTURE_ENABLED`
+- `TABLE_STRUCTURE_BACKEND`
+- `VLM_MODE`
+- `VLM_PROVIDER`
 
-```ini
-LLM_PROVIDER=gemini
-GEMINI_MODEL=gemini-3.1-pro-preview
-GEMINI_FALLBACK_MODEL=gemini-2.5-pro
+Google kullaniyorsan:
 
-DOC_PROCESSING_MODE=classic
-EMBEDDING_MODEL=gemini-embedding-001
-EMBEDDING_DIMENSION=3072
-
-VLM_PROVIDER=gemini
-VLM_MODE=force
-OCR_ENABLED=0
-
-VERTEX_ENABLED=1
-VERTEX_PROJECT_ID=your-gcp-project
-VERTEX_LOCATION=global
-VERTEX_FALLBACK_LOCATION=europe-west4
-VERTEX_REQUEST_TIMEOUT_MS=120000
-GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
-```
-
-Not:
-
-- Kod tarafinda model-bazli Vertex location secimi vardir.
-- `gemini-3.1-pro-*` icin `VERTEX_LOCATION`
-- `gemini-2.5-pro-*` icin `VERTEX_FALLBACK_LOCATION`
-
-Gerekli GCP adimlari:
-
-1. Vertex AI API'yi ac
-2. Billing aktif olsun
-3. Service account JSON olustur
-4. `GOOGLE_APPLICATION_CREDENTIALS` ile JSON dosyasini ver
-
-#### AI Studio ile calisma
-
-Vertex kullanmayacaksan:
-
-```ini
-LLM_PROVIDER=gemini
-GEMINI_API_KEY=your-ai-studio-key
-GEMINI_MODEL=gemini-3.1-pro-preview
-GEMINI_FALLBACK_MODEL=gemini-2.5-pro
-
-DOC_PROCESSING_MODE=classic
-EMBEDDING_MODEL=gemini-embedding-001
-EMBEDDING_DIMENSION=3072
-
-VLM_PROVIDER=gemini
-VLM_MODE=force
-OCR_ENABLED=0
-OCR_BACKEND=docai
-
-VERTEX_ENABLED=0
-```
-
-Not:
-
-- Vertex env degiskenleri set ise AI Studio key ile `401 UNAUTHENTICATED` alirsin.
-- AI Studio ile calisacaksan `VERTEX_ENABLED=0` ve eski `GOOGLE_GENAI_USE_VERTEXAI` benzeri shell env'leri kapat.
-
-#### Multimodal profil
-
-Gercek multimodal MVP akisini denemek istersen:
-
-```ini
-DOC_PROCESSING_MODE=multimodal
-MULTIMODAL_ANSWER_MODE=auto
-VISUAL_CHUNK_LEVEL=page
-VISUAL_REGION_SOURCE=heuristic
-VISUAL_DETECTOR_BACKEND=none
-EMBEDDING_MODEL=gemini-embedding-2-preview
-VLM_PROVIDER=gemini
-VLM_MODE=force
-```
-
-Bu modun davranisi:
-
-- klasik text chunk'lar korunur
-- sayfa goruntuleri asset olarak saklanir
-- page-level `visual` chunk uretilir
-- `VISUAL_CHUNK_LEVEL=region` secilirse deneysel olarak dikey crop tabanli region chunk'lar uretilir
-- `VISUAL_REGION_SOURCE=heuristic|detector` ile region proposal kaynagi secilir
-- `VISUAL_DETECTOR_BACKEND=sidecar` secilirse detector bbox'lari JSON sidecar dosyalarindan okunabilir
-- `VISUAL_DETECTOR_BACKEND=docai` secilirse Google Document AI Layout Parser kullanilir
-- `gemini-embedding-2-preview` seciliyse visual chunk icin image+text embedding denenir
-- `MULTIMODAL_ANSWER_MODE=auto` ise yalnizca tablo/form/figure/layout tipi sorularda secili visual evidence Gemini prompt'una eklenir
-- `MULTIMODAL_ANSWER_MODE=on` ise visual evidence varsa her zaman multimodal answer generation kullanilir
-- `MULTIMODAL_ANSWER_MODE=off` ise retrieval multimodal kalsa bile generation text-only kalir
-
-Sinirlar:
-
-- Varsayilan akış `page-level` multimodal moddur
-- `VISUAL_CHUNK_LEVEL=region` deneysel bir akistir; sabit dikey crop'lar kullanir, layout-aware bbox/region detector degildir
-- `VISUAL_REGION_SOURCE=detector` secenegi bbox detector yolunu acar; `sidecar` veya `docai` backend'i yoksa heuristic fallback kullanilir
-- `VISUAL_DETECTOR_BACKEND=sidecar` ile ayni belge icin `<dosya>.regions.json` veya `<stem>.regions.json` dosyasindan bbox region'lari okunabilir
-- `VISUAL_DETECTOR_BACKEND=docai` ile online advanced path olarak Google Document AI Layout Parser kullanilabilir
-- UI'dan mode degistirmek mevcut yuklu belgeleri geriye donuk cevirmez; belgeyi yeniden yuklemek gerekir
-
-Sidecar JSON ornegi:
-
-```json
-{
-  "pages": {
-    "1": [
-      {
-        "label": "header",
-        "crop_type": "detector_header",
-        "confidence": 0.91,
-        "bbox": [0, 0, 1360, 320],
-        "summary_text": "Kapak ve baslik alani"
-      },
-      {
-        "label": "table",
-        "crop_type": "detector_table",
-        "confidence": 0.88,
-        "bbox": [120, 420, 1240, 1180],
-        "summary_text": "Tablo bolgesi"
-      }
-    ]
-  }
-}
-```
-
-Sidecar uretmek ve dogrulamak icin yardimci scriptler:
-
-```bash
-.venv-gpu/bin/python scripts/generate_layout_sidecar.py test_data/Case_Study_20260205.pdf --level region --output ./data/layout_sidecars/Case_Study_20260205.regions.json
-.venv-gpu/bin/python scripts/validate_layout_sidecar.py ./data/layout_sidecars/Case_Study_20260205.regions.json --document test_data/Case_Study_20260205.pdf
-```
-
-Document AI Layout Parser ornek env:
-
-```ini
-DOC_PROCESSING_MODE=multimodal
-VISUAL_CHUNK_LEVEL=region
-VISUAL_REGION_SOURCE=detector
-VISUAL_DETECTOR_BACKEND=docai
-DOCAI_PROJECT_ID=your-gcp-project
-DOCAI_LOCATION=us
-DOCAI_LAYOUT_PROCESSOR_ID=your-layout-processor-id
-DOCAI_LAYOUT_PROCESSOR_VERSION=pretrained-layout-parser-v1.6-pro-2025-12-01
-DOCAI_TIMEOUT_SECONDS=120
-GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
-```
-
-Document AI OCR ornek env:
-
-```ini
-OCR_ENABLED=1
-OCR_BACKEND=docai
-DOCAI_PROJECT_ID=your-gcp-project
-DOCAI_LOCATION=us
-DOCAI_OCR_PROCESSOR_ID=your-enterprise-ocr-processor-id
-DOCAI_OCR_PROCESSOR_VERSION=
-GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
-```
-
-#### Tamamen lokal mod
-
-```ini
-LLM_PROVIDER=local
-VLM_PROVIDER=local
-EMBEDDING_MODEL=auto
-```
-
-Bu profil Ollama gerektirir. Ayrinti icin `chainlit.md` ve `.env.example`.
+- `DOCAI_PROJECT_ID`
+- `DOCAI_LOCATION`
+- processor id alanlari
+- `GOOGLE_APPLICATION_CREDENTIALS`
 
 ## Calistirma
 
@@ -287,8 +292,9 @@ Bu script:
 
 - `.env` dosyasini yukler
 - `.venv-gpu/bin/python` kullanir
+- istenirse `ollama serve` baslatir
 - `scripts/preflight.py` calistirir
-- sonra Chainlit uygulamasini baslatir
+- Chainlit uygulamasini baslatir
 
 Varsayilan adres:
 
@@ -302,216 +308,69 @@ Host ve port override:
 HOST=0.0.0.0 PORT=8001 ./run.sh
 ```
 
-Preflight'i tek basina calistirmak icin:
+## Yardimci Scriptler
+
+Ornek layout scriptleri:
+
+```bash
+.venv-gpu/bin/python scripts/generate_layout_sidecar.py test_data/Case_Study_20260205.pdf --level region --output ./data/layout_sidecars/Case_Study_20260205.regions.json
+.venv-gpu/bin/python scripts/validate_layout_sidecar.py ./data/layout_sidecars/Case_Study_20260205.regions.json --document test_data/Case_Study_20260205.pdf
+.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source detector --detector-backend docai
+```
+
+## Test
+
+Hizli sira:
 
 ```bash
 .venv-gpu/bin/python scripts/preflight.py
-```
-
-Preflight su kontrolleri yapar:
-
-- auth / client kurulumu
-- generation modeli erisilebilir mi
-- embedding cagrisi calisiyor mu
-- VLM extraction cagrisi donuyor mu
-
-## UI ve Demo Notlari
-
-Chainlit UI runtime ayarlari sunar:
-
-- `Processing Mode`
-- `Embedding Model`
-- `Embedding Device`
-- `VLM Mode`
-- `VLM Provider`
-- `VLM Max Pages`
-
-Ancak demo sirasinda bunlari degistirmemen tavsiye edilir. Ozellikle:
-
-- embedding model degisirse indeks yeniden olusturulur
-- processing mode degisirse yeni belge yuklemelerinde fark yaratir
-- VLM ayarlari yeni yuklemelerde fark yaratir
-- provider degisikligi, state'i karmasiklastirir
-
-Mülakat icin en guvenli yol: `.env` ile sabit profil + `./run.sh`.
-
-## OCR, VLM ve GPU
-
-### OCR
-
-- `OCR_ENABLED=0`: OCR tamamen kapali
-- `OCR_ENABLED=1`: secili OCR backend devreye girer
-- `OCR_BACKEND=docai`: online SOTA yol, onerilen varsayilan
-- `OCR_BACKEND=tesseract_legacy`: eski local fallback
-- `OCR_BACKEND=paddle`: offline gercek backend (opsiyonel PaddleOCR kurulumu gerekir)
-- `OCR_BACKEND=paddle_vl`: offline advanced hedef backend; `PaddleOCRVL` kuruluysa denenir, degilse legacy fallback'e duser
-
-Document AI OCR icin:
-
-- `DOCAI_PROJECT_ID`
-- `DOCAI_LOCATION`
-- `DOCAI_OCR_PROCESSOR_ID`
-- opsiyonel `DOCAI_OCR_PROCESSOR_VERSION`
-- `GOOGLE_APPLICATION_CREDENTIALS`
-
-Tesseract legacy gerekiyorsa:
-
-- `TESSERACT_CMD`
-- `TESSDATA_PREFIX`
-- `TESSERACT_CONFIG`
-
-ayarlarini `.env` icinde ver.
-
-Offline PaddleOCR icin:
-
-- `OCR_BACKEND=paddle`
-- `OCR_DEVICE=auto|cpu|cuda`
-- opsiyonel `PADDLE_OCR_VERSION=PP-OCRv5`
-
-Not:
-
-- Bu backend ana `requirements.txt` icinde zorunlu degildir
-- lokal kurulum icin resmi Paddle kurulumuna gore `paddlepaddle` / `paddlepaddle-gpu` ve sonra [requirements-ocr-offline.txt](/home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/requirements-ocr-offline.txt) kur
-- `OCR_BACKEND=paddle_vl` secenegi varsa sistem `PaddleOCRVL` importunu dener; ortam hazir degilse warning verip legacy fallback kullanir
-
-### VLM
-
-Varsayilan demo profilinde:
-
-```ini
-VLM_PROVIDER=gemini
-VLM_MODE=force
-```
-
-Bu, gorsel/PDF extraction sirasinda Gemini VLM'in zorlanarak kullanilmasi anlamina gelir.
-
-### GPU
-
-GPU kullanimi profile gore degisir:
-
-- Gemini generation / Gemini embedding / Gemini VLM: uzak servis, lokal GPU kullanmaz
-- Lokal `sentence-transformers` embedding: lokal GPU kullanabilir
-- Ollama local LLM/VLM: kendi surecinde GPU kullanabilir
-
-Detayli notlar icin `GPU_REQUIREMENTS.md`.
-
-## Test ve Dogrulama
-
-Onerilen siralama:
-
-```bash
 .venv-gpu/bin/python scripts/baseline_gate.py
 .venv-gpu/bin/python scripts/lang_gate.py
-.venv-gpu/bin/python scripts/eval_retrieval.py --pdf test_data/Case_Study_20260205.pdf
-.venv-gpu/bin/python scripts/eval_case_study.py --pdf test_data/Case_Study_20260205.pdf
-```
-
-Hizli smoke:
-
-```bash
 .venv-gpu/bin/python scripts/smoke_suite.py test_data/Case_Study_20260205.pdf
 ```
 
-Region inspect:
+Detaylar icin: `TESTING.md`
 
-```bash
-.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source heuristic
-.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source detector --detector-backend sidecar --detector-dir ./data/layout_sidecars
-.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source detector --detector-backend docai --docai-project-id your-gcp-project --docai-processor-id your-layout-processor-id
-```
-
-Tum test notlari icin `TESTING.md`.
-
-## CI
-
-Workflow: `.github/workflows/ci.yml`
-
-- `baseline_gate.py`
-- `lang_gate.py`
-- `eval_case_study.py` `GEMINI_API_KEY` veya uygun Gemini auth varsa opsiyonel
-
-## Troubleshooting
-
-### 401 UNAUTHENTICATED
-
-Tipik neden: AI Studio API key ile Vertex endpoint'ine gitmek.
-
-Kontrol et:
-
-- `VERTEX_ENABLED`
-- `GOOGLE_APPLICATION_CREDENTIALS`
-- shell icindeki eski `GOOGLE_GENAI_USE_VERTEXAI`
-
-AI Studio kullanacaksan Vertex'i kapat. Vertex kullanacaksan service account ile devam et.
-
-### 404 NOT_FOUND / model bulunamadi
-
-Tipik nedenler:
-
-- model ilgili proje/hesap icin acik degil
-- yanlis region
-- preview model erisimi yok
-
-Oneri:
-
-- `VERTEX_LOCATION=global`
-- primary: `gemini-3.1-pro-preview`
-- fallback: `gemini-2.5-pro`
-
-### Port 8000 dolu
-
-Farkli portla baslat:
-
-```bash
-PORT=8001 ./run.sh
-```
-
-### Belge yuklendi ama indeks olusmadi
-
-Kontrol et:
-
-- extraction bossa VLM/OCR gerekli olabilir
-- `VLM_MAX_PAGES` limiti dusuk olabilir
-- taranmis PDF ise `OCR_ENABLED=1` ve secili OCR backend dogru ayarlandi mi bak
-
-### Lokal GPU gorunuyor ama hizlanma yok
-
-Bu normal olabilir. Varsayilan profil uzak Gemini embedding kullaniyor. Lokal GPU sadece lokal embedding/Ollama yolunda fark yaratir.
-
-## Proje Yapisi
+## Repo Yapisi
 
 ```text
 app.py
 run.sh
-requirements.txt
 README.md
 TESTING.md
+DEVLOG.md
 GPU_REQUIREMENTS.md
 chainlit.md
 .env.example
 
 scripts/
-  baseline_gate.py
-  eval_case_study.py
-  eval_retrieval.py
-  hallucination_test.py
+  docling_layout_runner.py
+  generate_layout_sidecar.py
+  inspect_regions.py
+  paddle_ocr_runner.py
   preflight.py
-  smoke_suite.py
+  validate_layout_sidecar.py
 
 src/
   config.py
   core/
-    embedding.py
-    gemini_client.py
     generation.py
-    indexing.py
     ingestion.py
+    layout_detector.py
+    layout_regions.py
+    models.py
+    multimodal.py
+    ocr_backend.py
     pipeline.py
     retrieval.py
-    structure.py
-    vlm_extract.py
+    table_structure.py
 ```
 
-## Not
+## Kisa Not
 
-Bu repo halen case-study / MVP karakterinde. Guclu taraflari retrieval tasarimi, kaynakli cevap ve coklu calisma modlari. Uretim ortamina tasinacaksa auth, tenancy, observability ve cost control taraflari ayrica sertlestirilmelidir.
+Proje bugun itibariyla "tek bir sade RAG" olmaktan cikmis durumda; artik OCR, layout, table structure ve local/online karisik yollari olan bir belge zekasi sistemi. Bu nedenle dogru kullanim yolu:
+
+- once profil/preset sec
+- sonra belgeyi yukle
+- mode veya backend degisirse belgeyi yeniden yukle
+

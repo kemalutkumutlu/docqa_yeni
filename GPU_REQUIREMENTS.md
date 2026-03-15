@@ -1,110 +1,218 @@
 # GPU_REQUIREMENTS
 
-Bu repo icin GPU kullanimi, secilen profile gore degisir. Guncel varsayilan profil Gemini tabanli uzaktaki servisleri kullandigi icin, lokal GPU her adimda etkili degildir.
+Bu belge, projede GPU'nun hangi parcalarda gercekten fayda sagladigini ozetler. Kritik nokta: bu sistemde her sey GPU ile hizlanmaz.
 
 ## Kisa Ozet
 
 - `Gemini generation`: lokal GPU kullanmaz
 - `Gemini embedding`: lokal GPU kullanmaz
-- `Gemini VLM`: lokal GPU kullanmaz
-- `sentence-transformers` lokal embedding: lokal GPU kullanabilir
+- `Document AI OCR / Layout / Table`: lokal GPU kullanmaz
+- local `sentence-transformers` embedding: lokal GPU kullanabilir
+- `PaddleOCR-VL-1.5` / `PaddleOCR`: lokal GPU kullanabilir
+- `Docling layout detector`: lokal GPU kullanabilir
 - `Ollama` local LLM/VLM: kendi surecinde lokal GPU kullanabilir
 
-Yani bugunku demo profilinde RTX 4090 zorunlu degildir; ancak lokal embedding veya local Ollama yoluna gecersen fark yaratir.
+Yani GPU'nun asil etkili oldugu local kisimlar:
+
+- embedding
+- Paddle OCR
+- Docling layout
+- Ollama
 
 ## GPU Ne Zaman Fayda Saglar?
 
-### 1. Lokal embedding
-
-`EMBEDDING_MODEL=auto` veya sabit bir `sentence-transformers` modeli secersen:
-
-- ilk index olusturmada hizlanma
-- query embedding sirasinda hizlanma
-
-Ornek:
+### 1. Local embedding
 
 ```ini
 EMBEDDING_MODEL=auto
 EMBEDDING_DEVICE=cuda
 ```
 
-veya
+veya:
 
 ```ini
 EMBEDDING_MODEL=intfloat/multilingual-e5-base
 EMBEDDING_DEVICE=cuda
 ```
 
-### 2. Lokal Ollama
+Kazanc:
+
+- ilk index olusturma
+- sorgu embedding latency
+
+### 2. Paddle OCR
+
+```ini
+OCR_ENABLED=1
+OCR_BACKEND=paddle_vl
+OCR_DEVICE=cuda
+```
+
+veya:
+
+```ini
+OCR_ENABLED=1
+OCR_BACKEND=paddle
+OCR_DEVICE=cuda
+```
+
+Kazanc:
+
+- scan/image belgelerde OCR hizi
+- PaddleOCR-VL-1.5 inference
+
+Not:
+
+- environment kirli ise Paddle import zinciri torch/CUDA tarafinda kirilabilir
+- bu durumda ayri OCR venv kullanmak daha stabil olur
+
+### 3. Docling layout detector
+
+```ini
+VISUAL_REGION_SOURCE=detector
+VISUAL_DETECTOR_BACKEND=docling
+DOCLING_DEVICE=cuda
+```
+
+Kazanc:
+
+- bbox/layout detection latency
+- table/block detection kalitesi icin lokal hiz kazanimi
+
+Onemli not:
+
+- `docling` icin ayri bir venv kullanmak tavsiye edilir
+- `DOCLING_PYTHON_BIN` ile projeye baglanabilir
+
+### 4. Ollama local LLM/VLM
 
 ```ini
 LLM_PROVIDER=local
 VLM_PROVIDER=local
 ```
 
-Bu durumda Ollama'nin sectigin modeline gore VRAM tuketimi onemli hale gelir.
+Bu durumda GPU:
 
-## Onerilen Kurulum
+- model inference hizina
+- ilk token gecikmesine
+- vision extraction surelerine
 
-GPU ortamini ayri sanal ortamda tut:
+dogrudan etki eder.
+
+## Onerilen Ortam Stratejisi
+
+Bu projede tek venv'e her seyi yigmak yerine ayri ortam tutmak daha guvenli:
+
+- `.venv-gpu`: ana uygulama
+- ayri `docling` venv: layout detector
+- gerekirse ayri `paddle` venv: OCR
+
+Bunun sebebi:
+
+- torch / CUDA / paddle / docling zincirleri birbirini bozabilir
+- subprocess ile ayrik venv kullanmak ana uygulamayi daha kararlı tutar
+
+## Ana Ortam Kurulumu
 
 ```bash
 python -m venv .venv-gpu
 source .venv-gpu/bin/activate
 python -m pip install -U pip
-```
-
-CUDA uyumlu PyTorch kur. Ornek `cu121`:
-
-```bash
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-Sonra proje bagimliliklarini kur:
-
-```bash
 python -m pip install -r requirements.txt
 ```
+
+Local OCR/layout bagimliliklari icin:
+
+```bash
+python -m pip install -r requirements-ocr-offline.txt
+```
+
+Platforma gore ayrica:
+
+- uygun `torch` build'i
+- uygun `paddlepaddle` veya `paddlepaddle-gpu`
+
+kurulmalidir.
 
 ## Dogrulama
 
 ### Torch GPU goruyor mu?
 
 ```bash
-python -c "import torch; print('torch', torch.__version__); print('cuda', torch.version.cuda); print('available', torch.cuda.is_available()); print('gpu', torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+.venv-gpu/bin/python - <<'PY'
+import torch
+print(torch.__version__)
+print(torch.cuda.is_available())
+print(torch.version.cuda)
+PY
 ```
 
-### Lokal embedding gercekten GPU'da mi?
-
-Bu test yalnizca lokal embedding icin anlamlidir:
+### Local embedding gercekten GPU'da mi?
 
 ```bash
-python -c "from src.config import load_settings; from src.core.embedding import Embedder; s = load_settings(); print('selected', s.embedding_model, s.embedding_device); e = Embedder(s.embedding_model, device=s.embedding_device); e.embed_query('test'); print('device:', getattr(getattr(e, '_model', None), 'device', 'remote-or-n/a'))"
+.venv-gpu/bin/python - <<'PY'
+from src.config import load_settings
+from src.core.embedding import Embedder
+s = load_settings()
+print('selected', s.embedding_model, s.embedding_device)
+e = Embedder(s.embedding_model, device=s.embedding_device)
+e.embed_query('test')
+print('device:', getattr(getattr(e, '_model', None), 'device', 'remote-or-n/a'))
+PY
 ```
 
-Not:
+### Paddle OCR smoke
 
-- `gemini-embedding-001` kullanirken bu yol lokal `torch` device raporlamaz; embedding uzaktan gelir.
+```bash
+.venv-gpu/bin/python scripts/paddle_ocr_runner.py --help
+```
 
-## VRAM Notu
+### Docling smoke
 
-Local Ollama kullaniyorsan:
+```bash
+DOCLING_PYTHON_BIN=/abs/path/to/.venv-docling/bin/python \
+.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source detector --detector-backend docling
+```
 
-- daha buyuk model daha fazla VRAM ister
-- uzun context KV cache'i buyutur
-- VRAM yetmezse CPU offload olabilir
-- bu da latency'yi belirgin artirir
+## VRAM Notlari
+
+### Ollama
 
 Pratikte:
 
 - 7B quantize modeller guvenli baslangictir
-- demo amaci offline gostermekse orta boy model secmek daha mantiklidir
+- uzun context daha fazla VRAM ister
+- vision modelleri de ek maliyet getirir
 
-## Troubleshooting
+Orta seviye kartlarda:
+
+- `qwen2.5:7b`
+- `llava:7b`
+
+makul baslangic secenekleridir.
+
+### Paddle ve Docling
+
+PaddleOCR-VL-1.5 ve layout detector ayni anda ayni GPU uzerinde kosacaksa:
+
+- VRAM baskisi artar
+- ayri surecler gecikmeyi ve bellek kullanimini etkileyebilir
+
+Bu nedenle production benzeri denemelerde:
+
+- her adimi tek tek smoke test etmek
+- ayri venv / ayri surec tercih etmek
+
+daha sagliklidir.
+
+## Sik Sorunlar
 
 ### CUDA gorunuyor ama hizlanma yok
 
-Muhtemel neden: Gemini tabanli uzak embedding kullaniyorsun. Bu beklenen davranistir.
+Muhtemel nedenler:
+
+- Gemini / Document AI kullaniyorsun
+- ilgili path remote servis oldugu icin lokal GPU etkisiz
 
 ### `device: cpu` gorunuyor
 
@@ -113,14 +221,30 @@ Kontrol et:
 - `EMBEDDING_MODEL` lokal mi
 - `EMBEDDING_DEVICE=cuda` mi
 - dogru venv aktif mi
-- CUDA uyumlu torch kurulmus mu
+- CUDA uyumlu torch kurulu mu
 
-### App'i hangi Python ile acayim?
+### Paddle segfault veya import crash
 
-Tek onerilen yol:
+Muhtemel neden:
+
+- torch / CUDA preload zinciri
+- opsiyonel bagimlilik eksigi
+- opencv / libgomp uyumsuzlugu
+
+Pratik cozum:
+
+- ayri temiz OCR venv
+- subprocess ile izolasyon
+
+### App'i hangi Python ile acmaliyim?
 
 ```bash
 ./run.sh
 ```
 
-Bu script `.venv-gpu/bin/python` kullanir ve `preflight.py` ile acilis dogrulamasini yapar.
+Bu script:
+
+- `.venv-gpu/bin/python` kullanir
+- preflight yapar
+- shell/env farklarini azaltir
+

@@ -1,5 +1,67 @@
 # DEVLOG
 
+## Faz 11.0 - Advanced OCR, Layout, Table ve Settings Donemi
+
+Bu faz, projeyi salt "classic RAG" cizgisinden cikarip coklu backend'li belge zekasi sistemine donusturen degisiklikleri toplar.
+
+Bugunku gercek:
+
+- OCR artik ayri bir backend matrisi ile calisiyor:
+  - `docai`
+  - `paddle_vl`
+  - `paddle`
+  - `tesseract_legacy`
+- Layout detector artik ayri bir stage:
+  - `none`
+  - `sidecar`
+  - `docai`
+  - `docling`
+- Table structure artik ayri bir stage:
+  - `off`
+  - `auto`
+  - `docai`
+  - `gemini`
+  - `heuristic`
+- UI settings paneli `Basic` ve `Advanced` sekmelerine ayrildi
+- Runtime preset mantigi eklendi
+- Ayar bagimliliklari gizlenmek yerine disabled alanlarla gorunur hale getirildi
+
+Bu fazda alinan ana kararlar:
+
+1. Yeni capability'leri mevcut text-first akisi bozmadan eklemek
+2. OCR, layout ve table stage'lerini additive hale getirmek
+3. Lokal agir backend'leri subprocess veya ayri venv ile izole etmek
+4. UI'da kullaniciya "hangi yol aktif / fallback neden oldu" bilgisini gostermek
+
+Eklenen yeni moduller:
+
+- `src/core/ocr_backend.py`
+- `src/core/layout_detector.py`
+- `src/core/layout_regions.py`
+- `src/core/table_structure.py`
+- `scripts/paddle_ocr_runner.py`
+- `scripts/docling_layout_runner.py`
+- `scripts/generate_layout_sidecar.py`
+- `scripts/inspect_regions.py`
+- `scripts/validate_layout_sidecar.py`
+
+Operasyonel sonuc:
+
+- Proje artik tek bir "online" veya "local" mod degil
+- her katman icin farkli backend secilebiliyor
+- en guclu kullanim sekli preset veya iyi bilinen profil secmek
+
+UI tarafinda onemli sinir:
+
+- Chainlit settings backend'e `Confirm` ile uygulanir
+- secim aninda backend tarafinda tam reactive hesaplama yoktur
+- bu nedenle alanlar kaybolmak yerine disabled edilerek zincir gorunur tutuldu
+
+Dokumantasyon notu:
+
+- Bu dosya tarihsel logdur
+- bugunku kullanim gercegi icin once `README.md`, `TESTING.md`, `chainlit.md` ve `GPU_REQUIREMENTS.md` okunmalidir
+
 ## Faz 10.0 — Multimodal Mode (MVP)
 
 - Amaç: mevcut `classic` text-first akisi bozmadan, UI'dan secilebilen ayri bir `multimodal` mode eklemek.
