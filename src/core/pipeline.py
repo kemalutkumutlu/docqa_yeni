@@ -34,8 +34,11 @@ from .doc_cache import CachedDocument, DocumentCache
 from .local_llm import OllamaConfig
 from .eventlog import JsonlEventLogger
 from .indexing import LocalIndex
-from .ingestion import OCRConfig, ingest_any, IngestResult
+from .ingestion import ingest_any, IngestResult
+from .layout_detector import resolve_sidecar_path
 from .multimodal import MultimodalConfig, visual_chunks_from_ingest
+from .ocr_backend import OCRConfig
+from .table_structure import TableStructureConfig, table_chunks_from_ingest
 from .vlm_extract import VLMConfig
 from .models import Chunk
 from .retrieval import RetrievalResult, retrieve, classify_query
@@ -72,6 +75,19 @@ class RAGPipeline:
     processing_mode: str = "classic"
     multimodal_answer_mode: str = "auto"
     visual_chunk_level: str = "page"
+    visual_region_source: str = "heuristic"
+    visual_detector_backend: str = "none"
+    visual_detector_dir: Optional[Path] = None
+    docai_project_id: str = ""
+    docai_location: str = "us"
+    docai_layout_processor_id: str = ""
+    docai_layout_processor_version: str = "pretrained-layout-parser-v1.6-pro-2025-12-01"
+    docai_timeout_seconds: int = 120
+    docling_python_bin: str = ""
+    docling_layout_model: str = "docling-layout-heron-101"
+    docling_artifacts_path: Optional[Path] = None
+    docling_device: str = "auto"
+    table_structure_config: Optional[TableStructureConfig] = None
     vlm_config: Optional[VLMConfig] = None
     llm_provider: str = "gemini"  # "gemini" | "openai" | "local" | "none"
     ollama_config: Optional[OllamaConfig] = None
@@ -95,6 +111,52 @@ class RAGPipeline:
             return self._logger
         self._logger = JsonlEventLogger.from_env()
         return self._logger
+
+    @staticmethod
+    def _summarize_evidence(retrieval: RetrievalResult, *, limit: int = 4) -> list[str]:
+        if not any(
+            getattr(ev, "region_label", "") or getattr(ev, "region_id", "") or getattr(ev, "crop_type", "page") != "page"
+            for ev in retrieval.evidences
+        ):
+            return []
+        lines: list[str] = []
+        seen: set[str] = set()
+        for ev in retrieval.evidences:
+            file_name = (ev.heading_path.split(" / ", 1)[0].strip() if " / " in (ev.heading_path or "") else (ev.heading_path or "").strip()) or "Belge"
+            page_text = f"Sayfa {ev.page_start}" if ev.page_start else "Sayfa ?"
+            region_bits: list[str] = []
+            if getattr(ev, "region_label", ""):
+                region_bits.append(f"Region {ev.region_label}")
+            if getattr(ev, "region_id", ""):
+                region_bits.append(str(ev.region_id))
+            if getattr(ev, "crop_type", "") and getattr(ev, "crop_type", "") != "page":
+                region_bits.append(str(ev.crop_type))
+            if getattr(ev, "proposal_source", ""):
+                region_bits.append(f"src={ev.proposal_source}")
+            if float(getattr(ev, "proposal_confidence", 0.0) or 0.0) > 0:
+                region_bits.append(f"conf={float(ev.proposal_confidence):.2f}")
+            location = page_text
+            if region_bits:
+                location += " | " + " | ".join(region_bits)
+            summary = (getattr(ev, "region_summary", "") or "").strip()
+            line = f"- `{file_name}` | {location}"
+            if summary:
+                line += f" | {summary}"
+            if any(int(getattr(ev, name, 0) or 0) > 0 for name in ("bbox_right", "bbox_bottom")):
+                line += (
+                    f" | bbox=({int(getattr(ev, 'bbox_left', 0) or 0)},"
+                    f"{int(getattr(ev, 'bbox_top', 0) or 0)},"
+                    f"{int(getattr(ev, 'bbox_right', 0) or 0)},"
+                    f"{int(getattr(ev, 'bbox_bottom', 0) or 0)})"
+                )
+            key = f"{file_name}:{location}:{summary}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(line)
+            if len(lines) >= limit:
+                break
+        return lines
 
     def _doc_cache(self) -> DocumentCache:
         return DocumentCache(self.chroma_dir.parent / "doc_cache")
@@ -180,9 +242,26 @@ class RAGPipeline:
                 f"emb_dev={self.embedding_device}",
                 f"processing_mode={self.processing_mode}",
                 f"visual_chunk_level={self.visual_chunk_level}",
+                f"visual_region_source={self.visual_region_source}",
+                f"visual_detector_backend={self.visual_detector_backend}",
+                f"docai_location={self.docai_location}",
+                f"docai_processor_id={self.docai_layout_processor_id}",
+                f"docai_processor_version={self.docai_layout_processor_version}",
+                f"docling_python_bin={self.docling_python_bin}",
+                f"docling_layout_model={self.docling_layout_model}",
+                f"docling_artifacts_path={self.docling_artifacts_path or ''}",
+                f"docling_device={self.docling_device}",
                 f"content_norm={CONTENT_NORMALIZER_VERSION}",
                 f"ocr_enabled={bool(o.enabled)}",
+                f"ocr_backend={getattr(o, 'backend', 'tesseract_legacy')}",
                 f"ocr_lang={o.lang}",
+                f"ocr_device={getattr(o, 'device', 'auto')}",
+                f"ocr_paddle_version={getattr(o, 'paddle_ocr_version', 'PP-OCRv5')}",
+                f"ocr_docai_project={getattr(o, 'docai_project_id', '') or ''}",
+                f"ocr_docai_location={getattr(o, 'docai_location', '') or ''}",
+                f"ocr_docai_processor_id={getattr(o, 'docai_processor_id', '') or ''}",
+                f"ocr_docai_processor_version={getattr(o, 'docai_processor_version', '') or ''}",
+                f"ocr_docai_timeout={int(getattr(o, 'docai_timeout_seconds', 120) or 120)}",
                 f"tess_cmd={o.tesseract_cmd or ''}",
                 f"tessdata={o.tessdata_prefix or ''}",
                 f"tess_cfg={getattr(o, 'tesseract_config', None) or ''}",
@@ -199,6 +278,28 @@ class RAGPipeline:
                         f"vlm_has_key={bool(v.api_key)}",
                     ]
                 )
+            t = self.table_structure_config
+            if t is None:
+                parts.append("table_structure=none")
+            else:
+                parts.extend(
+                    [
+                        f"table_enabled={bool(t.enabled)}",
+                        f"table_backend={t.backend}",
+                        f"table_min_conf={t.min_confidence}",
+                        f"table_gemini_model={t.gemini_model}",
+                        f"table_docai_project={t.docai_project_id}",
+                        f"table_docai_location={t.docai_location}",
+                        f"table_docai_processor_id={t.docai_processor_id}",
+                        f"table_docai_processor_version={t.docai_processor_version}",
+                    ]
+                )
+            if self.visual_region_source == "detector" and self.visual_detector_backend == "sidecar":
+                sidecar_path = resolve_sidecar_path(self.visual_detector_dir, display_name or file_path.name)
+                if sidecar_path and sidecar_path.exists():
+                    parts.append(f"detector_sidecar={sha256_file(sidecar_path)}")
+                else:
+                    parts.append("detector_sidecar=missing")
             return "|".join(parts)
 
         fp = _fingerprint()
@@ -237,10 +338,23 @@ class RAGPipeline:
             ocr=self.ocr_config,
             display_name=display_name,
             vlm=self.vlm_config,
+            table_config=self.table_structure_config,
             multimodal=MultimodalConfig(
                 enabled=self.processing_mode == "multimodal",
                 assets_dir=assets_dir,
                 chunk_level=self.visual_chunk_level,
+                region_source=self.visual_region_source,
+                detector_backend=self.visual_detector_backend,
+                detector_dir=self.visual_detector_dir,
+                docai_project_id=self.docai_project_id,
+                docai_location=self.docai_location,
+                docai_processor_id=self.docai_layout_processor_id,
+                docai_processor_version=self.docai_layout_processor_version,
+                docai_timeout_seconds=self.docai_timeout_seconds,
+                docling_python_bin=self.docling_python_bin,
+                docling_layout_model=self.docling_layout_model,
+                docling_artifacts_path=self.docling_artifacts_path,
+                docling_device=self.docling_device,
             ),
         )
         _progress("Belge yapisi analiz ediliyor...")
@@ -249,6 +363,7 @@ class RAGPipeline:
         chunks = section_tree_to_chunks(ingest, root)
         if self.processing_mode == "multimodal":
             chunks.extend(visual_chunks_from_ingest(ingest))
+        chunks.extend(table_chunks_from_ingest(ingest))
 
         state = DocumentState(
             doc_id=ingest.doc_id,
@@ -493,11 +608,21 @@ class RAGPipeline:
     def reconfigure_runtime(
         self,
         *,
+        ocr_enabled: Optional[bool] = None,
+        ocr_backend: Optional[str] = None,
         embedding_model: Optional[str] = None,
         embedding_device: Optional[str] = None,
         processing_mode: Optional[str] = None,
         multimodal_answer_mode: Optional[str] = None,
         visual_chunk_level: Optional[str] = None,
+        visual_region_source: Optional[str] = None,
+        visual_detector_backend: Optional[str] = None,
+        table_structure_enabled: Optional[bool] = None,
+        table_structure_backend: Optional[str] = None,
+        llm_provider: Optional[str] = None,
+        gemini_model: Optional[str] = None,
+        openai_model: Optional[str] = None,
+        local_llm_model: Optional[str] = None,
         vlm_mode: Optional[str] = None,
         vlm_provider: Optional[str] = None,
         vlm_max_pages: Optional[int] = None,
@@ -508,6 +633,17 @@ class RAGPipeline:
         - Embedding model/device changes rebuild the index from loaded chunks.
         - VLM changes affect future document ingestion (new uploads).
         """
+        ocr_changed = False
+        ocr_after = self.ocr_config
+        if ocr_enabled is not None and bool(ocr_enabled) != bool(getattr(ocr_after, "enabled", True)):
+            ocr_after = replace(ocr_after, enabled=bool(ocr_enabled))
+        backend_next = (ocr_backend or "").strip().lower()
+        if backend_next in ("docai", "paddle_vl", "paddle", "tesseract_legacy") and backend_next != getattr(ocr_after, "backend", "tesseract_legacy"):
+            ocr_after = replace(ocr_after, backend=backend_next)
+        if ocr_after != self.ocr_config:
+            self.ocr_config = ocr_after
+            ocr_changed = True
+
         embedding_changed = False
         model_next = (embedding_model or "").strip()
         if model_next and model_next != self.embedding_model:
@@ -536,6 +672,61 @@ class RAGPipeline:
         if visual_level_next in ("page", "region") and visual_level_next != self.visual_chunk_level:
             self.visual_chunk_level = visual_level_next
             visual_chunk_level_changed = True
+
+        visual_region_source_changed = False
+        visual_region_source_next = (visual_region_source or "").strip().lower()
+        if visual_region_source_next in ("heuristic", "detector") and visual_region_source_next != self.visual_region_source:
+            self.visual_region_source = visual_region_source_next
+            visual_region_source_changed = True
+
+        visual_detector_backend_changed = False
+        visual_detector_backend_next = (visual_detector_backend or "").strip().lower()
+        if visual_detector_backend_next in ("none", "sidecar", "docai", "docling") and visual_detector_backend_next != self.visual_detector_backend:
+            self.visual_detector_backend = visual_detector_backend_next
+            visual_detector_backend_changed = True
+
+        table_structure_changed = False
+        if self.table_structure_config is None:
+            self.table_structure_config = TableStructureConfig(
+                enabled=False,
+                backend="auto",
+                gemini_api_key=self.gemini_api_key,
+                gemini_model=self.gemini_model,
+                docai_project_id=self.docai_project_id,
+                docai_location=self.docai_location,
+                docai_timeout_seconds=self.docai_timeout_seconds,
+            )
+        table_after = self.table_structure_config
+        if table_structure_enabled is not None and bool(table_structure_enabled) != bool(getattr(table_after, "enabled", False)):
+            table_after = replace(table_after, enabled=bool(table_structure_enabled))
+        table_backend_next = (table_structure_backend or "").strip().lower()
+        if table_backend_next in ("off", "auto", "docai", "gemini", "heuristic") and table_backend_next != getattr(table_after, "backend", "auto"):
+            table_after = replace(table_after, backend=table_backend_next)
+        if table_after != self.table_structure_config:
+            self.table_structure_config = table_after
+            table_structure_changed = True
+
+        llm_changed = False
+        llm_provider_next = (llm_provider or "").strip().lower()
+        if llm_provider_next in ("gemini", "openai", "local", "none") and llm_provider_next != self.llm_provider:
+            self.llm_provider = llm_provider_next
+            llm_changed = True
+        gemini_model_next = (gemini_model or "").strip()
+        if gemini_model_next and gemini_model_next != self.gemini_model:
+            self.gemini_model = gemini_model_next
+            llm_changed = True
+        openai_model_next = (openai_model or "").strip()
+        if openai_model_next and openai_model_next != self.openai_model:
+            self.openai_model = openai_model_next
+            llm_changed = True
+        local_llm_model_next = (local_llm_model or "").strip()
+        if local_llm_model_next:
+            if self.ollama_config is None:
+                self.ollama_config = OllamaConfig(llm_model=local_llm_model_next)
+                llm_changed = True
+            elif local_llm_model_next != self.ollama_config.llm_model:
+                self.ollama_config = replace(self.ollama_config, llm_model=local_llm_model_next)
+                llm_changed = True
 
         if self.vlm_config is None:
             self.vlm_config = VLMConfig(
@@ -573,10 +764,15 @@ class RAGPipeline:
             index_rebuilt = True
 
         return {
+            "ocr_changed": ocr_changed,
             "embedding_changed": embedding_changed,
             "processing_mode_changed": processing_mode_changed,
             "multimodal_answer_mode_changed": multimodal_answer_mode_changed,
             "visual_chunk_level_changed": visual_chunk_level_changed,
+            "visual_region_source_changed": visual_region_source_changed,
+            "visual_detector_backend_changed": visual_detector_backend_changed,
+            "table_structure_changed": table_structure_changed,
+            "llm_changed": llm_changed,
             "vlm_changed": vlm_changed,
             "index_rebuilt": index_rebuilt,
         }
@@ -612,6 +808,7 @@ class RAGPipeline:
                     gemini_model=self.gemini_model,
                     multimodal_answer_mode=self.multimodal_answer_mode,
                 )
+            result = replace(result, evidence_summary=self._summarize_evidence(empty))
             lg = self._get_logger()
             if lg:
                 lg.log(
@@ -670,6 +867,7 @@ class RAGPipeline:
                 gemini_model=self.gemini_model,
                 multimodal_answer_mode=self.multimodal_answer_mode,
             )
+        result = replace(result, evidence_summary=self._summarize_evidence(ret))
         _gen_ms = (time.perf_counter() - _t_gen) * 1000
         lg = self._get_logger()
         if lg:
@@ -743,6 +941,7 @@ class RAGPipeline:
                     multimodal_answer_mode=self.multimodal_answer_mode,
                     on_token=on_token,
                 )
+            result = replace(result, evidence_summary=self._summarize_evidence(empty))
             return result
 
         _t_ret = time.perf_counter()
@@ -779,6 +978,7 @@ class RAGPipeline:
                 multimodal_answer_mode=self.multimodal_answer_mode,
                 on_token=on_token,
             )
+        result = replace(result, evidence_summary=self._summarize_evidence(ret))
         _gen_ms = (time.perf_counter() - _t_gen) * 1000
 
         lg = self._get_logger()

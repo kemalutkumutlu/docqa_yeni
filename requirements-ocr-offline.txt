@@ -1,0 +1,11 @@
+# Optional offline OCR backends
+#
+# Install this only if you want local Paddle-based OCR.
+# You still need a matching PaddlePaddle runtime from the official docs:
+# - CPU: `pip install paddlepaddle`
+# - CUDA: `pip install paddlepaddle-gpu`
+#
+# Then install:
+#   pip install -r requirements-ocr-offline.txt
+
+paddleocr

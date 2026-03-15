@@ -18,6 +18,7 @@ numpy==2.2.6
 
 # Gemini / Vertex / AI Studio
 google-genai==1.62.0
+google-cloud-documentai==3.6.0
 
 # UI
 chainlit==2.9.6

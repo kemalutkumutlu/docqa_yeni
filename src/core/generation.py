@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 from google import genai
@@ -180,6 +180,7 @@ KESİN KURALLAR — bunlara uymazsan cevap geçersiz sayılır:
 2. Eğer sorunun cevabı bağlamda yoksa veya yetersizse, tam olarak şu cümleyi yaz: \
    "Belgede bu bilgi bulunamadı."
 3. Her bilgi cümlesinin sonuna kaynak referansı ekle: [DosyaAdı - Sayfa X]
+   Bölgesel görsel kanıt varsa region bilgisini de koru: [DosyaAdı - Sayfa X, Region top]
 4. Türkçe cevap ver (kullanıcı İngilizce sorarsa İngilizce).
 5. Cevabı düzgün formatlayarak ver (madde işaretleri, numaralı liste vb.).
 """
@@ -462,14 +463,71 @@ def _build_context(evidences: List[Evidence]) -> str:
             continue
         seen_sections.add(key)
 
-        header = f"[{ev.heading_path} | Sayfa {ev.page_start}"
-        if ev.page_end != ev.page_start:
-            header += f"-{ev.page_end}"
-        header += "]"
+        header = _format_evidence_header(ev)
 
         blocks.append(f"{header}\n{ev.text}")
 
     return "\n\n---\n\n".join(blocks)
+
+
+def _evidence_region_suffix(ev: Evidence) -> str:
+    region = (getattr(ev, "region_label", "") or "").strip()
+    if not region:
+        return ""
+    return f", Region {region}"
+
+
+def _evidence_region_details(ev: Evidence) -> str:
+    parts: list[str] = []
+    region_id = (getattr(ev, "region_id", "") or "").strip()
+    crop_type = (getattr(ev, "crop_type", "") or "").strip()
+    region_summary = (getattr(ev, "region_summary", "") or "").strip()
+    proposal_source = (getattr(ev, "proposal_source", "") or "").strip()
+    proposal_confidence = float(getattr(ev, "proposal_confidence", 0.0) or 0.0)
+    if region_id:
+        parts.append(f"id={region_id}")
+    if crop_type and crop_type != "page":
+        parts.append(f"type={crop_type}")
+    if proposal_source:
+        parts.append(f"source={proposal_source}")
+    if proposal_confidence > 0:
+        parts.append(f"conf={proposal_confidence:.2f}")
+    if region_summary:
+        parts.append(f"summary={region_summary}")
+    return " | ".join(parts)
+
+
+def _format_evidence_header(ev: Evidence) -> str:
+    header = f"[{ev.heading_path} | Sayfa {ev.page_start}"
+    if ev.page_end != ev.page_start:
+        header += f"-{ev.page_end}"
+    if ev.region_label:
+        heading_low = (ev.heading_path or "").strip().lower()
+        region_low = ev.region_label.strip().lower()
+        if f"region {region_low}" not in heading_low:
+            header += _evidence_region_suffix(ev)
+    details = _evidence_region_details(ev)
+    if details:
+        header += f" | {details}"
+    header += "]"
+    return header
+
+
+def _format_citation(file_name: str, ev: Evidence) -> str:
+    cite = f"[{file_name}"
+    if ev.page_start and ev.page_end and ev.page_end != ev.page_start:
+        cite += f" - Sayfa {ev.page_start}-{ev.page_end}"
+    elif ev.page_start:
+        cite += f" - Sayfa {ev.page_start}"
+    cite += _evidence_region_suffix(ev)
+    region_id = (getattr(ev, "region_id", "") or "").strip()
+    crop_type = (getattr(ev, "crop_type", "") or "").strip()
+    if region_id:
+        cite += f", {region_id}"
+    if crop_type and crop_type != "page":
+        cite += f", {crop_type}"
+    cite += "]"
+    return cite
 
 
 def _visual_parts(evidences: List[Evidence], limit: int = 2) -> list[types.Part]:
@@ -739,10 +797,7 @@ def _render_deterministic_section_list(retrieval: RetrievalResult) -> Optional[s
         return None
 
     file_name = _extract_file_name_from_heading_path(parent_ev.heading_path)
-    if parent_ev.page_start and parent_ev.page_end and parent_ev.page_end != parent_ev.page_start:
-        cite = f"[{file_name} - Sayfa {parent_ev.page_start}-{parent_ev.page_end}]"
-    else:
-        cite = f"[{file_name} - Sayfa {parent_ev.page_start or 1}]"
+    cite = _format_citation(file_name, parent_ev)
 
     # Render as numbered list; keep items as-is (extract-only; no translation).
     lines_out: list[str] = []
@@ -781,6 +836,7 @@ class GenerationResult:
     coverage_ok: Optional[bool]  # None if not a section-list query
     intent: QueryIntent
     context_preview: str  # first N chars of context (for debug)
+    evidence_summary: list[str] = field(default_factory=list)
 
 
 def generate_chat_answer(
@@ -1873,14 +1929,9 @@ def generate_extractive_answer(
     seen_pages: set[str] = set()
     for ev in retrieval.evidences[:5]:  # top 5 evidence chunks
         file_name = _extract_file_name_from_heading_path(ev.heading_path)
-        if ev.page_start and ev.page_end and ev.page_end != ev.page_start:
-            cite = f"[{file_name} - Sayfa {ev.page_start}-{ev.page_end}]"
-        elif ev.page_start:
-            cite = f"[{file_name} - Sayfa {ev.page_start}]"
-        else:
-            cite = f"[{file_name}]"
+        cite = _format_citation(file_name, ev)
         # Deduplicate same page content
-        key = f"{file_name}:{ev.page_start}:{ev.page_end}:{ev.text[:80]}"
+        key = f"{file_name}:{ev.page_start}:{ev.page_end}:{ev.region_label}:{ev.text[:80]}"
         if key in seen_pages:
             continue
         seen_pages.add(key)

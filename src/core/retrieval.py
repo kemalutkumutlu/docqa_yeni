@@ -38,6 +38,12 @@ _SECTION_LIST_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"how\s+many\s+(items?|requirements?|sections?)", re.IGNORECASE),
 ]
 
+_VISUAL_REGION_QUERY_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\b(tablo|table|satır|satir|row|sütun|sutun|column|hücre|hucre|cell)\b", re.IGNORECASE),
+    re.compile(r"\b(form|alan|field|checkbox|label|değer|deger|value|imza|signature)\b", re.IGNORECASE),
+    re.compile(r"\b(görsel|gorsel|resim|image|layout|yerleşim|yerlesim|sayfadaki|page|region|bölge|bolge)\b", re.IGNORECASE),
+]
+
 
 def classify_query(query: str) -> QueryIntent:
     """
@@ -50,6 +56,13 @@ def classify_query(query: str) -> QueryIntent:
         if pat.search(query):
             return "section_list"
     return "normal_qa"
+
+
+def _query_prefers_visual_region(query: str) -> bool:
+    text = (query or "").strip()
+    if not text:
+        return False
+    return any(pat.search(text) for pat in _VISUAL_REGION_QUERY_PATTERNS)
 
 
 def _section_fetch_max_depth() -> int:
@@ -80,6 +93,20 @@ class Evidence:
     score: float
     modality: str = "text"
     image_path: str = ""
+    region_label: str = ""
+    region_id: str = ""
+    crop_type: str = "page"
+    region_summary: str = ""
+    proposal_source: str = "heuristic"
+    proposal_confidence: float = 0.0
+    bbox_left: int = 0
+    bbox_top: int = 0
+    bbox_right: int = 0
+    bbox_bottom: int = 0
+    bbox_left_norm: float = 0.0
+    bbox_top_norm: float = 0.0
+    bbox_right_norm: float = 1.0
+    bbox_bottom_norm: float = 1.0
 
 
 @dataclass
@@ -109,7 +136,114 @@ def _meta_to_evidence(meta: dict, doc: str, chunk_id: str, score: float) -> Evid
         score=score,
         modality=meta.get("modality", "text"),
         image_path=meta.get("image_path", ""),
+        region_label=meta.get("region_label", ""),
+        region_id=meta.get("region_id", ""),
+        crop_type=meta.get("crop_type", "page"),
+        region_summary=meta.get("region_summary", ""),
+        proposal_source=meta.get("proposal_source", "heuristic"),
+        proposal_confidence=float(meta.get("proposal_confidence", 0.0) or 0.0),
+        bbox_left=int(meta.get("bbox_left", 0) or 0),
+        bbox_top=int(meta.get("bbox_top", 0) or 0),
+        bbox_right=int(meta.get("bbox_right", 0) or 0),
+        bbox_bottom=int(meta.get("bbox_bottom", 0) or 0),
+        bbox_left_norm=float(meta.get("bbox_left_norm", 0.0) or 0.0),
+        bbox_top_norm=float(meta.get("bbox_top_norm", 0.0) or 0.0),
+        bbox_right_norm=float(meta.get("bbox_right_norm", 1.0) or 1.0),
+        bbox_bottom_norm=float(meta.get("bbox_bottom_norm", 1.0) or 1.0),
     )
+
+
+def _page_number_from_meta(meta: dict) -> int:
+    try:
+        return int(meta.get("page_start", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _meta_is_region(meta: dict) -> bool:
+    region_label = (meta.get("region_label", "") or "").strip()
+    region_id = (meta.get("region_id", "") or "").strip()
+    crop_type = (meta.get("crop_type", "page") or "page").strip().lower()
+    return bool(region_label or region_id or crop_type != "page")
+
+
+def _region_overlap_bonus(query: str, meta: dict) -> float:
+    summary = (meta.get("region_summary", "") or "").strip()
+    if not summary:
+        return 0.0
+    q_tokens = _tokenize_simple(query)
+    s_tokens = _tokenize_simple(summary)
+    if not q_tokens or not s_tokens:
+        return 0.0
+    overlap = len(q_tokens & s_tokens)
+    if overlap <= 0:
+        return 0.0
+    return min(0.004, 0.002 * overlap)
+
+
+def _region_aware_scores(
+    *,
+    query: str,
+    got_ids: List[str],
+    got_metas: List[dict],
+    hybrid_scores: Dict[str, float],
+) -> Dict[str, float]:
+    adjusted = dict(hybrid_scores)
+    if not got_ids:
+        return adjusted
+    if not any(_meta_is_region(meta or {}) for meta in got_metas):
+        return adjusted
+
+    visual_query = _query_prefers_visual_region(query)
+
+    page_modalities: Dict[int, Set[str]] = {}
+    for meta in got_metas:
+        page_no = _page_number_from_meta(meta)
+        if page_no <= 0:
+            continue
+        if not _meta_is_region(meta or {}):
+            continue
+        page_modalities.setdefault(page_no, set()).add((meta.get("modality", "text") or "text").strip().lower())
+
+    cross_modal_pages = {
+        page_no
+        for page_no, mods in page_modalities.items()
+        if "text" in mods and "visual" in mods
+    }
+
+    for cid, meta in zip(got_ids, got_metas):
+        base = adjusted.get(cid, 0.0)
+        modality = (meta.get("modality", "text") or "text").strip().lower()
+        kind = (meta.get("kind", "") or "").strip().lower()
+        crop_type = (meta.get("crop_type", "page") or "page").strip().lower()
+        page_no = _page_number_from_meta(meta)
+        bonus = 0.0
+
+        if not _meta_is_region(meta or {}):
+            adjusted[cid] = base
+            continue
+
+        if modality == "visual":
+            if meta.get("region_label"):
+                bonus += 0.002
+            if crop_type != "page":
+                bonus += 0.002
+            if visual_query:
+                bonus += 0.004
+            if page_no in cross_modal_pages:
+                bonus += 0.003
+            bonus += _region_overlap_bonus(query, meta)
+        elif kind == "table":
+            bonus += 0.003
+            if visual_query:
+                bonus += 0.006
+            bonus += _region_overlap_bonus(query, meta)
+        elif visual_query and page_no in cross_modal_pages:
+            bonus += 0.002
+
+        adjusted[cid] = base + bonus
+
+    return adjusted
 
 
 # ── Heading-aware section matching ───────────────────────────────────────────
@@ -506,10 +640,26 @@ def retrieve(
     got_ids = got.get("ids", [])
     got_docs = got.get("documents", [])
     got_metas = got.get("metadatas", [])
+    adjusted_scores = _region_aware_scores(
+        query=query,
+        got_ids=got_ids,
+        got_metas=got_metas,
+        hybrid_scores=hybrid.scores,
+    )
+
+    ranked = sorted(
+        zip(got_ids, got_docs, got_metas),
+        key=lambda item: adjusted_scores.get(item[0], 0.0),
+        reverse=True,
+    )
+    if ranked:
+        got_ids = [item[0] for item in ranked]
+        got_docs = [item[1] for item in ranked]
+        got_metas = [item[2] for item in ranked]
 
     if intent == "section_list":
         best = _pick_best_section(
-            got_ids, got_metas, hybrid.scores, query,
+            got_ids, got_metas, adjusted_scores, query,
         )
 
         if best:
@@ -564,7 +714,7 @@ def retrieve(
     # Normal QA: return hybrid top-k evidence
     evidences: List[Evidence] = []
     for cid, doc, meta in zip(got_ids, got_docs, got_metas):
-        score = hybrid.scores.get(cid, 0.0)
+        score = adjusted_scores.get(cid, hybrid.scores.get(cid, 0.0))
         evidences.append(_meta_to_evidence(meta, doc or "", cid, score))
 
     return RetrievalResult(

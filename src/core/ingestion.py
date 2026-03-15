@@ -1,31 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
-import os
 import re
 import fitz  # PyMuPDF
 from PIL import Image
 from PIL import ImageFilter, ImageOps
 
 from .content_normalization import normalize_extracted_text
+from .layout_regions import plan_regions
 from .models import IngestResult, PageText, VisualAsset
 from .multimodal import MultimodalConfig
+from .ocr_backend import OCRConfig, configure_ocr_backend, ocr_image_text
+from .table_structure import TableStructureConfig, extract_tables_from_assets
 from .utils import normalize_whitespace, sha256_file
 from .vlm_extract import VLMConfig, extract_text_from_image
-
-
-@dataclass(frozen=True)
-class OCRConfig:
-    enabled: bool = True
-    lang: str = "tur+eng"
-    tesseract_cmd: Optional[str] = None
-    tessdata_prefix: Optional[str] = None
-    # Optional passthrough for pytesseract `config=` (e.g. "--psm 6 --oem 3").
-    # Keep default None to preserve existing behavior.
-    tesseract_config: Optional[str] = None
 
 
 def _text_quality_low(text: str) -> bool:
@@ -115,23 +104,6 @@ def _finalize_extracted_text(text: str, *, source: str) -> str:
     return normalize_extracted_text(text_norm, source=source)
 
 
-def _configure_tesseract(tesseract_cmd: Optional[str], tessdata_prefix: Optional[str]) -> None:
-    if not tesseract_cmd:
-        # Even if cmd isn't set, allow callers to set TESSDATA_PREFIX for system installs.
-        if tessdata_prefix:
-            os.environ["TESSDATA_PREFIX"] = tessdata_prefix
-        return
-    try:
-        import pytesseract  # noqa: WPS433
-
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-        if tessdata_prefix:
-            os.environ["TESSDATA_PREFIX"] = tessdata_prefix
-    except Exception:
-        # If pytesseract isn't installed or fails, leave as-is; caller will get warning.
-        return
-
-
 def _safe_exif_transpose(img: Image.Image) -> Image.Image:
     """
     Normalize image orientation using EXIF if present.
@@ -205,75 +177,17 @@ def _preprocess_variants_for_ocr(img_rgb: Image.Image) -> list[Image.Image]:
     return uniq
 
 
-def _ocr_image_text(img: Image.Image, lang: str, cfg: OCRConfig) -> str:
-    """
-    OCR one image with pytesseract, returning raw text (may be empty).
-    """
-    import pytesseract  # noqa: WPS433
-
-    # pytesseract supports L/RGB images; keep as-is.
-    config = (cfg.tesseract_config or "").strip()
-    return pytesseract.image_to_string(img, lang=lang, config=config) or ""
-
-
 def _save_visual_asset_image(img: Image.Image, *, out_path: Path) -> tuple[int, int]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, format="PNG")
     return img.size
 
 
-def _region_labels(region_count: int) -> list[str]:
-    if region_count <= 1:
-        return [""]
-    if region_count == 2:
-        return ["top", "bottom"]
-    return ["top", "middle", "bottom"][:region_count]
-
-
-def _target_region_count(img: Image.Image, summary_text: str) -> int:
-    lines = [line.strip() for line in (summary_text or "").splitlines() if line.strip()]
-    height = int(getattr(img, "height", 0) or 0)
-    if height >= 1500 and len(lines) >= 12:
-        return 3
-    if height >= 900 and len(lines) >= 6:
-        return 2
-    return 1
-
-
-def _split_summary_for_regions(summary_text: str, region_count: int) -> list[str]:
-    clean = (summary_text or "").strip()
-    if region_count <= 1:
-        return [clean]
-
-    lines = [line.strip() for line in clean.splitlines() if line.strip()]
-    if lines:
-        chunk_size = max(1, (len(lines) + region_count - 1) // region_count)
-        out = ["\n".join(lines[idx: idx + chunk_size]).strip() for idx in range(0, len(lines), chunk_size)]
-        out = [item for item in out if item]
-        if len(out) >= region_count:
-            return out[:region_count]
-
-    words = clean.split()
-    if words:
-        chunk_size = max(1, (len(words) + region_count - 1) // region_count)
-        out = [" ".join(words[idx: idx + chunk_size]).strip() for idx in range(0, len(words), chunk_size)]
-        out = [item for item in out if item]
-        if len(out) >= region_count:
-            return out[:region_count]
-
-    return [clean] if clean else [""]
-
-
-def _vertical_region_boxes(width: int, height: int, region_count: int) -> list[tuple[int, int, int, int]]:
-    if region_count <= 1:
-        return [(0, 0, width, height)]
-    boxes: list[tuple[int, int, int, int]] = []
-    step = max(1, height // region_count)
-    for idx in range(region_count):
-        top = idx * step
-        bottom = height if idx == region_count - 1 else min(height, (idx + 1) * step)
-        boxes.append((0, top, width, bottom))
-    return boxes
+def _region_summary_text(summary: str, *, limit: int = 120) -> str:
+    clean = re.sub(r"\s+", " ", (summary or "").strip())
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)] + "..."
 
 
 def _build_visual_assets(
@@ -284,53 +198,41 @@ def _build_visual_assets(
     page_number: int,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
-) -> list[VisualAsset]:
+) -> tuple[list[VisualAsset], list[str]]:
     if not multimodal or not multimodal.enabled or multimodal.assets_dir is None:
-        return []
+        return [], []
 
     chunk_level = (multimodal.chunk_level or "page").strip().lower()
-    if chunk_level != "region":
-        out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}.png"
-        width, height = _save_visual_asset_image(img, out_path=out_path)
-        return [
-            VisualAsset(
-                doc_id=ingest_doc_id,
-                file_name=file_name,
-                page_number=page_number,
-                image_path=str(out_path),
-                summary_text=summary_text,
-                mime_type="image/png",
-                width=width,
-                height=height,
-            )
-        ]
-
-    region_count = _target_region_count(img, summary_text)
-    if region_count <= 1:
-        out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}.png"
-        width, height = _save_visual_asset_image(img, out_path=out_path)
-        return [
-            VisualAsset(
-                doc_id=ingest_doc_id,
-                file_name=file_name,
-                page_number=page_number,
-                image_path=str(out_path),
-                summary_text=summary_text,
-                mime_type="image/png",
-                width=width,
-                height=height,
-            )
-        ]
-
-    summaries = _split_summary_for_regions(summary_text, region_count)
-    labels = _region_labels(region_count)
-    boxes = _vertical_region_boxes(img.width, img.height, region_count)
+    region_source = (multimodal.region_source or "heuristic").strip().lower()
+    proposals, warnings = plan_regions(
+        img,
+        page_number=page_number,
+        level="region" if chunk_level == "region" else "page",
+        source="detector" if region_source == "detector" else "heuristic",
+        summary_text=summary_text,
+        document_name=file_name,
+        detector_backend=(multimodal.detector_backend or "none"),
+        detector_dir=multimodal.detector_dir,
+        docai_project_id=(multimodal.docai_project_id or ""),
+        docai_location=(multimodal.docai_location or "us"),
+        docai_processor_id=(multimodal.docai_processor_id or ""),
+        docai_processor_version=(multimodal.docai_processor_version or "pretrained-layout-parser-v1.6-pro-2025-12-01"),
+        docai_timeout_seconds=int(multimodal.docai_timeout_seconds or 120),
+        docling_python_bin=(multimodal.docling_python_bin or ""),
+        docling_layout_model=(multimodal.docling_layout_model or "docling-layout-heron-101"),
+        docling_artifacts_path=multimodal.docling_artifacts_path,
+        docling_device=(multimodal.docling_device or "auto"),
+    )
     assets: list[VisualAsset] = []
-    for idx, box in enumerate(boxes, start=1):
-        crop = img.crop(box)
-        out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}_r{idx:02d}.png"
+    for proposal in proposals:
+        if proposal.region_count > 1:
+            suffix = f"_r{proposal.region_index:02d}"
+        else:
+            suffix = ""
+        crop = img.crop((proposal.bbox_left, proposal.bbox_top, proposal.bbox_right, proposal.bbox_bottom))
+        out_path = multimodal.assets_dir / ingest_doc_id / f"page_{page_number:04d}{suffix}.png"
         width, height = _save_visual_asset_image(crop, out_path=out_path)
-        summary = summaries[idx - 1] if idx - 1 < len(summaries) else (summary_text or "").strip()
+        summary = (proposal.summary_text or summary_text or "").strip()
         assets.append(
             VisualAsset(
                 doc_id=ingest_doc_id,
@@ -341,12 +243,25 @@ def _build_visual_assets(
                 mime_type="image/png",
                 width=width,
                 height=height,
-                region_label=labels[idx - 1] if idx - 1 < len(labels) else f"region-{idx}",
-                region_index=idx,
-                region_count=region_count,
+                region_label=proposal.region_label,
+                region_index=proposal.region_index,
+                region_count=proposal.region_count,
+                region_id=proposal.region_id,
+                crop_type=proposal.crop_type,
+                region_summary=_region_summary_text(summary),
+                proposal_source=proposal.proposal_source,
+                proposal_confidence=proposal.proposal_confidence,
+                bbox_left=proposal.bbox_left,
+                bbox_top=proposal.bbox_top,
+                bbox_right=proposal.bbox_right,
+                bbox_bottom=proposal.bbox_bottom,
+                bbox_left_norm=proposal.bbox_left_norm,
+                bbox_top_norm=proposal.bbox_top_norm,
+                bbox_right_norm=proposal.bbox_right_norm,
+                bbox_bottom_norm=proposal.bbox_bottom_norm,
             )
         )
-    return assets
+    return assets, warnings
 
 
 def _pdf_page_visual_assets(
@@ -357,7 +272,7 @@ def _pdf_page_visual_assets(
     page_number: int,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
-) -> list[VisualAsset]:
+) -> tuple[list[VisualAsset], list[str]]:
     pix = page.get_pixmap(dpi=160)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     return _build_visual_assets(
@@ -377,7 +292,7 @@ def _image_visual_assets(
     file_name: str,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
-) -> list[VisualAsset]:
+) -> tuple[list[VisualAsset], list[str]]:
     return _build_visual_assets(
         img_rgb,
         ingest_doc_id=ingest_doc_id,
@@ -393,6 +308,7 @@ def ingest_pdf(
     ocr: OCRConfig,
     display_name: Optional[str] = None,
     vlm: Optional[VLMConfig] = None,
+    table_config: Optional[TableStructureConfig] = None,
     multimodal: Optional[MultimodalConfig] = None,
 ) -> IngestResult:
     """
@@ -404,7 +320,7 @@ def ingest_pdf(
     if not path.exists():
         raise FileNotFoundError(str(path))
 
-    _configure_tesseract(ocr.tesseract_cmd, ocr.tessdata_prefix)
+    configure_ocr_backend(ocr)
 
     doc_id = sha256_file(path)
     # Chainlit uploads can be stored under a temporary UUID-like filename.
@@ -413,6 +329,7 @@ def ingest_pdf(
     warnings: list[str] = []
     pages: list[PageText] = []
     visual_assets: list[VisualAsset] = []
+    structured_tables = []
 
     pdf = fitz.open(str(path))
     try:
@@ -436,15 +353,23 @@ def ingest_pdf(
             )
             if should_try_ocr:
                 try:
-                    import pytesseract  # noqa: WPS433
-
                     pix = page.get_pixmap(dpi=200)  # good speed/quality tradeoff
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    ocr_text = pytesseract.image_to_string(img, lang=ocr.lang) or ""
-                    ocr_text_norm = _finalize_extracted_text(ocr_text, source="ocr")
+                    ocr_result = ocr_image_text(
+                        img,
+                        cfg=ocr,
+                        document_name=file_name,
+                        page_number=page_no,
+                        image_kind="pdf_page",
+                    )
+                    if ocr_result.warnings:
+                        for warning in ocr_result.warnings:
+                            if warning not in warnings:
+                                warnings.append(warning)
+                    ocr_text_norm = _finalize_extracted_text(ocr_result.text, source=ocr_result.source)
                     # Choose between pdf_text and ocr by structure score (not just length).
                     text_norm, source = _pick_best_candidate(
-                        [(pdf_text_norm, "pdf_text"), (ocr_text_norm, "ocr")]
+                        [(pdf_text_norm, "pdf_text"), (ocr_text_norm, ocr_result.source)]
                     )
                 except Exception as e:  # noqa: BLE001
                     warnings.append(f"OCR failed on page {page_no}: {e}")
@@ -479,7 +404,7 @@ def ingest_pdf(
                     source=source,  # type: ignore[arg-type]
                 )
             )
-            assets = _pdf_page_visual_assets(
+            assets, asset_warnings = _pdf_page_visual_assets(
                 page,
                 ingest_doc_id=doc_id,
                 file_name=file_name,
@@ -487,16 +412,26 @@ def ingest_pdf(
                 summary_text=text_norm,
                 multimodal=multimodal,
             )
+            if asset_warnings:
+                for warning in asset_warnings:
+                    if warning not in warnings:
+                        warnings.append(warning)
             if assets:
                 visual_assets.extend(assets)
     finally:
         pdf.close()
+    if table_config is not None:
+        structured_tables, table_warnings = extract_tables_from_assets(visual_assets, cfg=table_config)
+        for warning in table_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
 
     return IngestResult(
         doc_id=doc_id,
         file_name=file_name,
         pages=pages,
         visual_assets=visual_assets,
+        structured_tables=structured_tables,
         warnings=warnings,
     )
 
@@ -506,18 +441,20 @@ def ingest_image(
     ocr: OCRConfig,
     display_name: Optional[str] = None,
     vlm: Optional[VLMConfig] = None,
+    table_config: Optional[TableStructureConfig] = None,
     multimodal: Optional[MultimodalConfig] = None,
 ) -> IngestResult:
     """OCR a single image file into one 'page'."""
     if not path.exists():
         raise FileNotFoundError(str(path))
 
-    _configure_tesseract(ocr.tesseract_cmd, ocr.tessdata_prefix)
+    configure_ocr_backend(ocr)
 
     doc_id = sha256_file(path)
     file_name = display_name or path.name
     warnings: list[str] = []
     visual_assets: list[VisualAsset] = []
+    structured_tables = []
 
     text_norm = ""
     # Load image once; reuse for OCR/VLM candidates.
@@ -543,16 +480,25 @@ def ingest_image(
 
     if ocr.enabled and img_rgb is not None:
         try:
-            # Multi-pass OCR: try original + a few safe preprocess variants, then pick
-            # the best by structure score (same idea as dual-quality in PDFs).
-            ocr_variants = _preprocess_variants_for_ocr(img_rgb)
-            # Cap work: keep only first few (ordered by cheap->expensive).
-            ocr_variants = ocr_variants[:4]
+            ocr_variants = [img_rgb]
+            if (ocr.backend or "tesseract_legacy").strip().lower() == "tesseract_legacy":
+                # Multi-pass OCR only for the legacy Tesseract path.
+                ocr_variants = _preprocess_variants_for_ocr(img_rgb)[:4]
             for im in ocr_variants:
-                ocr_text = _ocr_image_text(im, lang=ocr.lang, cfg=ocr)
-                ocr_text_norm = _finalize_extracted_text(ocr_text, source="image_ocr")
+                ocr_result = ocr_image_text(
+                    im,
+                    cfg=ocr,
+                    document_name=file_name,
+                    page_number=1,
+                    image_kind="image",
+                )
+                if ocr_result.warnings:
+                    for warning in ocr_result.warnings:
+                        if warning not in warnings:
+                            warnings.append(warning)
+                ocr_text_norm = _finalize_extracted_text(ocr_result.text, source=ocr_result.source)
                 if ocr_text_norm:
-                    cands.append((ocr_text_norm, "image_ocr"))
+                    cands.append((ocr_text_norm, ocr_result.source))
         except Exception as e:  # noqa: BLE001
             warnings.append(f"Image OCR failed: {e}")
 
@@ -579,20 +525,30 @@ def ingest_image(
         )
     ]
     if img_rgb is not None:
-        assets = _image_visual_assets(
+        assets, asset_warnings = _image_visual_assets(
             img_rgb,
             ingest_doc_id=doc_id,
             file_name=file_name,
             summary_text=text_norm,
             multimodal=multimodal,
         )
+        if asset_warnings:
+            for warning in asset_warnings:
+                if warning not in warnings:
+                    warnings.append(warning)
         if assets:
             visual_assets.extend(assets)
+    if table_config is not None:
+        structured_tables, table_warnings = extract_tables_from_assets(visual_assets, cfg=table_config)
+        for warning in table_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
     return IngestResult(
         doc_id=doc_id,
         file_name=file_name,
         pages=pages,
         visual_assets=visual_assets,
+        structured_tables=structured_tables,
         warnings=warnings,
     )
 
@@ -602,12 +558,13 @@ def ingest_any(
     ocr: OCRConfig,
     display_name: Optional[str] = None,
     vlm: Optional[VLMConfig] = None,
+    table_config: Optional[TableStructureConfig] = None,
     multimodal: Optional[MultimodalConfig] = None,
 ) -> IngestResult:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return ingest_pdf(path, ocr=ocr, display_name=display_name, vlm=vlm, multimodal=multimodal)
+        return ingest_pdf(path, ocr=ocr, display_name=display_name, vlm=vlm, table_config=table_config, multimodal=multimodal)
     if suffix in (".png", ".jpg", ".jpeg"):
-        return ingest_image(path, ocr=ocr, display_name=display_name, vlm=vlm, multimodal=multimodal)
+        return ingest_image(path, ocr=ocr, display_name=display_name, vlm=vlm, table_config=table_config, multimodal=multimodal)
     raise ValueError(f"Unsupported file type: {suffix}")
 

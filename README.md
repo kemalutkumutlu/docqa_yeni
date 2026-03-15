@@ -45,7 +45,7 @@ Bu profilin mantigi:
 - embedding: `gemini-embedding-001` `3072d`
 - alternatif preview: `gemini-embedding-2-preview`
 - VLM extraction: Gemini, varsayilan olarak acik
-- klasik Tesseract OCR: kapali
+- OCR: kapali (`OCR_BACKEND=docai` hazir, ancak aktif degil)
 
 ## Mimari
 
@@ -158,6 +158,7 @@ EMBEDDING_DIMENSION=3072
 VLM_PROVIDER=gemini
 VLM_MODE=force
 OCR_ENABLED=0
+OCR_BACKEND=docai
 
 VERTEX_ENABLED=0
 ```
@@ -175,6 +176,8 @@ Gercek multimodal MVP akisini denemek istersen:
 DOC_PROCESSING_MODE=multimodal
 MULTIMODAL_ANSWER_MODE=auto
 VISUAL_CHUNK_LEVEL=page
+VISUAL_REGION_SOURCE=heuristic
+VISUAL_DETECTOR_BACKEND=none
 EMBEDDING_MODEL=gemini-embedding-2-preview
 VLM_PROVIDER=gemini
 VLM_MODE=force
@@ -186,6 +189,9 @@ Bu modun davranisi:
 - sayfa goruntuleri asset olarak saklanir
 - page-level `visual` chunk uretilir
 - `VISUAL_CHUNK_LEVEL=region` secilirse deneysel olarak dikey crop tabanli region chunk'lar uretilir
+- `VISUAL_REGION_SOURCE=heuristic|detector` ile region proposal kaynagi secilir
+- `VISUAL_DETECTOR_BACKEND=sidecar` secilirse detector bbox'lari JSON sidecar dosyalarindan okunabilir
+- `VISUAL_DETECTOR_BACKEND=docai` secilirse Google Document AI Layout Parser kullanilir
 - `gemini-embedding-2-preview` seciliyse visual chunk icin image+text embedding denenir
 - `MULTIMODAL_ANSWER_MODE=auto` ise yalnizca tablo/form/figure/layout tipi sorularda secili visual evidence Gemini prompt'una eklenir
 - `MULTIMODAL_ANSWER_MODE=on` ise visual evidence varsa her zaman multimodal answer generation kullanilir
@@ -195,7 +201,69 @@ Sinirlar:
 
 - Varsayilan akış `page-level` multimodal moddur
 - `VISUAL_CHUNK_LEVEL=region` deneysel bir akistir; sabit dikey crop'lar kullanir, layout-aware bbox/region detector degildir
+- `VISUAL_REGION_SOURCE=detector` secenegi bbox detector yolunu acar; `sidecar` veya `docai` backend'i yoksa heuristic fallback kullanilir
+- `VISUAL_DETECTOR_BACKEND=sidecar` ile ayni belge icin `<dosya>.regions.json` veya `<stem>.regions.json` dosyasindan bbox region'lari okunabilir
+- `VISUAL_DETECTOR_BACKEND=docai` ile online advanced path olarak Google Document AI Layout Parser kullanilabilir
 - UI'dan mode degistirmek mevcut yuklu belgeleri geriye donuk cevirmez; belgeyi yeniden yuklemek gerekir
+
+Sidecar JSON ornegi:
+
+```json
+{
+  "pages": {
+    "1": [
+      {
+        "label": "header",
+        "crop_type": "detector_header",
+        "confidence": 0.91,
+        "bbox": [0, 0, 1360, 320],
+        "summary_text": "Kapak ve baslik alani"
+      },
+      {
+        "label": "table",
+        "crop_type": "detector_table",
+        "confidence": 0.88,
+        "bbox": [120, 420, 1240, 1180],
+        "summary_text": "Tablo bolgesi"
+      }
+    ]
+  }
+}
+```
+
+Sidecar uretmek ve dogrulamak icin yardimci scriptler:
+
+```bash
+.venv-gpu/bin/python scripts/generate_layout_sidecar.py test_data/Case_Study_20260205.pdf --level region --output ./data/layout_sidecars/Case_Study_20260205.regions.json
+.venv-gpu/bin/python scripts/validate_layout_sidecar.py ./data/layout_sidecars/Case_Study_20260205.regions.json --document test_data/Case_Study_20260205.pdf
+```
+
+Document AI Layout Parser ornek env:
+
+```ini
+DOC_PROCESSING_MODE=multimodal
+VISUAL_CHUNK_LEVEL=region
+VISUAL_REGION_SOURCE=detector
+VISUAL_DETECTOR_BACKEND=docai
+DOCAI_PROJECT_ID=your-gcp-project
+DOCAI_LOCATION=us
+DOCAI_LAYOUT_PROCESSOR_ID=your-layout-processor-id
+DOCAI_LAYOUT_PROCESSOR_VERSION=pretrained-layout-parser-v1.6-pro-2025-12-01
+DOCAI_TIMEOUT_SECONDS=120
+GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
+```
+
+Document AI OCR ornek env:
+
+```ini
+OCR_ENABLED=1
+OCR_BACKEND=docai
+DOCAI_PROJECT_ID=your-gcp-project
+DOCAI_LOCATION=us
+DOCAI_OCR_PROCESSOR_ID=your-enterprise-ocr-processor-id
+DOCAI_OCR_PROCESSOR_VERSION=
+GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
+```
 
 #### Tamamen lokal mod
 
@@ -271,16 +339,40 @@ Mülakat icin en guvenli yol: `.env` ile sabit profil + `./run.sh`.
 
 ### OCR
 
-- `OCR_ENABLED=0`: klasik Tesseract kapali
-- `OCR_ENABLED=1`: Tesseract ek extraction adayi olarak devreye girer
+- `OCR_ENABLED=0`: OCR tamamen kapali
+- `OCR_ENABLED=1`: secili OCR backend devreye girer
+- `OCR_BACKEND=docai`: online SOTA yol, onerilen varsayilan
+- `OCR_BACKEND=tesseract_legacy`: eski local fallback
+- `OCR_BACKEND=paddle`: offline gercek backend (opsiyonel PaddleOCR kurulumu gerekir)
+- `OCR_BACKEND=paddle_vl`: offline advanced hedef backend; `PaddleOCRVL` kuruluysa denenir, degilse legacy fallback'e duser
 
-Tesseract gerekiyorsa:
+Document AI OCR icin:
+
+- `DOCAI_PROJECT_ID`
+- `DOCAI_LOCATION`
+- `DOCAI_OCR_PROCESSOR_ID`
+- opsiyonel `DOCAI_OCR_PROCESSOR_VERSION`
+- `GOOGLE_APPLICATION_CREDENTIALS`
+
+Tesseract legacy gerekiyorsa:
 
 - `TESSERACT_CMD`
 - `TESSDATA_PREFIX`
 - `TESSERACT_CONFIG`
 
 ayarlarini `.env` icinde ver.
+
+Offline PaddleOCR icin:
+
+- `OCR_BACKEND=paddle`
+- `OCR_DEVICE=auto|cpu|cuda`
+- opsiyonel `PADDLE_OCR_VERSION=PP-OCRv5`
+
+Not:
+
+- Bu backend ana `requirements.txt` icinde zorunlu degildir
+- lokal kurulum icin resmi Paddle kurulumuna gore `paddlepaddle` / `paddlepaddle-gpu` ve sonra [requirements-ocr-offline.txt](/home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/requirements-ocr-offline.txt) kur
+- `OCR_BACKEND=paddle_vl` secenegi varsa sistem `PaddleOCRVL` importunu dener; ortam hazir degilse warning verip legacy fallback kullanir
 
 ### VLM
 
@@ -318,6 +410,14 @@ Hizli smoke:
 
 ```bash
 .venv-gpu/bin/python scripts/smoke_suite.py test_data/Case_Study_20260205.pdf
+```
+
+Region inspect:
+
+```bash
+.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source heuristic
+.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source detector --detector-backend sidecar --detector-dir ./data/layout_sidecars
+.venv-gpu/bin/python scripts/inspect_regions.py test_data/Case_Study_20260205.pdf --level region --source detector --detector-backend docai --docai-project-id your-gcp-project --docai-processor-id your-layout-processor-id
 ```
 
 Tum test notlari icin `TESTING.md`.
@@ -372,7 +472,7 @@ Kontrol et:
 
 - extraction bossa VLM/OCR gerekli olabilir
 - `VLM_MAX_PAGES` limiti dusuk olabilir
-- taranmis PDF ise `OCR_ENABLED=1` ve Tesseract kurulu mu bak
+- taranmis PDF ise `OCR_ENABLED=1` ve secili OCR backend dogru ayarlandi mi bak
 
 ### Lokal GPU gorunuyor ama hizlanma yok
 

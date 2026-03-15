@@ -22,6 +22,20 @@ def _chunk_metadata(c: Chunk) -> Dict[str, Any]:
         "kind": c.kind,
         "modality": c.modality,
         "image_path": c.image_path,
+        "region_label": c.region_label,
+        "region_id": c.region_id,
+        "crop_type": c.crop_type,
+        "region_summary": c.region_summary,
+        "proposal_source": c.proposal_source,
+        "proposal_confidence": c.proposal_confidence,
+        "bbox_left": c.bbox_left,
+        "bbox_top": c.bbox_top,
+        "bbox_right": c.bbox_right,
+        "bbox_bottom": c.bbox_bottom,
+        "bbox_left_norm": c.bbox_left_norm,
+        "bbox_top_norm": c.bbox_top_norm,
+        "bbox_right_norm": c.bbox_right_norm,
+        "bbox_bottom_norm": c.bbox_bottom_norm,
     }
 
 

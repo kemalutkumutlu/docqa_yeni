@@ -1,8 +1,11 @@
 .env
 .venv/
 .venv-gpu/
+.venv-docling/
 __pycache__/
 *.pyc
+.vendor/
+keys/
 
 # Local data / indexes
 data/

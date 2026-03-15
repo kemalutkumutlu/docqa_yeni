@@ -18,15 +18,16 @@ from pathlib import Path
 from typing import Any
 
 import chainlit as cl
-from chainlit.input_widget import Select, Slider
+from chainlit.input_widget import Select, Slider, Tab, TextInput
 from chainlit.types import ThreadDict
 from chainlit.user import User
 from chainlit.context import ChainlitContextException, context as cl_context
 
 from src.config import load_settings
-from src.core.ingestion import OCRConfig
+from src.core.ocr_backend import OCRConfig
 from src.core.local_llm import OllamaConfig, ollama_is_available
 from src.core.pipeline import RAGPipeline
+from src.core.table_structure import TableStructureConfig
 from src.core.vlm_extract import VLMConfig
 from src.core.gemini_client import use_vertex_ai
 
@@ -36,6 +37,18 @@ except Exception as _native_history_import_error:  # pragma: no cover - optional
     SQLAlchemyDataLayer = None
 else:
     _native_history_import_error = None
+
+try:
+    from engineio.payload import Payload as _EngineIOPayload
+except Exception:
+    _EngineIOPayload = None
+else:
+    raw_max_packets = (os.getenv("ENGINEIO_MAX_DECODE_PACKETS", "64") or "64").strip()
+    try:
+        _engineio_max_packets = max(16, min(512, int(raw_max_packets)))
+    except Exception:
+        _engineio_max_packets = 64
+    _EngineIOPayload.max_decode_packets = _engineio_max_packets
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -804,9 +817,23 @@ _CHAT_PROFILE_TO_PROVIDER = {
 _CHAT_HISTORY_KEY = "recent_user_messages"
 _CHAT_HISTORY_MAX = 12
 _RUNTIME_OVERRIDES_KEY = "runtime_overrides"
+_SETTINGS_VIEW_VALUES = ["basic", "advanced"]
+_RUNTIME_PRESET_VALUES = ["custom", "online_best", "hybrid_best", "local_best", "fast"]
 _PROCESSING_MODE_VALUES = ["classic", "multimodal"]
 _MULTIMODAL_ANSWER_MODE_VALUES = ["off", "auto", "on"]
 _VISUAL_CHUNK_LEVEL_VALUES = ["page", "region"]
+_VISUAL_REGION_SOURCE_VALUES = ["heuristic", "detector"]
+_VISUAL_DETECTOR_BACKEND_VALUES = ["none", "docai", "docling", "sidecar"]
+_TOGGLE_VALUES = ["on", "off"]
+_OCR_BACKEND_VALUES = ["docai", "paddle_vl", "paddle", "tesseract_legacy"]
+_TABLE_STRUCTURE_BACKEND_VALUES = ["off", "auto", "docai", "gemini", "heuristic"]
+_LLM_PROVIDER_VALUES = ["gemini", "openai", "local", "none"]
+_GENERATION_MODEL_PRESETS = [
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+    "gpt-4o-mini",
+    "qwen2.5:7b",
+]
 _EMBEDDING_MODEL_PRESETS = [
     "gemini-embedding-001",
     "gemini-embedding-2-preview",
@@ -823,7 +850,10 @@ _PROFILE_WARNING_KEY = "profile_warning"
 
 
 def _get_cached_settings():
-    settings = cl.user_session.get("app_settings")
+    try:
+        settings = cl.user_session.get("app_settings")
+    except ChainlitContextException:
+        return load_settings()
     if settings is None:
         settings = load_settings()
         cl.user_session.set("app_settings", settings)
@@ -871,8 +901,327 @@ def _resolve_embedding_model_choice(choice: str, embedding_device: str) -> str:
     return (choice or "").strip()
 
 
+def _normalize_toggle_value(value, fallback: str) -> str:
+    text = str(value or "").strip().lower()
+    if text in ("1", "true", "yes", "y", "on", "enabled"):
+        return "on"
+    if text in ("0", "false", "no", "n", "off", "disabled"):
+        return "off"
+    return fallback
+
+
+def _toggle_to_bool(value, fallback: bool) -> bool:
+    normalized = _normalize_toggle_value(value, "on" if fallback else "off")
+    return normalized == "on"
+
+
+def _llm_model_for_provider(pipeline: RAGPipeline, provider: str) -> str:
+    resolved = (provider or "").strip().lower()
+    if resolved == "openai":
+        return (pipeline.openai_model or "").strip() or "gpt-4o-mini"
+    if resolved == "local":
+        if pipeline.ollama_config:
+            return (pipeline.ollama_config.llm_model or "").strip() or "qwen2.5:7b"
+        return "qwen2.5:7b"
+    if resolved == "none":
+        return "extractive"
+    return (pipeline.gemini_model or "").strip() or "gemini-3.1-pro-preview"
+
+
+def _generation_model_values(pipeline: RAGPipeline, settings, provider: str, current_choice: str) -> list[str]:
+    resolved = (provider or "").strip().lower()
+    values: list[str] = []
+    if resolved == "gemini":
+        for model_name in (
+            getattr(pipeline, "gemini_model", ""),
+            getattr(settings, "gemini_model", ""),
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-pro",
+        ):
+            clean = str(model_name or "").strip()
+            if clean and clean not in values:
+                values.append(clean)
+    elif resolved == "openai":
+        for model_name in (
+            getattr(pipeline, "openai_model", ""),
+            getattr(settings, "openai_model", ""),
+            "gpt-4o-mini",
+        ):
+            clean = str(model_name or "").strip()
+            if clean and clean not in values:
+                values.append(clean)
+    elif resolved == "local":
+        for model_name in (
+            getattr(getattr(pipeline, "ollama_config", None), "llm_model", ""),
+            getattr(settings, "ollama_llm_model", ""),
+            "qwen2.5:7b",
+        ):
+            clean = str(model_name or "").strip()
+            if clean and clean not in values:
+                values.append(clean)
+    if current_choice:
+        clean = str(current_choice).strip()
+        if clean and clean not in values and resolved != "none":
+            values.append(clean)
+    return values
+
+
+def _normalize_generation_model_choice(pipeline: RAGPipeline, settings, provider: str, choice: str) -> str:
+    values = _generation_model_values(pipeline, settings, provider, choice)
+    clean = str(choice or "").strip()
+    if clean and clean in values:
+        return clean
+    return _llm_model_for_provider(pipeline, provider)
+
+
+def _settings_dependency_summary(
+    *,
+    processing_mode: str,
+    visual_chunk_level: str,
+    visual_region_source: str,
+    visual_detector_backend: str,
+    ocr_enabled: str,
+    ocr_backend: str,
+    table_enabled: str,
+    table_backend: str,
+    llm_provider: str,
+    generation_model: str,
+    vlm_mode: str,
+    vlm_provider: str,
+    vlm_max_pages: int,
+) -> str:
+    layout_line = "disabled"
+    if processing_mode != "multimodal":
+        layout_line = "kapali: processing_mode=classic"
+    elif visual_chunk_level != "region":
+        layout_line = f"kapali: visual_chunk_level={visual_chunk_level}"
+    elif visual_region_source != "detector":
+        layout_line = f"kapali: visual_region_source={visual_region_source}"
+    elif visual_detector_backend == "none":
+        layout_line = "heuristic fallback: detector backend=none"
+    else:
+        layout_line = f"aktif: {visual_detector_backend}"
+
+    multimodal_answer_line = (
+        "anlamli"
+        if processing_mode == "multimodal"
+        else "sinirli: processing_mode=classic"
+    )
+    table_line = (
+        f"aktif: {table_backend}"
+        if table_enabled == "on"
+        else "kapali"
+    )
+    generation_line = (
+        "extractive (LLM yok)"
+        if llm_provider == "none"
+        else f"{llm_provider} / {generation_model}"
+    )
+    vlm_line = (
+        "kapali"
+        if vlm_mode == "off"
+        else f"{vlm_provider} / {vlm_mode} / max_pages={vlm_max_pages}"
+    )
+    return "\n".join(
+        [
+            f"OCR: {ocr_enabled} / {ocr_backend}",
+            f"Multimodal answer: {multimodal_answer_line}",
+            f"Layout detector: {layout_line}",
+            f"Table structure: {table_line}",
+            f"Generation: {generation_line}",
+            f"VLM: {vlm_line}",
+        ]
+    )
+
+
+def _preset_defaults(pipeline: RAGPipeline, settings, preset: str) -> dict[str, str | int]:
+    selected = (preset or "custom").strip().lower()
+    if selected == "online_best":
+        return {
+            "ocr_enabled": "on",
+            "ocr_backend": "docai",
+            "processing_mode": "multimodal",
+            "multimodal_answer_mode": "auto",
+            "visual_chunk_level": "region",
+            "visual_region_source": "detector",
+            "visual_detector_backend": "docai",
+            "table_structure_enabled": "on",
+            "table_structure_backend": "auto",
+            "llm_provider": "gemini",
+            "generation_model_choice": (settings.gemini_model or pipeline.gemini_model or "gemini-3.1-pro-preview"),
+            "embedding_model_choice": "gemini-embedding-2-preview",
+            "embedding_device": "cuda" if _cuda_available() else "auto",
+            "vlm_mode": "force",
+            "vlm_provider": "gemini",
+            "vlm_max_pages": 25,
+        }
+    if selected == "hybrid_best":
+        return {
+            "ocr_enabled": "on",
+            "ocr_backend": "paddle_vl",
+            "processing_mode": "multimodal",
+            "multimodal_answer_mode": "auto",
+            "visual_chunk_level": "region",
+            "visual_region_source": "detector",
+            "visual_detector_backend": "docai",
+            "table_structure_enabled": "on",
+            "table_structure_backend": "auto",
+            "llm_provider": "gemini",
+            "generation_model_choice": (settings.gemini_model or pipeline.gemini_model or "gemini-3.1-pro-preview"),
+            "embedding_model_choice": "gemini-embedding-2-preview",
+            "embedding_device": "cuda" if _cuda_available() else "auto",
+            "vlm_mode": "force",
+            "vlm_provider": "gemini",
+            "vlm_max_pages": 25,
+        }
+    if selected == "local_best":
+        return {
+            "ocr_enabled": "on",
+            "ocr_backend": "paddle_vl",
+            "processing_mode": "multimodal",
+            "multimodal_answer_mode": "auto",
+            "visual_chunk_level": "region",
+            "visual_region_source": "detector",
+            "visual_detector_backend": "docling",
+            "table_structure_enabled": "on",
+            "table_structure_backend": "heuristic",
+            "llm_provider": "local",
+            "generation_model_choice": (settings.ollama_llm_model or getattr(getattr(pipeline, "ollama_config", None), "llm_model", "qwen2.5:7b") or "qwen2.5:7b"),
+            "embedding_model_choice": "auto",
+            "embedding_device": "cuda" if _cuda_available() else "auto",
+            "vlm_mode": "auto",
+            "vlm_provider": "local",
+            "vlm_max_pages": 10,
+        }
+    if selected == "fast":
+        return {
+            "ocr_enabled": "on",
+            "ocr_backend": "paddle",
+            "processing_mode": "classic",
+            "multimodal_answer_mode": "off",
+            "visual_chunk_level": "page",
+            "visual_region_source": "heuristic",
+            "visual_detector_backend": "none",
+            "table_structure_enabled": "off",
+            "table_structure_backend": "off",
+            "llm_provider": "gemini",
+            "generation_model_choice": (settings.gemini_model or pipeline.gemini_model or "gemini-3.1-pro-preview"),
+            "embedding_model_choice": "auto",
+            "embedding_device": "auto",
+            "vlm_mode": "off",
+            "vlm_provider": "gemini",
+            "vlm_max_pages": 5,
+        }
+    return {}
+
+
+def _effective_settings_values(pipeline: RAGPipeline) -> dict[str, str | int]:
+    current_vlm = pipeline.vlm_config
+    current_table = pipeline.table_structure_config
+    current_ocr = pipeline.ocr_config
+    return {
+        "ocr_enabled": "on" if getattr(current_ocr, "enabled", True) else "off",
+        "ocr_backend": getattr(current_ocr, "backend", "docai"),
+        "processing_mode": getattr(pipeline, "processing_mode", "classic"),
+        "multimodal_answer_mode": getattr(pipeline, "multimodal_answer_mode", "auto"),
+        "visual_chunk_level": getattr(pipeline, "visual_chunk_level", "page"),
+        "visual_region_source": getattr(pipeline, "visual_region_source", "heuristic"),
+        "visual_detector_backend": getattr(pipeline, "visual_detector_backend", "none"),
+        "table_structure_enabled": "on" if bool(getattr(current_table, "enabled", False)) else "off",
+        "table_structure_backend": getattr(current_table, "backend", "auto"),
+        "llm_provider": getattr(pipeline, "llm_provider", "gemini"),
+        "generation_model_choice": _llm_model_for_provider(pipeline, getattr(pipeline, "llm_provider", "gemini")),
+        "embedding_model_choice": getattr(pipeline, "embedding_model", "auto"),
+        "embedding_device": getattr(pipeline, "embedding_device", "auto"),
+        "vlm_mode": getattr(current_vlm, "mode", "auto") if current_vlm else "auto",
+        "vlm_provider": getattr(current_vlm, "provider", "gemini") if current_vlm else "gemini",
+        "vlm_max_pages": int(getattr(current_vlm, "max_pages", _VLM_MAX_PAGES_DEFAULT) if current_vlm else _VLM_MAX_PAGES_DEFAULT),
+    }
+
+
+def _matches_preset(values: dict[str, str | int], preset: str, pipeline: RAGPipeline, settings) -> bool:
+    defaults = _preset_defaults(pipeline, settings, preset)
+    if not defaults:
+        return False
+    for key, preset_value in defaults.items():
+        if values.get(key) != preset_value:
+            return False
+    return True
+
+
+def _settings_fallback_summary(
+    *,
+    pipeline: RAGPipeline,
+    settings,
+    ocr_enabled: str,
+    ocr_backend: str,
+    visual_region_source: str,
+    visual_detector_backend: str,
+    llm_provider: str,
+    vlm_provider: str,
+    table_enabled: str,
+    table_backend: str,
+) -> str:
+    lines: list[str] = []
+    if ocr_enabled != "on":
+        lines.append("OCR fallback: yok, cunku OCR kapali.")
+    elif ocr_backend == "docai" and not getattr(pipeline.ocr_config, "docai_processor_id", ""):
+        lines.append("OCR fallback: DOCAI_OCR_PROCESSOR_ID yoksa legacy fallback devreye girer.")
+    elif ocr_backend == "paddle_vl":
+        lines.append("OCR fallback: paddle_vl basarisiz olursa paddle -> legacy zinciri calisir.")
+    elif ocr_backend == "paddle":
+        lines.append("OCR fallback: paddle basarisiz olursa legacy zinciri calisir.")
+    else:
+        lines.append("OCR fallback: secili backend dogrudan kullanilir.")
+
+    if visual_region_source != "detector":
+        lines.append("Layout fallback: detector zinciri kapali, heuristic region planning kullanilir.")
+    elif visual_detector_backend == "none":
+        lines.append("Layout fallback: detector backend=none oldugu icin heuristic kullanilir.")
+    elif visual_detector_backend == "docai" and not getattr(pipeline, "docai_layout_processor_id", ""):
+        lines.append("Layout fallback: DOCAI_LAYOUT_PROCESSOR_ID yoksa heuristic kullanilir.")
+    elif visual_detector_backend == "docling" and not getattr(pipeline, "docling_python_bin", ""):
+        lines.append("Layout fallback: DOCLING_PYTHON_BIN yoksa heuristic kullanilir.")
+    else:
+        lines.append(f"Layout path: detector backend `{visual_detector_backend}` ile calisir.")
+
+    resolved_llm_provider, llm_warning = _resolve_llm_provider_choice(
+        llm_provider,
+        settings,
+        pipeline.ollama_config or OllamaConfig(),
+    )
+    if llm_warning:
+        lines.append(f"Generation fallback: {llm_warning}")
+    else:
+        lines.append(f"Generation path: `{resolved_llm_provider}` aktif.")
+
+    resolved_vlm_provider, vlm_warning = _resolve_vlm_provider_choice(
+        vlm_provider,
+        settings,
+        pipeline.ollama_config or OllamaConfig(),
+    )
+    if vlm_warning:
+        lines.append(f"VLM fallback: {vlm_warning}")
+    else:
+        lines.append(f"VLM path: `{resolved_vlm_provider}` aktif.")
+
+    if table_enabled != "on":
+        lines.append("Table stage: kapali.")
+    elif table_backend == "off":
+        lines.append("Table stage: backend=off oldugu icin kapali.")
+    elif table_backend == "docai" and not getattr(getattr(pipeline, "table_structure_config", None), "docai_processor_id", ""):
+        lines.append("Table fallback: docai processor yoksa fallback backend gerekir.")
+    else:
+        lines.append(f"Table path: `{table_backend}` secili.")
+
+    return "\n".join(lines)
+
+
 def _runtime_overrides() -> dict:
-    raw = cl.user_session.get(_RUNTIME_OVERRIDES_KEY)
+    try:
+        raw = cl.user_session.get(_RUNTIME_OVERRIDES_KEY)
+    except ChainlitContextException:
+        return {}
     return raw if isinstance(raw, dict) else {}
 
 
@@ -943,6 +1292,8 @@ def _resolve_vlm_provider_choice(requested_provider: str, settings, ollama_cfg: 
 
 def _settings_widgets(pipeline: RAGPipeline) -> list:
     vlm_cfg = pipeline.vlm_config
+    table_cfg = pipeline.table_structure_config
+    ocr_cfg = pipeline.ocr_config
     processing_mode_current = _sanitize_select_value(
         _get_runtime_value("processing_mode", getattr(pipeline, "processing_mode", "classic")),
         _PROCESSING_MODE_VALUES,
@@ -984,14 +1335,114 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
         _VISUAL_CHUNK_LEVEL_VALUES,
         getattr(pipeline, "visual_chunk_level", "page"),
     )
+    visual_region_source_current = _sanitize_select_value(
+        _get_runtime_value("visual_region_source", getattr(pipeline, "visual_region_source", "heuristic")),
+        _VISUAL_REGION_SOURCE_VALUES,
+        getattr(pipeline, "visual_region_source", "heuristic"),
+    )
+    visual_detector_backend_current = _sanitize_select_value(
+        _get_runtime_value("visual_detector_backend", getattr(pipeline, "visual_detector_backend", "none")),
+        _VISUAL_DETECTOR_BACKEND_VALUES,
+        getattr(pipeline, "visual_detector_backend", "none"),
+    )
+    ocr_enabled_current = _normalize_toggle_value(
+        _get_runtime_value("ocr_enabled", "on" if getattr(ocr_cfg, "enabled", True) else "off"),
+        "on" if getattr(ocr_cfg, "enabled", True) else "off",
+    )
+    ocr_backend_current = _sanitize_select_value(
+        _get_runtime_value("ocr_backend", getattr(ocr_cfg, "backend", "docai")),
+        _OCR_BACKEND_VALUES,
+        getattr(ocr_cfg, "backend", "docai"),
+    )
+    table_enabled_current = _normalize_toggle_value(
+        _get_runtime_value("table_structure_enabled", "on" if getattr(table_cfg, "enabled", False) else "off"),
+        "on" if getattr(table_cfg, "enabled", False) else "off",
+    )
+    table_backend_current = _sanitize_select_value(
+        _get_runtime_value("table_structure_backend", getattr(table_cfg, "backend", "auto")),
+        _TABLE_STRUCTURE_BACKEND_VALUES,
+        getattr(table_cfg, "backend", "auto"),
+    )
+    llm_provider_current = _sanitize_select_value(
+        _get_runtime_value("llm_provider", getattr(pipeline, "llm_provider", "gemini")),
+        _LLM_PROVIDER_VALUES,
+        getattr(pipeline, "llm_provider", "gemini"),
+    )
+    settings = _get_cached_settings()
+    generation_model_current = _normalize_generation_model_choice(
+        pipeline,
+        settings,
+        llm_provider_current,
+        str(_get_runtime_value("generation_model_choice", _llm_model_for_provider(pipeline, llm_provider_current))).strip(),
+    )
+    generation_model_values = _generation_model_values(
+        pipeline,
+        settings,
+        llm_provider_current,
+        generation_model_current,
+    )
     vlm_pages_current = _clamp_int(
         _get_runtime_value("vlm_max_pages", vlm_cfg.max_pages if vlm_cfg else _VLM_MAX_PAGES_DEFAULT),
         vlm_cfg.max_pages if vlm_cfg else _VLM_MAX_PAGES_DEFAULT,
         0,
         _VLM_MAX_PAGES_LIMIT,
     )
+    multimodal_active = processing_mode_current == "multimodal"
+    region_mode_active = multimodal_active and visual_chunk_level_current == "region"
+    detector_mode_active = region_mode_active and visual_region_source_current == "detector"
+    ocr_active = ocr_enabled_current == "on"
+    table_stage_available = multimodal_active
+    table_active = table_enabled_current == "on" and table_stage_available
+    llm_active = llm_provider_current != "none"
+    llm_supports_multimodal_answer = llm_provider_current in ("gemini", "openai")
+    vlm_active = vlm_mode_current != "off"
+    embedding_device_relevant = not str(embedding_choice_current or "").strip().lower().startswith("gemini-embedding-")
+    dependency_summary = _settings_dependency_summary(
+        processing_mode=processing_mode_current,
+        visual_chunk_level=visual_chunk_level_current,
+        visual_region_source=visual_region_source_current,
+        visual_detector_backend=visual_detector_backend_current,
+        ocr_enabled=ocr_enabled_current,
+        ocr_backend=ocr_backend_current,
+        table_enabled=table_enabled_current,
+        table_backend=table_backend_current,
+        llm_provider=llm_provider_current,
+        generation_model=generation_model_current,
+        vlm_mode=vlm_mode_current,
+        vlm_provider=vlm_provider_current,
+        vlm_max_pages=vlm_pages_current,
+    )
+    settings_view_current = _sanitize_select_value(
+        _get_runtime_value("settings_view", "basic"),
+        _SETTINGS_VIEW_VALUES,
+        "basic",
+    )
+    runtime_preset_current = _sanitize_select_value(
+        _get_runtime_value("runtime_preset", "custom"),
+        _RUNTIME_PRESET_VALUES,
+        "custom",
+    )
+    fallback_summary = _settings_fallback_summary(
+        pipeline=pipeline,
+        settings=settings,
+        ocr_enabled=ocr_enabled_current,
+        ocr_backend=ocr_backend_current,
+        visual_region_source=visual_region_source_current,
+        visual_detector_backend=visual_detector_backend_current,
+        llm_provider=llm_provider_current,
+        vlm_provider=vlm_provider_current,
+        table_enabled=table_enabled_current,
+        table_backend=table_backend_current,
+    )
 
-    return [
+    basic_widgets = [
+        Select(
+            id="runtime_preset",
+            label="Runtime Preset",
+            values=_RUNTIME_PRESET_VALUES,
+            initial_value=runtime_preset_current,
+            description="Hazir ayar kombinasyonlari. Manual override yaparsan preset otomatik olarak custom'a dusebilir.",
+        ),
         Select(
             id="processing_mode",
             label="Processing Mode",
@@ -1000,44 +1451,139 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
             description="classic: mevcut text-first akış. multimodal: visual page chunk + multimodal retrieval.",
         ),
         Select(
-            id="multimodal_answer_mode",
-            label="Multimodal Answer Generation",
-            values=_MULTIMODAL_ANSWER_MODE_VALUES,
-            initial_value=multimodal_answer_mode_current,
-            description="Sadece multimodal mode + Gemini icin anlamli. off: text-only. auto: gorsel/layout sorularinda. on: visual evidence varsa her zaman.",
+            id="ocr_enabled",
+            label="OCR",
+            values=_TOGGLE_VALUES,
+            initial_value=ocr_enabled_current,
+            description="Scanned/image belgelerde OCR katmanini acip kapatir.",
         ),
         Select(
-            id="visual_chunk_level",
-            label="Visual Chunk Level",
-            values=_VISUAL_CHUNK_LEVEL_VALUES,
-            initial_value=visual_chunk_level_current,
-            description="multimodal icin visual granularity. page: mevcut kararlı akış. region: deneysel crop tabanlı akış.",
+            id="llm_provider",
+            label="LLM Provider",
+            values=_LLM_PROVIDER_VALUES,
+            initial_value=llm_provider_current,
+            description="Cevap uretim yolu. none secilirse extractive yanit kullanilir.",
         ),
+    ]
+
+    if llm_active:
+        basic_widgets.append(
+            Select(
+                id="generation_model",
+                label="Generation Model",
+                values=generation_model_values,
+                initial_value=generation_model_current,
+                description="Secili LLM provider icin kullanilacak model.",
+            )
+        )
+    advanced_widgets = []
+    advanced_widgets.append(
         Select(
             id="embedding_model",
             label="Embedding Model",
             values=embedding_values,
             initial_value=embedding_choice_current,
             description="Varsayilan: Gemini embedding. auto: lokal e5-base/e5-small secilir.",
-        ),
+        )
+    )
+    advanced_widgets.append(
         Select(
             id="embedding_device",
             label="Embedding Device",
             values=_EMBEDDING_DEVICE_VALUES,
             initial_value=embedding_device_current,
-        ),
+            description="Sadece lokal embedding modellerinde anlamli.",
+            disabled=not embedding_device_relevant,
+        )
+    )
+    advanced_widgets.append(
         Select(
             id="vlm_mode",
             label="VLM Mode",
             values=_VLM_MODE_VALUES,
             initial_value=vlm_mode_current,
-        ),
+        )
+    )
+    advanced_widgets.append(
+        Select(
+            id="ocr_backend",
+            label="OCR Backend",
+            values=_OCR_BACKEND_VALUES,
+            initial_value=ocr_backend_current,
+            description="OCR acikken anlamli. paddle_vl en guclu lokal yol, docai online OCR yoludur.",
+            disabled=not ocr_active,
+        )
+    )
+    advanced_widgets.append(
+        Select(
+            id="visual_chunk_level",
+            label="Visual Chunk Level",
+            values=_VISUAL_CHUNK_LEVEL_VALUES,
+            initial_value=visual_chunk_level_current,
+            description="Multimodal acikken anlamli. region secilirse region-source ve detector zinciri devreye girer.",
+            disabled=not multimodal_active,
+        )
+    )
+    advanced_widgets.append(
+        Select(
+            id="table_structure_enabled",
+            label="Table Structure",
+            values=_TOGGLE_VALUES,
+            initial_value=table_enabled_current,
+            description="Tablo gorunen regionlarda yapisal table extraction katmanini acip kapatir.",
+            disabled=not table_stage_available,
+        )
+    )
+    advanced_widgets.append(
+        Select(
+            id="multimodal_answer_mode",
+            label="Multimodal Answer Generation",
+            values=_MULTIMODAL_ANSWER_MODE_VALUES,
+            initial_value=multimodal_answer_mode_current,
+            description="Gemini/OpenAI + multimodal zincirinde anlamli.",
+            disabled=not (multimodal_active and llm_supports_multimodal_answer),
+        )
+    )
+    advanced_widgets.append(
+        Select(
+            id="visual_region_source",
+            label="Visual Region Source",
+            values=_VISUAL_REGION_SOURCE_VALUES,
+            initial_value=visual_region_source_current,
+            description="Region secilince hangi proposal kaynaginin kullanilacagini belirler.",
+            disabled=not region_mode_active,
+        )
+    )
+    advanced_widgets.append(
+        Select(
+            id="visual_detector_backend",
+            label="Visual Detector Backend",
+            values=_VISUAL_DETECTOR_BACKEND_VALUES,
+            initial_value=visual_detector_backend_current,
+            description="Secili detector zinciri: docai online, docling local, sidecar harici bbox JSON.",
+            disabled=not detector_mode_active,
+        )
+    )
+    advanced_widgets.append(
+        Select(
+            id="table_structure_backend",
+            label="Table Structure Backend",
+            values=_TABLE_STRUCTURE_BACKEND_VALUES,
+            initial_value=table_backend_current,
+            description="Table stage acikken hangi backend'in kullanilacagini belirler.",
+            disabled=not table_active,
+        )
+    )
+    advanced_widgets.append(
         Select(
             id="vlm_provider",
             label="VLM Provider",
             values=_VLM_PROVIDER_VALUES,
             initial_value=vlm_provider_current,
-        ),
+            disabled=not vlm_active,
+        )
+    )
+    advanced_widgets.append(
         Slider(
             id="vlm_max_pages",
             label="VLM Max Pages",
@@ -1045,7 +1591,32 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
             min=0,
             max=_VLM_MAX_PAGES_LIMIT,
             step=1,
-        ),
+            disabled=not vlm_active,
+        )
+    )
+    advanced_widgets.extend(
+        [
+            TextInput(
+                id="active_pipeline_summary",
+                label="Active Pipeline Summary",
+                initial=dependency_summary,
+                multiline=True,
+                description="Ayarlarin birbirini nasil etkiledigini gosteren ozet. Bu alan bilgilendirme amaclidir.",
+                disabled=True,
+            ),
+            TextInput(
+                id="fallback_explanation",
+                label="Why Fallback Happens",
+                initial=fallback_summary,
+                multiline=True,
+                description="Secili kombinasyonda hangi kosul fallback veya disable davranisi dogurur, onu aciklar.",
+                disabled=True,
+            ),
+        ]
+    )
+    return [
+        Tab(id="settings_basic", label="Basic", inputs=basic_widgets),
+        Tab(id="settings_advanced", label="Advanced", inputs=advanced_widgets),
     ]
 
 
@@ -1053,6 +1624,14 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
     overrides = _runtime_overrides()
     if not overrides:
         return
+
+    settings = _get_cached_settings()
+    ollama_cfg = pipeline.ollama_config or OllamaConfig(
+        base_url=settings.ollama_base_url,
+        llm_model=settings.ollama_llm_model,
+        vlm_model=settings.ollama_vlm_model,
+        timeout=settings.ollama_timeout,
+    )
 
     device = _sanitize_select_value(
         overrides.get("embedding_device", pipeline.embedding_device),
@@ -1066,8 +1645,35 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
     vlm_mode_default = vlm_cfg.mode if vlm_cfg else "auto"
     vlm_provider_default = vlm_cfg.provider if vlm_cfg else "gemini"
     vlm_pages_default = vlm_cfg.max_pages if vlm_cfg else _VLM_MAX_PAGES_DEFAULT
+    requested_llm_provider = _sanitize_select_value(
+        overrides.get("llm_provider"),
+        _LLM_PROVIDER_VALUES,
+        getattr(pipeline, "llm_provider", "gemini"),
+    )
+    resolved_llm_provider, _ = _resolve_llm_provider_choice(requested_llm_provider, settings, ollama_cfg)
+    generation_model_choice = str(
+        overrides.get("generation_model_choice", _llm_model_for_provider(pipeline, requested_llm_provider))
+    ).strip()
+    gemini_model_next = None
+    openai_model_next = None
+    local_llm_model_next = None
+    if requested_llm_provider == "gemini" and generation_model_choice:
+        gemini_model_next = generation_model_choice
+    elif requested_llm_provider == "openai" and generation_model_choice:
+        openai_model_next = generation_model_choice
+    elif requested_llm_provider == "local" and generation_model_choice:
+        local_llm_model_next = generation_model_choice
 
     pipeline.reconfigure_runtime(
+        ocr_enabled=_toggle_to_bool(
+            overrides.get("ocr_enabled"),
+            getattr(pipeline.ocr_config, "enabled", True),
+        ),
+        ocr_backend=_sanitize_select_value(
+            overrides.get("ocr_backend"),
+            _OCR_BACKEND_VALUES,
+            getattr(pipeline.ocr_config, "backend", "docai"),
+        ),
         processing_mode=_sanitize_select_value(
             overrides.get("processing_mode"),
             _PROCESSING_MODE_VALUES,
@@ -1083,6 +1689,29 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
             _VISUAL_CHUNK_LEVEL_VALUES,
             getattr(pipeline, "visual_chunk_level", "page"),
         ),
+        visual_region_source=_sanitize_select_value(
+            overrides.get("visual_region_source"),
+            _VISUAL_REGION_SOURCE_VALUES,
+            getattr(pipeline, "visual_region_source", "heuristic"),
+        ),
+        visual_detector_backend=_sanitize_select_value(
+            overrides.get("visual_detector_backend"),
+            _VISUAL_DETECTOR_BACKEND_VALUES,
+            getattr(pipeline, "visual_detector_backend", "none"),
+        ),
+        table_structure_enabled=_toggle_to_bool(
+            overrides.get("table_structure_enabled"),
+            bool(getattr(getattr(pipeline, "table_structure_config", None), "enabled", False)),
+        ),
+        table_structure_backend=_sanitize_select_value(
+            overrides.get("table_structure_backend"),
+            _TABLE_STRUCTURE_BACKEND_VALUES,
+            getattr(getattr(pipeline, "table_structure_config", None), "backend", "auto"),
+        ),
+        llm_provider=resolved_llm_provider,
+        gemini_model=gemini_model_next,
+        openai_model=openai_model_next,
+        local_llm_model=local_llm_model_next,
         embedding_model=model_resolved,
         embedding_device=device,
         vlm_mode=_sanitize_select_value(overrides.get("vlm_mode"), _VLM_MODE_VALUES, vlm_mode_default),
@@ -1166,10 +1795,14 @@ def _render_sidebar_panel(
     llm_model: str,
     embedding_model: str,
     embedding_runtime: str,
+    ocr_backend: str,
+    ocr_enabled: str,
     vlm_provider: str,
     vlm_mode: str,
     vlm_max_pages: str,
     visual_chunk_level: str,
+    visual_region_source: str,
+    visual_detector_backend: str,
     active_doc: str | None,
     docs: list[str],
 ) -> str:
@@ -1181,8 +1814,11 @@ def _render_sidebar_panel(
             f"- **Mod**: {_sidebar_chip(mode)}",
             f"- **LLM**: {_sidebar_chip(llm_provider)} {_sidebar_chip(llm_model)}",
             f"- **Embedding**: {_sidebar_chip(embedding_model)} {_sidebar_chip(embedding_runtime)}",
+            f"- **OCR**: {_sidebar_chip(ocr_backend)} {_sidebar_chip(ocr_enabled)}",
             f"- **VLM**: {_sidebar_chip(vlm_provider)} {_sidebar_chip(vlm_mode)} {_sidebar_chip(f'pages {vlm_max_pages}')}",
             f"- **Visual Level**: {_sidebar_chip(visual_chunk_level)}",
+            f"- **Region Source**: {_sidebar_chip(visual_region_source)}",
+            f"- **Detector Backend**: {_sidebar_chip(visual_detector_backend)}",
             "",
             "---",
             "",
@@ -1340,15 +1976,47 @@ def _get_pipeline() -> RAGPipeline:
             gemini_model=settings.gemini_model,
             ocr_config=OCRConfig(
                 enabled=getattr(settings, "ocr_enabled", True),
-                lang="tur+eng",
+                backend=getattr(settings, "ocr_backend", "docai"),
+                lang=getattr(settings, "ocr_lang", "tur+eng"),
+                device=getattr(settings, "ocr_device", "auto"),
+                paddle_ocr_version=getattr(settings, "paddle_ocr_version", "PP-OCRv5"),
                 tesseract_cmd=settings.tesseract_cmd,
                 tessdata_prefix=settings.tessdata_prefix,
                 tesseract_config=getattr(settings, "tesseract_config", None),
+                docai_project_id=getattr(settings, "docai_project_id", ""),
+                docai_location=getattr(settings, "docai_location", "us"),
+                docai_processor_id=getattr(settings, "docai_ocr_processor_id", ""),
+                docai_processor_version=getattr(settings, "docai_ocr_processor_version", ""),
+                docai_timeout_seconds=getattr(settings, "docai_timeout_seconds", 120),
             ),
             embedding_device=getattr(settings, "embedding_device", "auto"),
             processing_mode=getattr(settings, "processing_mode", "classic"),
             multimodal_answer_mode=getattr(settings, "multimodal_answer_mode", "auto"),
             visual_chunk_level=getattr(settings, "visual_chunk_level", "page"),
+            visual_region_source=getattr(settings, "visual_region_source", "heuristic"),
+            visual_detector_backend=getattr(settings, "visual_detector_backend", "none"),
+            visual_detector_dir=getattr(settings, "visual_detector_dir", None),
+            docai_project_id=getattr(settings, "docai_project_id", ""),
+            docai_location=getattr(settings, "docai_location", "us"),
+            docai_layout_processor_id=getattr(settings, "docai_layout_processor_id", ""),
+            docai_layout_processor_version=getattr(settings, "docai_layout_processor_version", "pretrained-layout-parser-v1.6-pro-2025-12-01"),
+            docai_timeout_seconds=getattr(settings, "docai_timeout_seconds", 120),
+            docling_python_bin=getattr(settings, "docling_python_bin", ""),
+            docling_layout_model=getattr(settings, "docling_layout_model", "docling-layout-heron-101"),
+            docling_artifacts_path=getattr(settings, "docling_artifacts_path", None),
+            docling_device=getattr(settings, "docling_device", "auto"),
+            table_structure_config=TableStructureConfig(
+                enabled=getattr(settings, "table_structure_enabled", False),
+                backend=getattr(settings, "table_structure_backend", "auto"),
+                min_confidence=float(getattr(settings, "table_structure_min_confidence", 0.55) or 0.55),
+                gemini_api_key=settings.gemini_api_key,
+                gemini_model=getattr(settings, "table_structure_gemini_model", settings.gemini_model),
+                docai_project_id=getattr(settings, "docai_project_id", ""),
+                docai_location=getattr(settings, "docai_location", "us"),
+                docai_processor_id=getattr(settings, "docai_table_processor_id", ""),
+                docai_processor_version=getattr(settings, "docai_table_processor_version", ""),
+                docai_timeout_seconds=getattr(settings, "docai_timeout_seconds", 120),
+            ),
             vlm_config=VLMConfig(
                 api_key=settings.gemini_api_key,
                 model=settings.gemini_model,
@@ -1434,6 +2102,7 @@ async def on_chat_start():
     cl.user_session.set(_CHAT_HISTORY_KEY, [])
     pipeline = _get_pipeline()
     profile_warning = _apply_chat_profile_to_pipeline(pipeline)
+    _apply_runtime_overrides_to_pipeline(pipeline)
     native_history_note = _native_history_status_note()
     if native_history_note:
         print(f"[ui] {native_history_note}", flush=True)
@@ -1482,6 +2151,7 @@ async def on_chat_resume(thread: ThreadDict):
     pipeline = _restore_thread_state(thread_id, metadata=metadata)
     if pipeline is not None:
         await _sync_profile_to_pipeline(pipeline)
+        _apply_runtime_overrides_to_pipeline(pipeline)
     await _update_documents_sidebar(pipeline)
 
 
@@ -1491,8 +2161,16 @@ async def on_settings_update(values: dict):
     if not pipeline:
         pipeline = _get_pipeline()
 
+    current_overrides = _runtime_overrides()
     current_vlm = pipeline.vlm_config
     current_pages = current_vlm.max_pages if current_vlm else _VLM_MAX_PAGES_DEFAULT
+    current_ocr = pipeline.ocr_config
+    current_table = pipeline.table_structure_config
+    selected_settings_view = _sanitize_select_value(
+        values.get("settings_view"),
+        _SETTINGS_VIEW_VALUES,
+        str(current_overrides.get("settings_view", "basic") or "basic"),
+    )
 
     selected_device = _sanitize_select_value(
         values.get("embedding_device"),
@@ -1514,6 +2192,40 @@ async def on_settings_update(values: dict):
         _VISUAL_CHUNK_LEVEL_VALUES,
         getattr(pipeline, "visual_chunk_level", "page"),
     )
+    selected_visual_region_source = _sanitize_select_value(
+        values.get("visual_region_source"),
+        _VISUAL_REGION_SOURCE_VALUES,
+        getattr(pipeline, "visual_region_source", "heuristic"),
+    )
+    selected_visual_detector_backend = _sanitize_select_value(
+        values.get("visual_detector_backend"),
+        _VISUAL_DETECTOR_BACKEND_VALUES,
+        getattr(pipeline, "visual_detector_backend", "none"),
+    )
+    selected_ocr_enabled = _normalize_toggle_value(
+        values.get("ocr_enabled"),
+        "on" if getattr(current_ocr, "enabled", True) else "off",
+    )
+    selected_ocr_backend = _sanitize_select_value(
+        values.get("ocr_backend"),
+        _OCR_BACKEND_VALUES,
+        getattr(current_ocr, "backend", "docai"),
+    )
+    selected_table_enabled = _normalize_toggle_value(
+        values.get("table_structure_enabled"),
+        "on" if getattr(current_table, "enabled", False) else "off",
+    )
+    selected_table_backend = _sanitize_select_value(
+        values.get("table_structure_backend"),
+        _TABLE_STRUCTURE_BACKEND_VALUES,
+        getattr(current_table, "backend", "auto"),
+    )
+    selected_llm_provider = _sanitize_select_value(
+        values.get("llm_provider"),
+        _LLM_PROVIDER_VALUES,
+        getattr(pipeline, "llm_provider", "gemini"),
+    )
+    selected_generation_model = str(values.get("generation_model") or "").strip()
     selected_model_choice = str(values.get("embedding_model") or pipeline.embedding_model).strip()
     if not selected_model_choice:
         selected_model_choice = pipeline.embedding_model
@@ -1543,51 +2255,136 @@ async def on_settings_update(values: dict):
         vlm_model=settings.ollama_vlm_model,
         timeout=settings.ollama_timeout,
     )
+    previous_preset = _sanitize_select_value(
+        current_overrides.get("runtime_preset"),
+        _RUNTIME_PRESET_VALUES,
+        "custom",
+    )
+    selected_runtime_preset = _sanitize_select_value(
+        values.get("runtime_preset"),
+        _RUNTIME_PRESET_VALUES,
+        previous_preset,
+    )
+    if selected_runtime_preset != "custom" and selected_runtime_preset != previous_preset:
+        preset_values = _preset_defaults(pipeline, settings, selected_runtime_preset)
+        if preset_values:
+            selected_ocr_enabled = str(preset_values.get("ocr_enabled", selected_ocr_enabled))
+            selected_ocr_backend = str(preset_values.get("ocr_backend", selected_ocr_backend))
+            selected_processing_mode = str(preset_values.get("processing_mode", selected_processing_mode))
+            selected_multimodal_answer_mode = str(preset_values.get("multimodal_answer_mode", selected_multimodal_answer_mode))
+            selected_visual_chunk_level = str(preset_values.get("visual_chunk_level", selected_visual_chunk_level))
+            selected_visual_region_source = str(preset_values.get("visual_region_source", selected_visual_region_source))
+            selected_visual_detector_backend = str(preset_values.get("visual_detector_backend", selected_visual_detector_backend))
+            selected_table_enabled = str(preset_values.get("table_structure_enabled", selected_table_enabled))
+            selected_table_backend = str(preset_values.get("table_structure_backend", selected_table_backend))
+            selected_llm_provider = str(preset_values.get("llm_provider", selected_llm_provider))
+            selected_generation_model = str(preset_values.get("generation_model_choice", selected_generation_model))
+            selected_model_choice = str(preset_values.get("embedding_model_choice", selected_model_choice))
+            selected_device = str(preset_values.get("embedding_device", selected_device))
+            selected_vlm_mode = str(preset_values.get("vlm_mode", selected_vlm_mode))
+            selected_vlm_provider = str(preset_values.get("vlm_provider", selected_vlm_provider))
+            selected_vlm_pages = _clamp_int(preset_values.get("vlm_max_pages"), selected_vlm_pages, 0, _VLM_MAX_PAGES_LIMIT)
+            resolved_model = _resolve_embedding_model_choice(selected_model_choice, selected_device) or pipeline.embedding_model
+    selected_generation_model = _normalize_generation_model_choice(
+        pipeline,
+        settings,
+        selected_llm_provider,
+        selected_generation_model,
+    )
     resolved_vlm_provider, vlm_warning = _resolve_vlm_provider_choice(
         selected_vlm_provider,
         settings,
         ollama_cfg,
     )
-
-    cl.user_session.set(
-        _RUNTIME_OVERRIDES_KEY,
-        {
-            "embedding_model_choice": selected_model_choice,
-            "embedding_device": selected_device,
-            "processing_mode": selected_processing_mode,
-            "multimodal_answer_mode": selected_multimodal_answer_mode,
-            "visual_chunk_level": selected_visual_chunk_level,
-            "vlm_mode": selected_vlm_mode,
-            "vlm_provider": resolved_vlm_provider,
-            "vlm_max_pages": selected_vlm_pages,
-        },
+    resolved_llm_provider, llm_warning = _resolve_llm_provider_choice(
+        selected_llm_provider,
+        settings,
+        ollama_cfg,
     )
+    gemini_model_next = None
+    openai_model_next = None
+    local_llm_model_next = None
+    if selected_llm_provider == "gemini" and selected_generation_model:
+        gemini_model_next = selected_generation_model
+    elif selected_llm_provider == "openai" and selected_generation_model:
+        openai_model_next = selected_generation_model
+    elif selected_llm_provider == "local" and selected_generation_model:
+        local_llm_model_next = selected_generation_model
+    effective_after_apply = {}
 
     result = pipeline.reconfigure_runtime(
+        ocr_enabled=_toggle_to_bool(selected_ocr_enabled, getattr(current_ocr, "enabled", True)),
+        ocr_backend=selected_ocr_backend,
         processing_mode=selected_processing_mode,
         multimodal_answer_mode=selected_multimodal_answer_mode,
         visual_chunk_level=selected_visual_chunk_level,
+        visual_region_source=selected_visual_region_source,
+        visual_detector_backend=selected_visual_detector_backend,
+        table_structure_enabled=_toggle_to_bool(selected_table_enabled, getattr(current_table, "enabled", False)),
+        table_structure_backend=selected_table_backend,
+        llm_provider=resolved_llm_provider,
+        gemini_model=gemini_model_next,
+        openai_model=openai_model_next,
+        local_llm_model=local_llm_model_next,
         embedding_model=resolved_model,
         embedding_device=selected_device,
         vlm_mode=selected_vlm_mode,
         vlm_provider=resolved_vlm_provider,
         vlm_max_pages=selected_vlm_pages,
     )
+    effective_after_apply = _effective_settings_values(pipeline)
+    stored_runtime_preset = selected_runtime_preset
+    if stored_runtime_preset != "custom" and not _matches_preset(effective_after_apply, stored_runtime_preset, pipeline, settings):
+        stored_runtime_preset = "custom"
+    cl.user_session.set(
+        _RUNTIME_OVERRIDES_KEY,
+        {
+            "settings_view": selected_settings_view,
+            "runtime_preset": stored_runtime_preset,
+            "ocr_enabled": selected_ocr_enabled,
+            "ocr_backend": selected_ocr_backend,
+            "embedding_model_choice": selected_model_choice,
+            "embedding_device": selected_device,
+            "processing_mode": selected_processing_mode,
+            "multimodal_answer_mode": selected_multimodal_answer_mode,
+            "visual_chunk_level": selected_visual_chunk_level,
+            "visual_region_source": selected_visual_region_source,
+            "visual_detector_backend": selected_visual_detector_backend,
+            "table_structure_enabled": selected_table_enabled,
+            "table_structure_backend": selected_table_backend,
+            "llm_provider": selected_llm_provider,
+            "generation_model_choice": selected_generation_model,
+            "vlm_mode": selected_vlm_mode,
+            "vlm_provider": resolved_vlm_provider,
+            "vlm_max_pages": selected_vlm_pages,
+        },
+    )
     cl.user_session.set("pipeline", pipeline)
     _thread_pipeline_set(_active_thread_id(), pipeline)
 
     if (
-        result.get("embedding_changed")
+        result.get("ocr_changed")
+        or result.get("llm_changed")
+        or result.get("embedding_changed")
         or result.get("vlm_changed")
         or result.get("processing_mode_changed")
         or result.get("multimodal_answer_mode_changed")
         or result.get("visual_chunk_level_changed")
+        or result.get("visual_region_source_changed")
+        or result.get("visual_detector_backend_changed")
+        or result.get("table_structure_changed")
     ):
         messages = [
             "**Runtime ayarlari guncellendi**",
+            f"- OCR: `{selected_ocr_enabled}` | backend=`{getattr(pipeline.ocr_config, 'backend', 'docai')}`",
+            f"- Preset: `{stored_runtime_preset}` | view=`{selected_settings_view}`",
             f"- Processing: `{getattr(pipeline, 'processing_mode', 'classic')}`",
             f"- Multimodal Answer Gen: `{getattr(pipeline, 'multimodal_answer_mode', 'auto')}`",
             f"- Visual Chunk Level: `{getattr(pipeline, 'visual_chunk_level', 'page')}`",
+            f"- Visual Region Source: `{getattr(pipeline, 'visual_region_source', 'heuristic')}`",
+            f"- Visual Detector Backend: `{getattr(pipeline, 'visual_detector_backend', 'none')}`",
+            f"- Table Structure: `{'on' if bool(getattr(getattr(pipeline, 'table_structure_config', None), 'enabled', False)) else 'off'}` | backend=`{getattr(getattr(pipeline, 'table_structure_config', None), 'backend', 'auto')}`",
+            f"- LLM: `{getattr(pipeline, 'llm_provider', 'gemini')}` | model=`{_active_llm_model(pipeline)}`",
             f"- Embedding: `{pipeline.embedding_model}` | `{_embedding_runtime_label(pipeline.embedding_model, pipeline.embedding_device)}`",
             f"- VLM: `{resolved_vlm_provider}` | `{selected_vlm_mode}` | max_pages=`{selected_vlm_pages}`",
         ]
@@ -1595,6 +2392,10 @@ async def on_settings_update(values: dict):
             messages.append("- Mevcut dokumanlar icin embedding indeksi yeniden olusturuldu.")
         elif result.get("embedding_changed"):
             messages.append("- Embedding ayari degisti; indeks yeni ayarlarla hazir.")
+        if result.get("ocr_changed"):
+            messages.append("- OCR ayarlari bir sonraki dosya yuklemelerinde uygulanir.")
+        if result.get("llm_changed"):
+            messages.append("- LLM provider/model ayari aninda uygulanir; yeni sorulari etkiler.")
         if result.get("vlm_changed"):
             messages.append("- VLM ayarlari bir sonraki dosya yuklemelerinde uygulanir.")
         if result.get("processing_mode_changed"):
@@ -1603,10 +2404,25 @@ async def on_settings_update(values: dict):
             messages.append("- Multimodal answer generation ayari aninda uygulanir; reindex gerekmez.")
         if result.get("visual_chunk_level_changed"):
             messages.append("- Visual chunk level deneysel bir ayardir; mevcut belgeler icin yeniden yukleme gerekir.")
+        if result.get("visual_region_source_changed"):
+            messages.append("- Region source ayari bir sonraki belge yuklemelerinde uygulanir.")
+        if result.get("visual_detector_backend_changed"):
+            messages.append("- Visual detector backend bir sonraki belge yuklemelerinde uygulanir.")
+        if result.get("table_structure_changed"):
+            messages.append("- Table structure ayarlari bir sonraki belge yuklemelerinde uygulanir.")
+        if selected_runtime_preset != stored_runtime_preset and stored_runtime_preset == "custom":
+            messages.append("- Preset secimi manuel override nedeniyle `custom` moduna gecti.")
+        elif selected_runtime_preset != previous_preset:
+            messages.append(f"- Preset `{selected_runtime_preset}` uygulandi.")
+        if selected_visual_region_source == "detector" and selected_visual_detector_backend == "none":
+            messages.append("- Not: `Visual Region Source=detector` iken backend `none`; bu durumda heuristic fallback kullanilir.")
+        if llm_warning:
+            messages.append(f"- Not: {llm_warning}")
         if vlm_warning:
             messages.append(f"- Not: {vlm_warning}")
         await cl.Message(content="\n".join(messages)).send()
 
+    await cl.ChatSettings(_settings_widgets(pipeline)).send()
     await _update_documents_sidebar(pipeline)
 
 
@@ -1695,7 +2511,11 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
         vlm_provider = (pipeline.vlm_config.provider if (pipeline and pipeline.vlm_config) else "-")
         vlm_mode = (pipeline.vlm_config.mode if (pipeline and pipeline.vlm_config) else "-")
         vlm_max_pages = (pipeline.vlm_config.max_pages if (pipeline and pipeline.vlm_config) else "-")
+        ocr_backend = getattr(getattr(pipeline, "ocr_config", None), "backend", "docai") if pipeline else "-"
+        ocr_enabled = "on" if bool(getattr(getattr(pipeline, "ocr_config", None), "enabled", False)) else "off"
         visual_chunk_level = getattr(pipeline, "visual_chunk_level", "page") if pipeline else "-"
+        visual_region_source = getattr(pipeline, "visual_region_source", "heuristic") if pipeline else "-"
+        visual_detector_backend = getattr(pipeline, "visual_detector_backend", "none") if pipeline else "-"
 
         print(
             f"[ui] sidebar update: docs={docs}, active={active}, mode={mode}",
@@ -1708,10 +2528,14 @@ async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None
             llm_model=llm_model,
             embedding_model=embedding_model,
             embedding_runtime=embedding_runtime,
+            ocr_backend=str(ocr_backend),
+            ocr_enabled=ocr_enabled,
             vlm_provider=vlm_provider,
             vlm_mode=vlm_mode,
             vlm_max_pages=str(vlm_max_pages),
             visual_chunk_level=str(visual_chunk_level),
+            visual_region_source=str(visual_region_source),
+            visual_detector_backend=str(visual_detector_backend),
             active_doc=active,
             docs=docs,
         )
@@ -1800,6 +2624,19 @@ def _build_qa_debug_suffix(result, mode: str) -> str:
         f"<details><summary>Debug Bilgisi</summary>\n\n"
         f"{debug_text}\n\n"
         f"</details>"
+    )
+
+
+def _build_evidence_panel(result) -> str:
+    evidence_summary = getattr(result, "evidence_summary", None) or []
+    if not evidence_summary:
+        return ""
+    return "\n".join(
+        [
+            "**Kullanilan Kanitlar**",
+            "",
+            *evidence_summary,
+        ]
     )
 
 
@@ -1904,6 +2741,9 @@ async def _stream_doc_answer_live(
         await stream_msg.stream_token(result.answer)
     await stream_msg.stream_token(_build_qa_debug_suffix(result, mode))
     await stream_msg.update()
+    evidence_panel = _build_evidence_panel(result)
+    if evidence_panel:
+        await cl.Message(content=evidence_panel).send()
     return result
 
 
