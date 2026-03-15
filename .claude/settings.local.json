@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find . -maxdepth 4 -type f \\\\\\(-name *.py -o -name *.yaml -o -name *.yml -o -name *.env* -o -name Dockerfile* -o -name docker-compose* -o -name *.json -o -name *.txt -o -name *.sh \\\\\\) ! -path *__pycache__* ! -path *.git/* ! -path *.venv* ! -path *.vendor*)",
+      "Read(//mnt/c/Users/**)",
+      "Read(///wsl.localhost/Ubuntu//**)",
+      "Bash(xargs grep:*)",
+      "Bash(ls /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/.env*)",
+      "Bash(ls /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/*.env)",
+      "Bash(echo $DOCLING_PYTHON_BIN)",
+      "Bash(pip show:*)",
+      "Bash(wsl -e bash -c \"pip show docling 2>/dev/null | head -5 || echo NOT_INSTALLED; echo DOCLING_PYTHON_BIN=$DOCLING_PYTHON_BIN\")",
+      "Bash(wsl -e bash -c \"find /home/kemalutkumutlu -name ''venv-docling'' -type d 2>/dev/null; find /home -name ''venv-docling'' -type d 2>/dev/null\")",
+      "Bash(wsl -e bash -c \"find / -name ''venv-docling'' -type d 2>/dev/null | head -5\")",
+      "Bash(wsl -e bash -c \"ls /home/kemalutkumutlu/ 2>/dev/null || ls ~ 2>/dev/null\")",
+      "Bash(wsl -e bash -c \"ls /home/kemalutkumutlu/TUSAS_DOCQA/\")",
+      "Bash(wsl -e bash -c \"ls /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/\")",
+      "Bash(wsl -e bash -c \"ls /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/scripts/\")",
+      "Bash(wsl -e bash -c \"find /home/kemalutkumutlu -name ''venv-docling'' -type d 2>/dev/null; find /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni -maxdepth 2 -name ''python*'' -type f 2>/dev/null | head -5\")",
+      "Bash(wsl -e bash -c \"ls /home/kemalutkumutlu/code/ 2>/dev/null\")",
+      "Bash(wsl -e bash -c \"find /home/kemalutkumutlu /opt /usr/local -maxdepth 5 -name ''venv-docling'' -type d 2>/dev/null | head -5\")",
+      "Bash(wsl -e bash -c \"find /mnt -maxdepth 8 -name ''venv-docling'' -type d 2>/dev/null | head -5\")",
+      "Bash(wsl -e bash -c \"find /mnt/c/Users/Kemal -maxdepth 6 -name ''venv-docling'' -type d 2>/dev/null | head -5\")",
+      "Bash(wsl -e bash -c \"/home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/.venv-docling/bin/pip show docling 2>&1 | head -5\")",
+      "Bash(wsl -e bash -c 'ls /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/.venv-docling/bin/ | grep -E \"\"^python|^pip\"\"')",
+      "Bash(wsl -e bash -c '/home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/.venv-docling/bin/python -c \"\"import docling; print\\(docling.__version__\\)\"\" 2>&1')",
+      "Bash(wsl -e bash -c '/home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/.venv-docling/bin/python -c \"\"from docling.document_converter import DocumentConverter; print\\(\\\\\"\"OK\\\\\"\"\\)\"\" 2>&1')",
+      "Bash(wsl -e bash -c 'ls /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/.env 2>/dev/null && echo EXISTS || echo MISSING')",
+      "Bash(wsl -e bash -c 'cat /home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/.env')"
+    ]
+  }
+}

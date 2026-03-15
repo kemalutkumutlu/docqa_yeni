@@ -49,7 +49,7 @@ jobs:
 
       - name: Case Study acceptance eval
         if: ${{ env.GEMINI_API_KEY != '' }}
-        run: python scripts/eval_case_study.py --pdf Case_Study_20260205.pdf
+        run: python scripts/eval_case_study.py --pdf test_data/Case_Study_20260205.pdf
         env:
           LLM_PROVIDER: gemini
           GEMINI_API_KEY: ${{ env.GEMINI_API_KEY }}

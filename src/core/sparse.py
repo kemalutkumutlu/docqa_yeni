@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import pickle
+import json
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -32,6 +32,16 @@ def simple_tokenize(text: str) -> List[str]:
     return tokens + ngrams
 
 
+def _safe_bm25(corpus: List[List[str]]) -> BM25Okapi:
+    # rank_bm25 raises ZeroDivisionError when every document token list is empty.
+    # Use a private placeholder corpus for the degenerate case; callers already
+    # guard on `self.ids`, so this placeholder is never surfaced to retrieval.
+    non_empty = [doc for doc in corpus if doc]
+    if not non_empty:
+        return BM25Okapi([["__empty__"]])
+    return BM25Okapi(non_empty)
+
+
 @dataclass
 class BM25Index:
     # chunk_id -> token list
@@ -43,9 +53,11 @@ class BM25Index:
     def build(cls, chunks: List[Chunk]) -> "BM25Index":
         # Index child chunks for retrieval granularity (parents are fetched later)
         child_chunks = [c for c in chunks if c.kind == "child"]
-        ids = [c.chunk_id for c in child_chunks]
-        toks = [simple_tokenize(c.text) for c in child_chunks]
-        bm25 = BM25Okapi(toks)
+        pairs = [(c.chunk_id, simple_tokenize(c.text)) for c in child_chunks]
+        pairs = [(cid, toks) for cid, toks in pairs if toks]
+        ids = [cid for cid, _ in pairs]
+        toks = [toks for _, toks in pairs]
+        bm25 = _safe_bm25(toks)
         return cls(tokens_by_id=dict(zip(ids, toks)), bm25=bm25, ids=ids)
 
     def search(
@@ -91,8 +103,12 @@ class BM25Index:
         if not new_children:
             return self
 
-        new_ids = [c.chunk_id for c in new_children]
-        new_toks = [simple_tokenize(c.text) for c in new_children]
+        pairs = [(c.chunk_id, simple_tokenize(c.text)) for c in new_children]
+        pairs = [(cid, toks) for cid, toks in pairs if toks]
+        if not pairs:
+            return self
+        new_ids = [cid for cid, _ in pairs]
+        new_toks = [toks for _, toks in pairs]
 
         # Extend internal state
         combined_ids = self.ids + new_ids
@@ -100,7 +116,7 @@ class BM25Index:
         combined_map = dict(zip(combined_ids, combined_toks))
 
         # Rebuild BM25 from combined tokens
-        bm25 = BM25Okapi(combined_toks) if combined_toks else self.bm25
+        bm25 = _safe_bm25(combined_toks) if combined_toks else self.bm25
 
         self.ids = combined_ids
         self.tokens_by_id = combined_map
@@ -128,7 +144,7 @@ class BM25Index:
         self.ids = keep_ids
         self.tokens_by_id = {cid: self.tokens_by_id[cid] for cid in keep_ids if cid in self.tokens_by_id}
         corpus = [self.tokens_by_id.get(cid, []) for cid in keep_ids]
-        self.bm25 = BM25Okapi(corpus) if corpus else BM25Okapi([])
+        self.bm25 = _safe_bm25(corpus)
         return self
 
     # ── Persistence ──────────────────────────────────────────────
@@ -136,17 +152,26 @@ class BM25Index:
         """Persist BM25 state to disk (tokens + ids only; BM25Okapi is rebuilt on load)."""
         from pathlib import Path as _P
         _P(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump({"tokens_by_id": self.tokens_by_id, "ids": self.ids}, f)
+        payload = {
+            "version": 1,
+            "tokens_by_id": self.tokens_by_id,
+            "ids": self.ids,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
 
     @classmethod
     def load(cls, path: str) -> "BM25Index":
         """Load BM25 state from disk and rebuild BM25Okapi."""
-        with open(path, "rb") as f:
-            data = pickle.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
         tokens_by_id: Dict[str, List[str]] = data["tokens_by_id"]
         ids: List[str] = data["ids"]
         corpus = [tokens_by_id[cid] for cid in ids]
-        bm25 = BM25Okapi(corpus) if corpus else BM25Okapi([])
+        filtered = [(cid, toks) for cid, toks in zip(ids, corpus) if toks]
+        ids = [cid for cid, _ in filtered]
+        tokens_by_id = {cid: toks for cid, toks in filtered}
+        corpus = [toks for _, toks in filtered]
+        bm25 = _safe_bm25(corpus)
         return cls(tokens_by_id=tokens_by_id, bm25=bm25, ids=ids)
 

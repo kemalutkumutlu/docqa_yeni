@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import io
 import json
 import os
 from pathlib import Path
@@ -10,7 +9,6 @@ import sys
 import tempfile
 from typing import Protocol, Sequence
 
-import google.auth
 from PIL import Image
 
 
@@ -42,6 +40,7 @@ class LayoutDetector(Protocol):
         page_number: int,
         summary_text: str,
         document_name: str,
+        source_document_path: Path | None = None,
     ) -> DetectorResult:
         ...
 
@@ -56,8 +55,9 @@ class UnavailableLayoutDetector:
         page_number: int,
         summary_text: str,
         document_name: str,
+        source_document_path: Path | None = None,
     ) -> DetectorResult:
-        del image, page_number, summary_text, document_name
+        del image, page_number, summary_text, document_name, source_document_path
         return DetectorResult(
             regions=[],
             warnings=[
@@ -124,8 +124,9 @@ class SidecarLayoutDetector:
         page_number: int,
         summary_text: str,
         document_name: str,
+        source_document_path: Path | None = None,
     ) -> DetectorResult:
-        del image, summary_text
+        del image, summary_text, source_document_path
         sidecar_path = resolve_sidecar_path(self.detector_dir, document_name)
         if sidecar_path is None:
             return DetectorResult(
@@ -203,6 +204,7 @@ def _bbox_from_layout(layout, *, page_width: int, page_height: int, image_width:
 
 class DocAILayoutDetector:
     name = "docai"
+    _document_cache: dict[str, object] = {}
 
     def __init__(
         self,
@@ -227,6 +229,8 @@ class DocAILayoutDetector:
             value = (os.getenv(name, "") or "").strip()
             if value:
                 return value
+        import google.auth
+
         _, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
         if project_id:
             return project_id
@@ -280,6 +284,47 @@ class DocAILayoutDetector:
         rows.sort(key=lambda row: (row.bbox_top, row.bbox_left))
         return rows[:10]
 
+    def _cache_key(self, *, project_id: str, pdf_path: Path) -> str:
+        resolved = pdf_path.resolve()
+        try:
+            stat = resolved.stat()
+            stamp = f"{stat.st_size}:{stat.st_mtime_ns}"
+        except Exception:
+            stamp = "missing"
+        return "|".join(
+            [
+                project_id,
+                self.location,
+                self.processor_id,
+                self.processor_version or "default",
+                str(resolved),
+                stamp,
+            ]
+        )
+
+    def _load_document(self, *, project_id: str, pdf_path: Path):
+        cache_key = self._cache_key(project_id=project_id, pdf_path=pdf_path)
+        cached = self._document_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        from google.api_core.client_options import ClientOptions
+        from google.cloud import documentai
+
+        client = documentai.DocumentProcessorServiceClient(
+            client_options=ClientOptions(api_endpoint=f"{self.location}-documentai.googleapis.com")
+        )
+        if self.processor_version:
+            name = client.processor_version_path(project_id, self.location, self.processor_id, self.processor_version)
+        else:
+            name = client.processor_path(project_id, self.location, self.processor_id)
+        raw_document = documentai.RawDocument(content=pdf_path.read_bytes(), mime_type="application/pdf")
+        request = documentai.ProcessRequest(name=name, raw_document=raw_document)
+        result = client.process_document(request=request, timeout=self.timeout_seconds)
+        document = result.document
+        self._document_cache[cache_key] = document
+        return document
+
     def detect(
         self,
         image: Image.Image,
@@ -287,16 +332,16 @@ class DocAILayoutDetector:
         page_number: int,
         summary_text: str,
         document_name: str,
+        source_document_path: Path | None = None,
     ) -> DetectorResult:
-        del page_number, summary_text, document_name
+        del summary_text, document_name
         if not self.processor_id:
             return DetectorResult(
                 regions=[],
                 warnings=["VISUAL_DETECTOR_BACKEND=docai secili, ancak DOCAI_LAYOUT_PROCESSOR_ID tanimli degil; heuristic fallback kullanildi."],
             )
         try:
-            from google.api_core.client_options import ClientOptions
-            from google.cloud import documentai
+            import google.cloud.documentai  # noqa: F401
         except Exception as exc:
             return DetectorResult(
                 regions=[],
@@ -304,30 +349,28 @@ class DocAILayoutDetector:
             )
 
         try:
+            if source_document_path is None:
+                return DetectorResult(
+                    regions=[],
+                    warnings=[
+                        "Document AI layout parser PDF-seviyesinde calisir; kaynak belge yolu bulunamadi, heuristic fallback kullanildi."
+                    ],
+                )
+            pdf_path = Path(source_document_path)
+            if pdf_path.suffix.lower() != ".pdf":
+                return DetectorResult(
+                    regions=[],
+                    warnings=[
+                        f"Document AI layout parser image yerine PDF bekliyor ({pdf_path.name}); heuristic fallback kullanildi."
+                    ],
+                )
             project_id = self._resolve_project_id(self.project_id)
-        except Exception as exc:
-            return DetectorResult(regions=[], warnings=[f"Document AI project id cozulmedi ({exc}); heuristic fallback kullanildi."])
-
-        try:
-            image_bytes = io.BytesIO()
-            image.save(image_bytes, format="PNG")
-            content = image_bytes.getvalue()
-            client = documentai.DocumentProcessorServiceClient(
-                client_options=ClientOptions(api_endpoint=f"{self.location}-documentai.googleapis.com")
-            )
-            if self.processor_version:
-                name = client.processor_version_path(project_id, self.location, self.processor_id, self.processor_version)
-            else:
-                name = client.processor_path(project_id, self.location, self.processor_id)
-            raw_document = documentai.RawDocument(content=content, mime_type="image/png")
-            request = documentai.ProcessRequest(name=name, raw_document=raw_document)
-            result = client.process_document(request=request, timeout=self.timeout_seconds)
-            document = result.document
+            document = self._load_document(project_id=project_id, pdf_path=pdf_path)
             pages = getattr(document, "pages", None) or []
-            if not pages:
+            if not pages or page_number < 1 or page_number > len(pages):
                 return DetectorResult(regions=[], warnings=["Document AI sonucunda sayfa layout verisi donmedi; heuristic fallback kullanildi."])
             regions = self._candidate_regions(
-                pages[0],
+                pages[page_number - 1],
                 getattr(document, "text", "") or "",
                 image_width=image.width,
                 image_height=image.height,
@@ -425,6 +468,17 @@ class DoclingLayoutDetector:
             env["DOCLING_ARTIFACTS_PATH"] = str(artifacts_path)
         return env
 
+    @staticmethod
+    def _debug_suffix(payload: dict) -> str:
+        debug = payload.get("debug", {}) if isinstance(payload, dict) else {}
+        if not isinstance(debug, dict):
+            return ""
+        parts: list[str] = []
+        for key in ("source_suffix", "special_candidates", "text_candidates", "iter_items_seen", "iter_items_kept", "returned_regions"):
+            if key in debug:
+                parts.append(f"{key}={debug[key]}")
+        return f" [debug: {', '.join(parts)}]" if parts else ""
+
     def detect(
         self,
         image: Image.Image,
@@ -432,8 +486,9 @@ class DoclingLayoutDetector:
         page_number: int,
         summary_text: str,
         document_name: str,
+        source_document_path: Path | None = None,
     ) -> DetectorResult:
-        del page_number, summary_text
+        del summary_text
         runner_path = self._runner_path()
         if not runner_path.exists():
             return DetectorResult(
@@ -443,15 +498,23 @@ class DoclingLayoutDetector:
 
         with tempfile.TemporaryDirectory(prefix="docling_layout_") as tmp_dir:
             tmp_path = Path(tmp_dir)
-            image_path = tmp_path / "page.png"
             output_path = tmp_path / "regions.json"
-            try:
-                image.save(image_path, format="PNG")
-            except Exception as exc:
-                return DetectorResult(
-                    regions=[],
-                    warnings=[f"Docling layout icin gecici image yazilamadi ({exc}); heuristic fallback kullanildi."],
-                )
+            source_path: Path
+            cmd_source_flag: str
+            if source_document_path is not None and Path(source_document_path).suffix.lower() == ".pdf":
+                source_path = Path(source_document_path)
+                cmd_source_flag = "--source"
+            else:
+                image_path = tmp_path / "page.png"
+                try:
+                    image.save(image_path, format="PNG")
+                except Exception as exc:
+                    return DetectorResult(
+                        regions=[],
+                        warnings=[f"Docling layout icin gecici image yazilamadi ({exc}); heuristic fallback kullanildi."],
+                    )
+                source_path = image_path
+                cmd_source_flag = "--image"
 
             env = self._build_subprocess_env(
                 python_bin=self.python_bin,
@@ -463,12 +526,18 @@ class DoclingLayoutDetector:
             cmd = [
                 self.python_bin,
                 str(runner_path),
-                "--image",
-                str(image_path),
+                cmd_source_flag,
+                str(source_path),
                 "--output",
                 str(output_path),
                 "--document-name",
                 Path(document_name).name,
+                "--page-number",
+                str(max(1, int(page_number or 1))),
+                "--image-width",
+                str(max(1, int(image.width or 1))),
+                "--image-height",
+                str(max(1, int(image.height or 1))),
             ]
             try:
                 completed = subprocess.run(
@@ -513,9 +582,17 @@ class DoclingLayoutDetector:
         rows = payload.get("regions", []) if isinstance(payload, dict) else []
         regions = [region for row in rows if isinstance(row, dict) for region in [self._region_from_row(row)] if region is not None]
         if not regions:
+            debug_suffix = self._debug_suffix(payload if isinstance(payload, dict) else {})
+            payload_warnings = [
+                str(item).strip()
+                for item in (payload.get("warnings", []) if isinstance(payload, dict) else [])
+                if str(item).strip()
+            ]
+            warnings = list(payload_warnings)
+            warnings.append(f"Docling layout bbox bolgesi uretemedi{debug_suffix}; heuristic fallback kullanildi.")
             return DetectorResult(
                 regions=[],
-                warnings=["Docling layout bbox bolgesi uretemedi; heuristic fallback kullanildi."],
+                warnings=warnings,
             )
         warnings = [str(item).strip() for item in (payload.get("warnings", []) if isinstance(payload, dict) else []) if str(item).strip()]
         return DetectorResult(regions=regions, warnings=warnings)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import List, Optional, Set
 
 from .embedding import Embedder
@@ -9,6 +10,20 @@ from .hybrid import HybridResult, rrf_fuse
 from .models import Chunk
 from .sparse import BM25Index
 from .vectorstore import ChromaStore
+
+
+_CHROMA_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_CHROMA_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _chroma_write_lock(chroma_dir: Path | str) -> threading.Lock:
+    key = str(Path(chroma_dir).resolve())
+    with _CHROMA_WRITE_LOCKS_GUARD:
+        lock = _CHROMA_WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CHROMA_WRITE_LOCKS[key] = lock
+        return lock
 
 
 @dataclass
@@ -30,7 +45,7 @@ class LocalIndex:
     def bm25_path(self) -> Optional[str]:
         """Path where BM25 index is persisted (alongside ChromaDB)."""
         if self.chroma_dir:
-            return str(Path(self.chroma_dir) / "bm25_index.pkl")
+            return str(Path(self.chroma_dir) / "bm25_index.json")
         return None
 
     @classmethod
@@ -40,9 +55,14 @@ class LocalIndex:
         chroma_dir: Path,
         embedding_model: str,
         embedding_device: str = "auto",
+        embedding_dimension: int = 3072,
         collection_name: str = "chunks",
     ) -> "LocalIndex":
-        embedder = Embedder(model_name=embedding_model, device=embedding_device)  # type: ignore[arg-type]
+        embedder = Embedder(
+            model_name=embedding_model,
+            device=embedding_device,
+            output_dimension=embedding_dimension,
+        )  # type: ignore[arg-type]
         # Embed first so we can derive embedding dimension deterministically.
         embeddings = embedder.embed_chunks(chunks)
         emb_dim = len(embeddings[0]) if embeddings else 0
@@ -57,17 +77,17 @@ class LocalIndex:
             collection_name_use = f"chunks_d{emb_dim}"
 
         store = ChromaStore(persist_dir=str(chroma_dir), collection_name=collection_name_use)
+        with _chroma_write_lock(chroma_dir):
+            # Prevent stale chunks accumulating for the same doc_id(s) in the persistent store.
+            doc_ids = sorted({c.doc_id for c in chunks})
+            if doc_ids:
+                if len(doc_ids) == 1:
+                    store.delete_where(where={"doc_id": doc_ids[0]})
+                else:
+                    store.delete_where(where={"$or": [{"doc_id": did} for did in doc_ids]})
 
-        # Prevent stale chunks accumulating for the same doc_id(s) in the persistent store.
-        doc_ids = sorted({c.doc_id for c in chunks})
-        if doc_ids:
-            if len(doc_ids) == 1:
-                store.delete_where(where={"doc_id": doc_ids[0]})
-            else:
-                store.delete_where(where={"$or": [{"doc_id": did} for did in doc_ids]})
-
-        # Upsert all chunks (parents + children)
-        store.upsert_chunks(chunks, embeddings=embeddings)
+            # Upsert all chunks (parents + children)
+            store.upsert_chunks(chunks, embeddings=embeddings)
 
         bm25 = BM25Index.build(chunks)
         allowed_doc_ids = {c.doc_id for c in chunks}
@@ -87,13 +107,18 @@ class LocalIndex:
         chroma_dir: Path,
         embedding_model: str,
         embedding_device: str = "auto",
+        embedding_dimension: int = 3072,
         allowed_doc_ids: Set[str],
         collection_name: str = "chunks",
         chunks: Optional[List[Chunk]] = None,
     ) -> "LocalIndex":
-        embedder = Embedder(model_name=embedding_model, device=embedding_device)  # type: ignore[arg-type]
+        embedder = Embedder(
+            model_name=embedding_model,
+            device=embedding_device,
+            output_dimension=embedding_dimension,
+        )  # type: ignore[arg-type]
         store = ChromaStore(persist_dir=str(chroma_dir), collection_name=collection_name)
-        bm25_path = Path(chroma_dir) / "bm25_index.pkl"
+        bm25_path = Path(chroma_dir) / "bm25_index.json"
         if bm25_path.exists():
             bm25 = BM25Index.load(str(bm25_path))
         else:
@@ -120,33 +145,34 @@ class LocalIndex:
         if not new_chunks:
             return
 
-        # Clean stale chunks for the new doc_id(s) in Chroma.
-        new_doc_ids = sorted({c.doc_id for c in new_chunks})
-        if new_doc_ids:
-            if len(new_doc_ids) == 1:
-                self.store.delete_where(where={"doc_id": new_doc_ids[0]})
-            else:
-                self.store.delete_where(where={"$or": [{"doc_id": did} for did in new_doc_ids]})
+        with _chroma_write_lock(self.chroma_dir or ""):
+            # Clean stale chunks for the new doc_id(s) in Chroma.
+            new_doc_ids = sorted({c.doc_id for c in new_chunks})
+            if new_doc_ids:
+                if len(new_doc_ids) == 1:
+                    self.store.delete_where(where={"doc_id": new_doc_ids[0]})
+                else:
+                    self.store.delete_where(where={"$or": [{"doc_id": did} for did in new_doc_ids]})
 
-        # If any of these doc_ids were already indexed, we are REPLACING them.
-        # Chroma is cleaned above; we must also prevent sparse duplicates.
-        already_indexed = set(new_doc_ids) & set(self.allowed_doc_ids)
-        if already_indexed:
-            self.bm25.remove_doc_ids(already_indexed)
+            # If any of these doc_ids were already indexed, we are REPLACING them.
+            # Chroma is cleaned above; we must also prevent sparse duplicates.
+            already_indexed = set(new_doc_ids) & set(self.allowed_doc_ids)
+            if already_indexed:
+                self.bm25.remove_doc_ids(already_indexed)
 
-        # Embed only the NEW chunks.
-        embeddings = self.embedder.embed_chunks(new_chunks)
-        self.store.upsert_chunks(new_chunks, embeddings=embeddings)
+            # Embed only the NEW chunks.
+            embeddings = self.embedder.embed_chunks(new_chunks)
+            self.store.upsert_chunks(new_chunks, embeddings=embeddings)
 
-        # Extend BM25 incrementally.
-        self.bm25.extend(new_chunks)
+            # Extend BM25 incrementally.
+            self.bm25.extend(new_chunks)
 
-        # Track new doc_ids.
-        self.allowed_doc_ids.update(new_doc_ids)
+            # Track new doc_ids.
+            self.allowed_doc_ids.update(new_doc_ids)
 
-        # Persist updated BM25
-        if self.bm25_path:
-            self.bm25.save(self.bm25_path)
+            # Persist updated BM25
+            if self.bm25_path:
+                self.bm25.save(self.bm25_path)
 
     def _where_allowed_docs(self) -> Optional[dict]:
         """

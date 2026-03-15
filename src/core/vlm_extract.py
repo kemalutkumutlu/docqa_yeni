@@ -4,11 +4,7 @@ import io
 from dataclasses import dataclass
 from typing import Optional
 
-from google import genai
-from google.genai import types
 from PIL import Image
-
-from .gemini_client import build_gemini_client, gemini_model_candidates, is_model_not_found_error
 
 
 @dataclass(frozen=True)
@@ -52,6 +48,14 @@ Rules:
 """
 
 
+def _gemini_helpers():
+    from google.genai import types
+
+    from .gemini_client import build_gemini_client, gemini_model_candidates, is_model_not_found_error
+
+    return types, build_gemini_client, gemini_model_candidates, is_model_not_found_error
+
+
 def extract_text_from_image(image: Image.Image, cfg: VLMConfig) -> str:
     """
     Extract text from an image using a multimodal model (extract-only).
@@ -65,6 +69,7 @@ def extract_text_from_image(image: Image.Image, cfg: VLMConfig) -> str:
 
 def _extract_via_gemini(image: Image.Image, cfg: VLMConfig) -> str:
     """Gemini API path (existing behavior)."""
+    types, build_gemini_client, gemini_model_candidates, is_model_not_found_error = _gemini_helpers()
     # Encode image as PNG bytes
     buf = io.BytesIO()
     image.save(buf, format="PNG")

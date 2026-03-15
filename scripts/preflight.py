@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import load_settings  # noqa: E402
 from src.core.embedding import Embedder  # noqa: E402
+from src.core.generation import _openai_chat_completion  # noqa: E402
 from src.core.gemini_client import (  # noqa: E402
     build_gemini_client,
     gemini_model_candidates,
@@ -17,6 +18,7 @@ from src.core.gemini_client import (  # noqa: E402
     use_vertex_ai,
     vertex_location_for_model,
 )
+from src.core.local_llm import OllamaConfig, ollama_chat  # noqa: E402
 from src.core.vlm_extract import VLMConfig, extract_text_from_image  # noqa: E402
 
 
@@ -25,8 +27,44 @@ def _print(msg: str) -> None:
 
 
 def _test_generation(settings) -> str:
+    if settings.llm_provider == "none":
+        _print("[SKIP] generation disabled (LLM_PROVIDER=none)")
+        return "none"
+    if settings.llm_provider == "openai":
+        if not settings.openai_api_key:
+            raise RuntimeError("OpenAI preflight failed: OPENAI_API_KEY missing")
+        text = _openai_chat_completion(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            system_instruction="Reply with exactly: ok",
+            user_contents="ok",
+            temperature=0.0,
+            max_tokens=16,
+        )
+        _print(f"[OK] generation provider=openai model={settings.openai_model} response={text!r}")
+        return settings.openai_model
+    if settings.llm_provider == "local":
+        cfg = OllamaConfig(
+            base_url=settings.ollama_base_url,
+            llm_model=settings.ollama_llm_model,
+            vlm_model=settings.ollama_vlm_model,
+            timeout=settings.ollama_timeout,
+        )
+        text = ollama_chat(
+            cfg=cfg,
+            system="Reply with exactly: ok",
+            user_message="ok",
+            temperature=0.0,
+            max_tokens=16,
+        )
+        _print(f"[OK] generation provider=local model={cfg.llm_model} response={text!r}")
+        return cfg.llm_model
+
     last_error: Exception | None = None
-    for model_name in gemini_model_candidates(settings.gemini_model):
+    for model_name in gemini_model_candidates(
+        settings.gemini_model,
+        fallback_model=settings.gemini_fallback_model,
+    ):
         try:
             client = build_gemini_client(settings.gemini_api_key, model_name=model_name)
             resp = client.models.generate_content(
@@ -90,6 +128,7 @@ def main() -> int:
     _print(
         "[INFO] mode="
         f"{'vertex' if use_vertex_ai() else 'ai_studio'} "
+        f"llm_provider={settings.llm_provider} "
         f"llm={settings.gemini_model} emb={settings.embedding_model} "
         f"vlm={settings.vlm_provider}/{settings.vlm_mode}"
     )

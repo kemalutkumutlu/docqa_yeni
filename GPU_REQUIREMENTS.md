@@ -10,6 +10,7 @@ Bu belge, projede GPU'nun hangi parcalarda gercekten fayda sagladigini ozetler. 
 - local `sentence-transformers` embedding: lokal GPU kullanabilir
 - `PaddleOCR-VL-1.5` / `PaddleOCR`: lokal GPU kullanabilir
 - `Docling layout detector`: lokal GPU kullanabilir
+- `Docling text extraction` (`PDF_TEXT_BACKEND=docling`): lokal GPU kullanabilir
 - `Ollama` local LLM/VLM: kendi surecinde lokal GPU kullanabilir
 
 Yani GPU'nun asil etkili oldugu local kisimlar:
@@ -17,6 +18,7 @@ Yani GPU'nun asil etkili oldugu local kisimlar:
 - embedding
 - Paddle OCR
 - Docling layout
+- Docling text extraction
 - Ollama
 
 ## GPU Ne Zaman Fayda Saglar?
@@ -84,7 +86,26 @@ Onemli not:
 - `docling` icin ayri bir venv kullanmak tavsiye edilir
 - `DOCLING_PYTHON_BIN` ile projeye baglanabilir
 
-### 4. Ollama local LLM/VLM
+### 4. Docling text extraction
+
+```ini
+PDF_TEXT_BACKEND=docling
+DOCLING_PYTHON_BIN=/path/to/.venv-docling/bin/python
+DOCLING_DEVICE=cuda
+```
+
+Kazanc:
+
+- PDF metin + tablo cikarimi icin layout model inference hizi
+- `DOCLING_DEVICE=cuda` ile GPU'ya yonlendirilir
+
+Onemli not:
+
+- Docling text extraction layout detector ile ayni binary'yi paylasir (`.venv-docling`)
+- Subprocess ile calisir; ana uygulama ortamini etkilemez
+- Docling kazandigi sayfalarda OCR atlanir, dolayisiyla OCR GPU maliyeti de duser
+
+### 5. Ollama local LLM/VLM
 
 ```ini
 LLM_PROVIDER=local
@@ -104,7 +125,7 @@ dogrudan etki eder.
 Bu projede tek venv'e her seyi yigmak yerine ayri ortam tutmak daha guvenli:
 
 - `.venv-gpu`: ana uygulama
-- ayri `docling` venv: layout detector
+- `.venv-docling`: layout detector ve Docling text extraction
 - gerekirse ayri `paddle` venv: OCR
 
 Bunun sebebi:

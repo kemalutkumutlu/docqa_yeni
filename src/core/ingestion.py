@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import re
@@ -198,6 +204,7 @@ def _build_visual_assets(
     page_number: int,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
+    source_document_path: Optional[Path] = None,
 ) -> tuple[list[VisualAsset], list[str]]:
     if not multimodal or not multimodal.enabled or multimodal.assets_dir is None:
         return [], []
@@ -211,6 +218,7 @@ def _build_visual_assets(
         source="detector" if region_source == "detector" else "heuristic",
         summary_text=summary_text,
         document_name=file_name,
+        source_document_path=source_document_path,
         detector_backend=(multimodal.detector_backend or "none"),
         detector_dir=multimodal.detector_dir,
         docai_project_id=(multimodal.docai_project_id or ""),
@@ -272,6 +280,7 @@ def _pdf_page_visual_assets(
     page_number: int,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
+    source_document_path: Optional[Path] = None,
 ) -> tuple[list[VisualAsset], list[str]]:
     pix = page.get_pixmap(dpi=160)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -282,6 +291,7 @@ def _pdf_page_visual_assets(
         page_number=page_number,
         summary_text=summary_text,
         multimodal=multimodal,
+        source_document_path=source_document_path,
     )
 
 
@@ -292,6 +302,7 @@ def _image_visual_assets(
     file_name: str,
     summary_text: str,
     multimodal: Optional[MultimodalConfig],
+    source_document_path: Optional[Path] = None,
 ) -> tuple[list[VisualAsset], list[str]]:
     return _build_visual_assets(
         img_rgb,
@@ -300,7 +311,202 @@ def _image_visual_assets(
         page_number=1,
         summary_text=summary_text,
         multimodal=multimodal,
+        source_document_path=source_document_path,
     )
+
+
+# ─── PDF enhancement helpers ──────────────────────────────────────────────────
+
+def _extract_toc_text(pdf: fitz.Document) -> str:
+    """Extract bookmark / table-of-contents outline as a structured text prefix.
+
+    Prepending this to page-1 text helps structure.py detect section headings
+    it might otherwise miss (e.g. titles without numbered prefixes).
+    """
+    try:
+        toc = pdf.get_toc(simple=False)  # [(level, title, page_no, dest), ...]
+        if not toc:
+            return ""
+        lines = ["=== İÇİNDEKİLER ==="]
+        for entry in toc:
+            level, title, page_num = entry[0], entry[1], entry[2]
+            indent = "  " * max(0, level - 1)
+            lines.append(f"{indent}{title} (s.{page_num})")
+        return "\n".join(lines) + "\n"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_form_fields_text(page: fitz.Page) -> str:
+    """Extract filled form-field values from a PDF page (e.g. PDF forms)."""
+    try:
+        fields = []
+        for widget in page.widgets() or []:
+            name = (getattr(widget, "field_name", None) or "").strip()
+            value = str(getattr(widget, "field_value", None) or "").strip()
+            if value:
+                fields.append(f"{name}: {value}" if name else value)
+        return "\n".join(fields)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_native_tables_text(page: fitz.Page) -> str:
+    """Use PyMuPDF's native table finder (>= 1.23) to extract tables as markdown.
+
+    Returns empty string when unavailable or when no tables are detected.
+    Only called for text-based pages (source == 'pdf_text') to avoid double work.
+    """
+    try:
+        tabs = page.find_tables()
+        if not tabs or not tabs.tables:
+            return ""
+        parts: list[str] = []
+        for tab in tabs.tables:
+            try:
+                md = tab.to_markdown()
+                if md and md.strip():
+                    parts.append(md.strip())
+            except Exception:  # noqa: BLE001
+                pass
+        return "\n\n".join(parts) if parts else ""
+    except AttributeError:
+        # find_tables() introduced in PyMuPDF 1.23 – degrade gracefully
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_page_text_ordered(page: fitz.Page) -> str:
+    """Extract page text with multi-column layout awareness.
+
+    get_text("text") reads lines in raw PDF order which can interleave columns.
+    This function uses get_text("blocks") to detect two-column layouts and reads
+    each column top-to-bottom before concatenating.  Falls back to the simple
+    get_text("text") path if block extraction fails or layout is single-column.
+    """
+    try:
+        raw_blocks = page.get_text("blocks") or []
+        # Each block: (x0, y0, x1, y1, text, block_no, block_type)
+        # block_type 0 = text, 1 = image
+        text_blocks = [
+            (float(x0), float(y0), float(x1), float(y1), str(txt))
+            for x0, y0, x1, y1, txt, _bn, bt in raw_blocks
+            if int(bt) == 0 and str(txt).strip()
+        ]
+        if not text_blocks:
+            return page.get_text("text") or ""
+
+        page_width = float(page.rect.width) or 1.0
+        mid_x = page_width / 2.0
+
+        # Two-column detection: no block spans more than 65% of page width,
+        # AND both halves contain meaningful content (≥3 blocks each).
+        wide_blocks = [b for b in text_blocks if (b[2] - b[0]) > page_width * 0.65]
+        if not wide_blocks:
+            left_col = [b for b in text_blocks if b[2] <= mid_x * 1.15]
+            right_col = [b for b in text_blocks if b[0] >= mid_x * 0.85]
+            if len(left_col) >= 3 and len(right_col) >= 3:
+                left_sorted = sorted(left_col, key=lambda b: (round(b[1] / 10), b[0]))
+                right_sorted = sorted(right_col, key=lambda b: (round(b[1] / 10), b[0]))
+                parts = [b[4].strip() for b in left_sorted] + [b[4].strip() for b in right_sorted]
+                return "\n".join(p for p in parts if p)
+
+        # Single-column or mixed: sort by row (y0 bucketed to 10px), then left-to-right
+        sorted_blocks = sorted(text_blocks, key=lambda b: (round(b[1] / 10), b[0]))
+        return "\n".join(b[4].strip() for b in sorted_blocks if b[4].strip())
+
+    except Exception:  # noqa: BLE001
+        return page.get_text("text") or ""
+
+
+# ─── Docling text-extraction helpers ─────────────────────────────────────────
+
+@dataclass(frozen=True)
+class DoclingTextConfig:
+    """Configuration for optional Docling-based PDF text extraction.
+
+    When provided to ingest_pdf(), Docling runs on the whole PDF in a subprocess
+    (separate venv), extracts per-page text with table markdown, and the result
+    is offered as a candidate alongside the native PyMuPDF text.  The best
+    candidate (by structure score) is selected per page.
+    """
+    python_bin: str = ""                                     # path to docling venv python
+    model_name: str = "docling-layout-heron-101"
+    artifacts_path: Optional[Path] = None
+    device: str = "auto"
+    do_table_structure: bool = True
+    timeout: int = 300                                       # subprocess timeout in seconds
+
+
+def _docling_text_env(cfg: DoclingTextConfig) -> dict[str, str]:
+    """Build subprocess environment for docling_text_runner.py."""
+    pass_through = (
+        "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+        "TMPDIR", "TMP", "TEMP", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+        "XDG_CACHE_HOME", "HF_HOME", "HUGGINGFACE_HUB_CACHE",
+        "TRANSFORMERS_CACHE", "CUDA_VISIBLE_DEVICES", "LD_LIBRARY_PATH",
+    )
+    env: dict[str, str] = {k: v for k in pass_through if (v := os.environ.get(k))}
+    python_bin = (cfg.python_bin or sys.executable).strip() or sys.executable
+    env["PATH"] = str(Path(python_bin).resolve().parent) + os.pathsep + os.environ.get("PATH", "")
+    env["PYTHONNOUSERSITE"] = "1"
+    env["DOCLING_LAYOUT_MODEL"] = cfg.model_name or "docling-layout-heron-101"
+    env["DOCLING_DEVICE"] = cfg.device or "auto"
+    env["DOCLING_TABLE_STRUCTURE"] = "1" if cfg.do_table_structure else "0"
+    if cfg.artifacts_path is not None:
+        env["DOCLING_ARTIFACTS_PATH"] = str(cfg.artifacts_path)
+    return env
+
+
+def _docling_extract_page_texts(path: Path, cfg: DoclingTextConfig) -> dict[int, str]:
+    """Run docling_text_runner in a subprocess; return {page_no: text}.
+
+    Returns empty dict on any failure so callers can gracefully fall back to
+    the PyMuPDF text layer.
+    """
+    runner_path = Path(__file__).resolve().parents[2] / "scripts" / "docling_text_runner.py"
+    if not runner_path.exists():
+        return {}
+
+    python_bin = (cfg.python_bin or sys.executable).strip() or sys.executable
+
+    with tempfile.TemporaryDirectory(prefix="docling_text_") as tmp_dir:
+        output_path = Path(tmp_dir) / "pages.json"
+        cmd = [
+            python_bin,
+            str(runner_path),
+            "--source", str(path),
+            "--output", str(output_path),
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=cfg.timeout,
+                check=False,
+                env=_docling_text_env(cfg),
+            )
+        except FileNotFoundError:
+            return {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+        if completed.returncode != 0 or not output_path.exists():
+            return {}
+
+        try:
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+
+        pages_raw = payload.get("pages", {}) if isinstance(payload, dict) else {}
+        return {int(k): str(v) for k, v in pages_raw.items() if str(v).strip()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def ingest_pdf(
@@ -310,12 +516,15 @@ def ingest_pdf(
     vlm: Optional[VLMConfig] = None,
     table_config: Optional[TableStructureConfig] = None,
     multimodal: Optional[MultimodalConfig] = None,
+    docling_text: Optional[DoclingTextConfig] = None,
 ) -> IngestResult:
     """
     Extract page-bounded text from a PDF.
 
-    - Prefer PDF text layer.
+    - Prefer PDF text layer (with multi-column and table-aware extraction).
     - If a page has too little text and OCR is enabled, render to image and OCR.
+    - Prepends TOC/bookmarks to page-1 text when available.
+    - Supplements text-layer pages with native table markdown and form fields.
     """
     if not path.exists():
         raise FileNotFoundError(str(path))
@@ -331,25 +540,57 @@ def ingest_pdf(
     visual_assets: list[VisualAsset] = []
     structured_tables = []
 
-    pdf = fitz.open(str(path))
+    # ── Open PDF (handle encrypted / corrupted files explicitly) ────────────
+    try:
+        pdf = fitz.open(str(path))
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"PDF dosyasi acilamadi ({file_name}): {e}") from e
+
+    if pdf.needs_pass:
+        pdf.close()
+        raise ValueError(f"PDF sifreli/kilitli, parola gerekiyor: {file_name}")
+
+    # ── Extract bookmark / TOC (prepended to page-1 text) ───────────────────
+    toc_prefix = _extract_toc_text(pdf)
+
+    # ── Optional Docling text extraction (runs once for whole PDF) ───────────
+    docling_page_texts: dict[int, str] = {}
+    if docling_text is not None:
+        try:
+            docling_page_texts = _docling_extract_page_texts(path, docling_text)
+            if not docling_page_texts:
+                warnings.append("Docling PDF metin çıkarma sonuç vermedi; PyMuPDF kullanılıyor.")
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"Docling PDF metin çıkarma başarısız: {e}")
+
     try:
         vlm_pages_used = 0
         for i in range(pdf.page_count):
             page = pdf.load_page(i)
             page_no = i + 1
 
-            pdf_text = page.get_text("text") or ""
+            pdf_text = _extract_page_text_ordered(page)
             pdf_text_raw = normalize_whitespace(pdf_text)
             pdf_text_norm = _finalize_extracted_text(pdf_text, source="pdf_text")
             text_norm = pdf_text_norm
 
-            # Heuristic: if text layer is missing/too small, try OCR.
+            # ── Docling text candidate ────────────────────────────────────────
             source = "pdf_text"
+            if docling_page_texts.get(page_no):
+                docling_raw = docling_page_texts[page_no]
+                docling_norm = _finalize_extracted_text(docling_raw, source="docling_text")
+                if docling_norm:
+                    text_norm, source = _pick_best_candidate(
+                        [(pdf_text_norm, "pdf_text"), (docling_norm, "docling_text")]
+                    )
+
+            # Heuristic: if text layer is missing/too small, try OCR.
+            # Check quality of the best candidate so far (PyMuPDF or Docling).
             ocr_text_norm = ""
             # NOTE: some PDFs have a "text layer" that is present but unusable (broken layout,
             # single-token-per-line, etc.). Treat those pages as OCR candidates too.
             should_try_ocr = ocr.enabled and (
-                len(pdf_text_raw) < 40 or _text_quality_low(pdf_text_raw)
+                len(text_norm.strip()) < 40 or _text_quality_low(text_norm)
             )
             if should_try_ocr:
                 try:
@@ -395,6 +636,20 @@ def ingest_pdf(
                 except Exception as e:  # noqa: BLE001
                     warnings.append(f"VLM failed on page {page_no}: {e}")
 
+            # ── Supplement text-layer pages with native table markdown & form fields ──
+            # Only when PyMuPDF won (Docling already handles tables natively).
+            if source == "pdf_text":
+                native_tables = _extract_native_tables_text(page)
+                if native_tables:
+                    text_norm = text_norm + "\n\n" + native_tables
+                form_fields = _extract_form_fields_text(page)
+                if form_fields:
+                    text_norm = text_norm + "\n" + form_fields
+
+            # ── Prepend TOC/bookmarks to first page ──────────────────────────────
+            if page_no == 1 and toc_prefix:
+                text_norm = toc_prefix + "\n" + text_norm
+
             pages.append(
                 PageText(
                     doc_id=doc_id,
@@ -411,6 +666,7 @@ def ingest_pdf(
                 page_number=page_no,
                 summary_text=text_norm,
                 multimodal=multimodal,
+                source_document_path=path,
             )
             if asset_warnings:
                 for warning in asset_warnings:
@@ -531,6 +787,7 @@ def ingest_image(
             file_name=file_name,
             summary_text=text_norm,
             multimodal=multimodal,
+            source_document_path=path,
         )
         if asset_warnings:
             for warning in asset_warnings:
@@ -560,10 +817,19 @@ def ingest_any(
     vlm: Optional[VLMConfig] = None,
     table_config: Optional[TableStructureConfig] = None,
     multimodal: Optional[MultimodalConfig] = None,
+    docling_text: Optional[DoclingTextConfig] = None,
 ) -> IngestResult:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return ingest_pdf(path, ocr=ocr, display_name=display_name, vlm=vlm, table_config=table_config, multimodal=multimodal)
+        return ingest_pdf(
+            path,
+            ocr=ocr,
+            display_name=display_name,
+            vlm=vlm,
+            table_config=table_config,
+            multimodal=multimodal,
+            docling_text=docling_text,
+        )
     if suffix in (".png", ".jpg", ".jpeg"):
         return ingest_image(path, ocr=ocr, display_name=display_name, vlm=vlm, table_config=table_config, multimodal=multimodal)
     raise ValueError(f"Unsupported file type: {suffix}")

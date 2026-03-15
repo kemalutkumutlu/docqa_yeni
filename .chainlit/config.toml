@@ -4,6 +4,7 @@
 # Arayüz başlığı (Chainlit yerine TUSAS DOCQA)
 name = "TUSAS DOCQA"
 custom_css = "/public/stylesheet.css"
+custom_js = "/public/app_ui.js"
 
 # Logo: TUSAS logosu (public/ altında)
 logo_file_url = "/public/logo_brand_white.png"

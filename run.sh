@@ -24,6 +24,7 @@ PORT="${PORT:-8000}"
 DEBUG="${DEBUG:-0}"
 RUN_PREFLIGHT="${RUN_PREFLIGHT:-1}"
 OLLAMA_AUTO_START="${OLLAMA_AUTO_START:-1}"
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
 
 case "${DEBUG,,}" in
   1|0|true|false|yes|no|on|off|y|n|t|f|"")
@@ -36,7 +37,8 @@ esac
 mkdir -p "${DATA_DIR:-$PROJECT_ROOT/data}"
 
 if [[ "$OLLAMA_AUTO_START" == "1" ]] && command -v ollama >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
-  if ! curl -fsS "http://127.0.0.1:11434/api/tags" >/dev/null 2>&1; then
+  OLLAMA_HEALTH_URL="${OLLAMA_BASE_URL%/}/api/tags"
+  if [[ "$OLLAMA_BASE_URL" =~ ^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?/?$ ]] && ! curl -fsS "$OLLAMA_HEALTH_URL" >/dev/null 2>&1; then
     echo "[run.sh] starting ollama..."
     if command -v setsid >/dev/null 2>&1; then
       setsid ollama serve > "${DATA_DIR:-$PROJECT_ROOT/data}/ollama.log" 2>&1 < /dev/null &
@@ -44,7 +46,7 @@ if [[ "$OLLAMA_AUTO_START" == "1" ]] && command -v ollama >/dev/null 2>&1 && com
       nohup ollama serve > "${DATA_DIR:-$PROJECT_ROOT/data}/ollama.log" 2>&1 < /dev/null &
     fi
     for _ in {1..30}; do
-      if curl -fsS "http://127.0.0.1:11434/api/tags" >/dev/null 2>&1; then
+      if curl -fsS "$OLLAMA_HEALTH_URL" >/dev/null 2>&1; then
         break
       fi
       sleep 1

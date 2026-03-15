@@ -1,5 +1,72 @@
 # DEVLOG
 
+## Faz 11.2 — Docling PDF Text Backend
+
+Bu faz, PDF metin cikarimi icin Docling'i opsiyonel bir backend olarak ekler.
+
+Bugunku gercek:
+
+- `PDF_TEXT_BACKEND` ayari eklendi: `pymupdf` (default) | `docling` | `auto`
+- Docling, layout detector ile ayni `.venv-docling` ortamini kullanir
+- `scripts/docling_text_runner.py` eklendi: PDF basi subprocess ile Docling text + tablo markdown cikarimi
+- `DoclingTextConfig` dataclass eklendi (`src/core/ingestion.py`)
+- `_docling_extract_page_texts()` fonksiyonu: tek subprocess ile tum PDF islenir (model yukleme maliyeti sadece bir kez)
+- Docling metni `_pick_best_candidate()` ile PyMuPDF metnine kiyasla en iyi aday secilir
+- Docling kazandigi sayfada OCR tetiklenmez; Docling zaten tablo markdown uretir, ayri table supplement atlaniir
+- `src/core/pipeline.py`: `_build_docling_text_config()` metodu eklendi; backend=pymupdf ise hic calistirilmaz
+- `src/config.py`: `Settings.pdf_text_backend` alani ve `PDF_TEXT_BACKEND` env okumasi eklendi
+- `app.py`: pipeline olusturulurken `pdf_text_backend` settings'ten aktarilir; UI Advanced sekmesinde dropdown olarak gosterilir
+- `public/settings_sidebar.js`: `ADVANCED_FIELDS`'a `pdf_text_backend` eklendi
+
+Bu fazda alinan ana kararlar:
+
+1. Default `pymupdf`: mevcut kullanici icin davranis degismez
+2. Docling subprocess izolasyonu: layout detector ile ayni pattern, ayni venv
+3. Docling tum PDF icin bir kez calisir (her sayfa icin ayri subprocess degil)
+4. OCR kararinda `pdf_text_raw` yerine `text_norm.strip()` kontrol edilir — Docling iyi metin verdiyse OCR atlanir
+
+Operasyonel sonuc:
+
+- `PDF_TEXT_BACKEND=docling` ile Docling text extraction aktif olur
+- `DOCLING_PYTHON_BIN` ve `.venv-docling` zaten mevcutsa ek kurulum gerekmez
+- Layout detector (Docling) ve text extraction (Docling) ayni venv'i paylasiir
+
+## Faz 11.1 - Runtime Panel, Hardening ve UI Toparlama
+
+Bu faz, onceki capability genislemesini daha stabil ve daha tutarli hale getiren toparlama donemidir.
+
+Bugunku gercek:
+
+- BM25 persist artik `pickle` degil guvenli JSON formatina tasinmistir
+- sert `os._exit(0)` cikisi kaldirilmis, graceful shutdown davranisi eklenmistir
+- OpenAI ve Ollama HTTP cagrilari `httpx` tabanina alinmistir
+- Gemini/OpenAI/Ollama retry siniflandirmasi daha yapisal hale getirilmistir
+- optional Google import'lari lazy import ile startup'tan ayrilmistir
+- custom runtime settings paneli artik tek sag panel olarak calisir
+- onceki ayri `Belge Durumu` element sidebar'i kapatilmistir
+- belge baglami `Document Context` karti ile runtime paneline tasinmistir
+- sol sohbet paneline TUSAS marka alani eklenmistir
+
+Bu fazda alinan ana kararlar:
+
+1. provider fallback ve runtime ayar davranisini kullanici icin daha gorunur hale getirmek
+2. sag tarafta iki panel cakismasi yerine tek panel duzenine gecmek
+3. hata siniflandirmasini string aramadan daha yapisal helper'lara tasimak
+4. desktop UI'da marka hissini artirirken chat akisina mudahale etmemek
+
+Operasyonel sonuc:
+
+- desktop'ta sol tarafta custom history + brand paneli vardir
+- sag tarafta tek bir runtime panel vardir
+- `Apply`/`Reset` mantigi ile draft ve effective pipeline ayrimi korunur
+- preflight ve smoke script'leri yeni davranisla uyumlu calisir
+
+Dokumantasyon notu:
+
+- bugunku kullanim gercegi icin `README.md`, `TESTING.md` ve `chainlit.md` guncellenmistir
+- preview model secimleri bilincli olarak korunmustur
+- secret yonetimi bu fazda degistirilmemistir
+
 ## Faz 11.0 - Advanced OCR, Layout, Table ve Settings Donemi
 
 Bu faz, projeyi salt "classic RAG" cizgisinden cikarip coklu backend'li belge zekasi sistemine donusturen degisiklikleri toplar.

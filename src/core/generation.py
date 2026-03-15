@@ -14,33 +14,44 @@ import re
 import time
 import json
 from pathlib import Path
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
-from google import genai
-from google.genai import types
+import httpx
 
-from .gemini_client import build_gemini_client, gemini_model_candidates, is_model_not_found_error
 from .retrieval import CoverageInfo, Evidence, QueryIntent, RetrievalResult
 
 
-def _openai_retryable(e: Exception) -> bool:
-    msg = str(e)
-    return any(
-        s in msg
-        for s in (
-            "503",
-            "502",
-            "504",
-            "429",
-            "500",
-            "timed out",
-            "Timeout",
-            "Connection reset",
-        )
+def _google_genai_types():
+    from google.genai import types
+
+    return types
+
+
+def _gemini_helpers():
+    from .gemini_client import (
+        build_gemini_client,
+        gemini_model_candidates,
+        is_model_not_found_error,
+        is_retryable_api_error,
     )
+
+    return build_gemini_client, gemini_model_candidates, is_model_not_found_error, is_retryable_api_error
+
+
+_RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _retry_sleep_seconds(attempt: int) -> float:
+    return min(12.0, 1.5 * (2 ** (attempt - 1)))
+
+
+def _openai_retryable(e: Exception) -> bool:
+    if isinstance(e, httpx.HTTPStatusError):
+        return e.response.status_code in _RETRYABLE_HTTP_STATUS_CODES
+    if isinstance(e, (httpx.TimeoutException, httpx.TransportError, OSError, TimeoutError)):
+        return True
+    return False
 
 
 def _openai_chat_url() -> str:
@@ -56,13 +67,10 @@ def _openai_chat_completion(
     api_key: str,
     model: str,
     system_instruction: str,
-    user_contents: str,
+    user_contents: Any,
     temperature: float,
     max_tokens: int = 4096,
 ) -> str:
-    """
-    Minimal OpenAI Chat Completions call via stdlib urllib (no extra dependency).
-    """
     url = _openai_chat_url()
     payload = {
         "model": model,
@@ -74,27 +82,26 @@ def _openai_chat_completion(
         "max_tokens": max_tokens,
         "stream": False,
     }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
     last_err: Optional[Exception] = None
     for attempt in range(1, 5):
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+            with httpx.Client(timeout=120, follow_redirects=True) as client:
+                resp = client.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                )
+                resp.raise_for_status()
+                body = resp.json()
             return (((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
         except Exception as e:
             last_err = e
             if attempt >= 4 or not _openai_retryable(e):
                 raise
-            time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+            time.sleep(_retry_sleep_seconds(attempt))
     raise last_err  # type: ignore[misc]
 
 
@@ -102,7 +109,7 @@ def _openai_chat_completion_stream(
     api_key: str,
     model: str,
     system_instruction: str,
-    user_contents: str,
+    user_contents: Any,
     temperature: float,
     max_tokens: int = 4096,
     on_token: Optional[Callable[[str], None]] = None,
@@ -134,19 +141,21 @@ def _openai_chat_completion_stream(
     last_err: Optional[Exception] = None
     for attempt in range(1, 5):
         emitted_any = bool(text_parts)
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                for raw in resp:
-                    line = raw.decode("utf-8", errors="ignore").strip()
+            with httpx.stream(
+                "POST",
+                url,
+                json=payload,
+                timeout=120,
+                follow_redirects=True,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            ) as resp:
+                resp.raise_for_status()
+                for raw in resp.iter_lines():
+                    line = (raw or "").strip()
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -163,7 +172,7 @@ def _openai_chat_completion_stream(
             last_err = e
             if attempt >= 4 or emitted_any or not _openai_retryable(e):
                 raise
-            time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+            time.sleep(_retry_sleep_seconds(attempt))
 
     raise last_err  # type: ignore[misc]
 
@@ -253,7 +262,7 @@ def _chat_style_addendum(chat_style: str) -> str:
 def _response_looks_incomplete(text: str) -> bool:
     """
     Heuristic guard against provider answers that end mid-sentence.
-    Conservative for short replies; stricter for longer free-form text.
+    Deliberately conservative to avoid unnecessary continuation calls.
     """
     body = (text or "").strip()
     if not body:
@@ -272,7 +281,7 @@ def _response_looks_incomplete(text: str) -> bool:
         return True
 
     words = body.split()
-    if len(words) < 12:
+    if len(words) < 16:
         return False
 
     lines = [ln.rstrip() for ln in body.splitlines() if ln.strip()]
@@ -282,9 +291,17 @@ def _response_looks_incomplete(text: str) -> bool:
             return True
         if re.match(r"^\d+[\.\)]\s+\S+$", last_line):
             return True
+        if re.match(r"^[^:\n]{2,60}:\s*$", last_line):
+            return True
+        if re.search(r"\[[^\]]+\]$", last_line):
+            return False
 
     last_char = body[-1]
-    if last_char.isalnum() and len(body) >= 120:
+    if last_char.isalnum() and len(body) >= 200:
+        tail_words = re.findall(r"\w+", lines[-1] if lines else body[-120:])
+        if len(tail_words) >= 4:
+            return True
+    if body.endswith("...") and len(body) >= 40:
         return True
     return False
 
@@ -349,7 +366,7 @@ def _complete_if_incomplete(
     *,
     query: str,
     continue_fn: Callable[[str], str],
-    max_rounds: int = 3,
+    max_rounds: int = 2,
 ) -> str:
     text = (initial_text or "").strip()
     if not text:
@@ -530,8 +547,9 @@ def _format_citation(file_name: str, ev: Evidence) -> str:
     return cite
 
 
-def _visual_parts(evidences: List[Evidence], limit: int = 2) -> list[types.Part]:
-    parts: list[types.Part] = []
+def _visual_parts(evidences: List[Evidence], limit: int = 2) -> list[Any]:
+    types = _google_genai_types()
+    parts: list[Any] = []
     seen_paths: set[str] = set()
     for ev in evidences:
         if ev.modality != "visual" or not ev.image_path or ev.image_path in seen_paths:
@@ -583,7 +601,8 @@ def _build_gemini_user_contents(
     query: str,
     evidences: List[Evidence],
     multimodal_answer_mode: str = "auto",
-) -> str | list[types.Part]:
+) -> str | list[Any]:
+    types = _google_genai_types()
     if not _should_use_multimodal_answer_generation(query, evidences, multimodal_answer_mode):
         return user_message
     image_parts = _visual_parts(evidences)
@@ -843,37 +862,29 @@ def generate_chat_answer(
     query: str,
     gemini_api_key: str,
     gemini_model: str = "gemini-2.0-flash",
+    gemini_fallback_model: str = "",
     chat_style: str = "neutral",
 ) -> str:
     """
     Chat-only generation (no retrieval, no citations).
     """
-    def _retryable(e: Exception) -> bool:
-        msg = str(e)
-        return any(
-            s in msg
-            for s in (
-                "503",
-                "UNAVAILABLE",
-                "429",
-                "RESOURCE_EXHAUSTED",
-                "500",
-                "INTERNAL",
-                "timed out",
-                "Timeout",
-            )
-        )
-
     system = _CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query)
+    (
+        build_gemini_client,
+        gemini_model_candidates,
+        is_model_not_found_error,
+        is_retryable_api_error,
+    ) = _gemini_helpers()
 
     def _call_chat(user_contents: str, *, temperature: float = 0.4, max_tokens: int = 4096) -> str:
         last_err: Optional[Exception] = None
         for attempt in range(1, 5):
             try:
                 last_model_error: Optional[Exception] = None
-                for model_name in gemini_model_candidates(gemini_model):
+                for model_name in gemini_model_candidates(gemini_model, fallback_model=gemini_fallback_model):
                     try:
                         client = build_gemini_client(gemini_api_key, model_name=model_name)
+                        types = _google_genai_types()
                         resp = client.models.generate_content(
                             model=model_name,
                             contents=user_contents,
@@ -892,9 +903,9 @@ def generate_chat_answer(
                     raise last_model_error
             except Exception as e:
                 last_err = e
-                if attempt >= 4 or not _retryable(e):
+                if attempt >= 4 or not is_retryable_api_error(e):
                     raise
-                time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+                time.sleep(_retry_sleep_seconds(attempt))
         raise last_err  # type: ignore[misc]
 
     answer = _call_chat(f"SORU: {query}") or "Anlayamadım, tekrar eder misin?"
@@ -936,7 +947,7 @@ def generate_chat_answer_openai(
                 last_err = e
                 if attempt >= 4 or not _openai_retryable(e):
                     raise
-                time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+                time.sleep(_retry_sleep_seconds(attempt))
         raise last_err  # type: ignore[misc]
 
     answer = _call_chat(f"SORU: {query}") or "Anlayamadım, tekrar eder misin?"
@@ -955,6 +966,7 @@ def generate_answer(
     query: str,
     gemini_api_key: str,
     gemini_model: str = "gemini-2.0-flash",
+    gemini_fallback_model: str = "",
     multimodal_answer_mode: str = "auto",
 ) -> GenerationResult:
     """
@@ -1015,36 +1027,27 @@ def generate_answer(
         retrieval.evidences,
         multimodal_answer_mode=multimodal_answer_mode,
     )
+    (
+        build_gemini_client,
+        gemini_model_candidates,
+        is_model_not_found_error,
+        is_retryable_api_error,
+    ) = _gemini_helpers()
 
     def _call(
         system_instruction: str,
-        user_contents: str | list[types.Part],
+        user_contents: str | list[Any],
         temperature: float,
         max_tokens: int = 4096,
     ) -> str:
-        def _retryable(e: Exception) -> bool:
-            msg = str(e)
-            return any(
-                s in msg
-                for s in (
-                    "503",
-                    "UNAVAILABLE",
-                    "429",
-                    "RESOURCE_EXHAUSTED",
-                    "500",
-                    "INTERNAL",
-                    "timed out",
-                    "Timeout",
-                )
-            )
-
         last_err: Optional[Exception] = None
         for attempt in range(1, 5):
             try:
                 last_model_error: Optional[Exception] = None
-                for model_name in gemini_model_candidates(gemini_model):
+                for model_name in gemini_model_candidates(gemini_model, fallback_model=gemini_fallback_model):
                     try:
                         client = build_gemini_client(gemini_api_key, model_name=model_name)
+                        types = _google_genai_types()
                         response = client.models.generate_content(
                             model=model_name,
                             contents=user_contents,
@@ -1063,9 +1066,9 @@ def generate_answer(
                     raise last_model_error
             except Exception as e:
                 last_err = e
-                if attempt >= 4 or not _retryable(e):
+                if attempt >= 4 or not is_retryable_api_error(e):
                     raise
-                time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+                time.sleep(_retry_sleep_seconds(attempt))
 
         raise last_err  # type: ignore[misc]
 
@@ -1308,6 +1311,7 @@ def generate_answer_stream(
     query: str,
     gemini_api_key: str,
     gemini_model: str = "gemini-2.0-flash",
+    gemini_fallback_model: str = "",
     multimodal_answer_mode: str = "auto",
     on_token: Optional[Callable[[str], None]] = None,
 ) -> GenerationResult:
@@ -1377,33 +1381,52 @@ def generate_answer_stream(
         retrieval.evidences,
         multimodal_answer_mode=multimodal_answer_mode,
     )
+    (
+        build_gemini_client,
+        gemini_model_candidates,
+        is_model_not_found_error,
+        is_retryable_api_error,
+    ) = _gemini_helpers()
 
     chunks: list[str] = []
-    last_model_error: Optional[Exception] = None
-    for model_name in gemini_model_candidates(gemini_model):
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 5):
         try:
-            client = build_gemini_client(gemini_api_key, model_name=model_name)
-            for event in client.models.generate_content_stream(
-                model=model_name,
-                contents=gemini_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0.1,
-                    max_output_tokens=4096,
-                ),
-            ):
-                token = (event.text or "")
-                if token:
-                    chunks.append(token)
-                    _emit(token)
-            break
-        except Exception as model_exc:
-            last_model_error = model_exc
+            last_model_error: Optional[Exception] = None
             chunks = []
-            if not is_model_not_found_error(model_exc):
+            for model_name in gemini_model_candidates(gemini_model, fallback_model=gemini_fallback_model):
+                try:
+                    client = build_gemini_client(gemini_api_key, model_name=model_name)
+                    types = _google_genai_types()
+                    for event in client.models.generate_content_stream(
+                        model=model_name,
+                        contents=gemini_contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system,
+                            temperature=0.1,
+                            max_output_tokens=4096,
+                        ),
+                    ):
+                        token = (event.text or "")
+                        if token:
+                            chunks.append(token)
+                            _emit(token)
+                    break
+                except Exception as model_exc:
+                    last_model_error = model_exc
+                    chunks = []
+                    if not is_model_not_found_error(model_exc):
+                        raise
+            if not chunks and last_model_error is not None:
+                raise last_model_error
+            break
+        except Exception as e:
+            last_err = e
+            if attempt >= 4 or chunks or not is_retryable_api_error(e):
                 raise
-    if not chunks and last_model_error is not None:
-        raise last_model_error
+            time.sleep(_retry_sleep_seconds(attempt))
+    if not chunks and last_err is not None:
+        raise last_err
 
     answer = "".join(chunks).strip() or "Belgede bu bilgi bulunamadı."
     if answer.strip() != "Belgede bu bilgi bulunamadı.":
@@ -1412,9 +1435,10 @@ def generate_answer_stream(
             for attempt in range(1, 5):
                 try:
                     last_model_error_inner: Optional[Exception] = None
-                    for model_name in gemini_model_candidates(gemini_model):
+                    for model_name in gemini_model_candidates(gemini_model, fallback_model=gemini_fallback_model):
                         try:
                             client = build_gemini_client(gemini_api_key, model_name=model_name)
+                            types = _google_genai_types()
                             resp = client.models.generate_content(
                                 model=model_name,
                                 contents=prompt,
@@ -1433,9 +1457,9 @@ def generate_answer_stream(
                         raise last_model_error_inner
                 except Exception as e:
                     last_err = e
-                    if attempt >= 4:
+                    if attempt >= 4 or not is_retryable_api_error(e):
                         raise
-                    time.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+                    time.sleep(_retry_sleep_seconds(attempt))
             raise last_err  # type: ignore[misc]
 
         completed = _complete_if_incomplete(

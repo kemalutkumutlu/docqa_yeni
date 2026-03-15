@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Set, Tuple
@@ -63,20 +62,6 @@ def _query_prefers_visual_region(query: str) -> bool:
     if not text:
         return False
     return any(pat.search(text) for pat in _VISUAL_REGION_QUERY_PATTERNS)
-
-
-def _section_fetch_max_depth() -> int:
-    """
-    Depth limit for section subtree fetch (document-agnostic).
-    Default keeps current behavior (≈ children + grandchildren).
-    """
-    raw = (os.getenv("SECTION_FETCH_MAX_DEPTH", "2") or "").strip()
-    try:
-        n = int(raw)
-    except Exception:
-        n = 2
-    # Clamp to avoid accidental explosions.
-    return max(0, min(10, n))
 
 
 # ── 2) Evidence gathering ────────────────────────────────────────────────────
@@ -606,6 +591,7 @@ def retrieve(
     sparse_k: int = 10,
     final_k: int = 8,
     doc_id: Optional[str] = None,
+    section_fetch_max_depth: int = 2,
 ) -> RetrievalResult:
     """
     Full retrieval pipeline with query routing.
@@ -687,7 +673,7 @@ def retrieve(
                     index,
                     best_doc_id,
                     best_section_id,
-                    max_depth=_section_fetch_max_depth(),
+                    max_depth=max(0, min(10, int(section_fetch_max_depth))),
                 )
 
                 # Coverage info from the parent chunk text

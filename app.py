@@ -7,12 +7,16 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import hmac
+import importlib.util
 import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import tempfile
+import time
 from queue import Empty, SimpleQueue
 from pathlib import Path
 from typing import Any
@@ -29,7 +33,19 @@ from src.core.local_llm import OllamaConfig, ollama_is_available
 from src.core.pipeline import RAGPipeline
 from src.core.table_structure import TableStructureConfig
 from src.core.vlm_extract import VLMConfig
-from src.core.gemini_client import use_vertex_ai
+from src.ui_text import (
+    build_evidence_panel as _build_evidence_panel,
+    build_qa_debug_suffix as _build_qa_debug_suffix,
+    embedding_runtime_label as _embedding_runtime_label,
+    format_standard_error as _format_standard_error,
+    looks_like_chat_mode_request as _looks_like_chat_mode_request,
+    looks_like_doc_mode_request as _looks_like_doc_mode_request,
+    looks_like_doc_switch as _looks_like_doc_switch_base,
+    looks_like_smalltalk as _looks_like_smalltalk,
+    render_sidebar_panel as _render_sidebar_panel,
+    shorten_for_sidebar as _shorten_for_sidebar,
+    smalltalk_style as _smalltalk_style,
+)
 
 try:
     from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
@@ -62,11 +78,17 @@ _THREAD_TAG_RE = re.compile(r"^<!--THREAD:([A-Za-z0-9:_\-.]+)-->\s*")
 _OPEN_THREAD_CMD_RE = re.compile(r"^/open_thread(?:\s+([A-Za-z0-9:_\-.]+))?\s*$", re.IGNORECASE)
 _THREAD_MEMORY: dict[str, list[dict[str, str]]] = {}
 _THREAD_PIPELINES: dict[str, RAGPipeline] = {}
+_THREAD_LAST_USED: dict[str, float] = {}
 _THREAD_MEMORY_MAX_MSGS = 120
+_THREAD_CACHE_MAX = 100
+_THREAD_CACHE_TTL_SECONDS = 6 * 60 * 60
 _SIDEBAR_REV_KEY = "sidebar_render_rev"
 _THREAD_STATE_KEY = "docqa_thread_state"
 _THREAD_STATE_VERSION = 1
 _NATIVE_HISTORY_BOOTSTRAP_DONE = False
+_UPLOAD_WORK_SEMAPHORE: asyncio.Semaphore | None = None
+_DOC_QA_SEMAPHORE: asyncio.Semaphore | None = None
+_CHAT_QA_SEMAPHORE: asyncio.Semaphore | None = None
 
 
 def _auto_exit_enabled() -> bool:
@@ -88,6 +110,42 @@ def _env_truthy(name: str, default: str = "") -> bool:
     return value in ("1", "true", "yes", "y", "on")
 
 
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 32) -> int:
+    raw = (os.getenv(name, str(default)) or str(default)).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _upload_work_semaphore() -> asyncio.Semaphore:
+    global _UPLOAD_WORK_SEMAPHORE
+    if _UPLOAD_WORK_SEMAPHORE is None:
+        _UPLOAD_WORK_SEMAPHORE = asyncio.Semaphore(
+            _env_int("DOCQA_UPLOAD_CONCURRENCY", 2, minimum=1, maximum=8)
+        )
+    return _UPLOAD_WORK_SEMAPHORE
+
+
+def _doc_qa_semaphore() -> asyncio.Semaphore:
+    global _DOC_QA_SEMAPHORE
+    if _DOC_QA_SEMAPHORE is None:
+        _DOC_QA_SEMAPHORE = asyncio.Semaphore(
+            _env_int("DOCQA_QA_CONCURRENCY", 3, minimum=1, maximum=12)
+        )
+    return _DOC_QA_SEMAPHORE
+
+
+def _chat_qa_semaphore() -> asyncio.Semaphore:
+    global _CHAT_QA_SEMAPHORE
+    if _CHAT_QA_SEMAPHORE is None:
+        _CHAT_QA_SEMAPHORE = asyncio.Semaphore(
+            _env_int("DOCQA_CHAT_CONCURRENCY", 6, minimum=1, maximum=16)
+        )
+    return _CHAT_QA_SEMAPHORE
+
+
 def _native_history_requested() -> bool:
     return _env_truthy("CHAINLIT_NATIVE_HISTORY", "0")
 
@@ -96,6 +154,39 @@ def _native_history_auth_enabled() -> bool:
     return bool((os.getenv("CHAINLIT_AUTH_USERNAME", "") or "").strip()) and bool(
         (os.getenv("CHAINLIT_AUTH_PASSWORD", "") or "").strip()
     )
+
+
+def _mark_thread_used(thread_id: str | None) -> None:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return
+    _THREAD_LAST_USED[tid] = time.time()
+
+
+def _drop_thread_cache(thread_id: str | None) -> None:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return
+    _THREAD_MEMORY.pop(tid, None)
+    _THREAD_PIPELINES.pop(tid, None)
+    _THREAD_LAST_USED.pop(tid, None)
+
+
+def _cleanup_thread_caches() -> None:
+    now = time.time()
+    stale_ids = [
+        tid
+        for tid, last_used in list(_THREAD_LAST_USED.items())
+        if now - float(last_used or 0.0) > _THREAD_CACHE_TTL_SECONDS
+    ]
+    for tid in stale_ids:
+        _drop_thread_cache(tid)
+
+    overflow = max(0, len(_THREAD_LAST_USED) - _THREAD_CACHE_MAX)
+    if overflow <= 0:
+        return
+    for tid, _ in sorted(_THREAD_LAST_USED.items(), key=lambda item: item[1])[:overflow]:
+        _drop_thread_cache(tid)
 
 
 def _native_history_conninfo() -> str | None:
@@ -144,6 +235,12 @@ def _native_history_sqlite_path(conninfo: str) -> Path | None:
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
     return path
+
+
+def _native_history_sqlite_connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
 
 
 def _bootstrap_native_history_sqlite(conninfo: str) -> None:
@@ -234,10 +331,9 @@ def _bootstrap_native_history_sqlite(conninfo: str) -> None:
         'CREATE INDEX IF NOT EXISTS idx_elements_thread_id ON elements("threadId")',
     ]
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with _native_history_sqlite_connect(db_path) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
         for statement in ddl:
             conn.execute(statement)
         step_columns = {row[1] for row in conn.execute('PRAGMA table_info("steps")')}
@@ -252,7 +348,7 @@ def _native_history_backfill_user_binding(conninfo: str, identifier: str) -> Non
     if db_path is None or not identifier:
         return
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with _native_history_sqlite_connect(db_path) as conn:
         cur = conn.cursor()
         row = cur.execute(
             "SELECT id FROM users WHERE identifier = ? ORDER BY rowid DESC LIMIT 1",
@@ -283,7 +379,60 @@ def _native_history_backfill_user_binding(conninfo: str, identifier: str) -> Non
         conn.commit()
 
 
+async def _native_history_backfill_user_binding_async(conninfo: str, identifier: str) -> None:
+    db_path = _native_history_sqlite_path(conninfo)
+    if db_path is None or not identifier:
+        return
+    try:
+        import aiosqlite  # noqa: WPS433
+    except Exception:
+        await asyncio.to_thread(_native_history_backfill_user_binding, conninfo, identifier)
+        return
+
+    async with aiosqlite.connect(str(db_path), timeout=30) as conn:
+        await conn.execute("PRAGMA busy_timeout=30000")
+        async with conn.execute(
+            "SELECT id FROM users WHERE identifier = ? ORDER BY rowid DESC LIMIT 1",
+            (identifier,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return
+        user_id = row[0]
+        await conn.execute(
+            'UPDATE threads SET "userId" = ?, "userIdentifier" = ? WHERE ("userId" IS NULL OR "userId" = "")',
+            (user_id, identifier),
+        )
+        async with conn.execute(
+            'SELECT id, metadata FROM threads WHERE (name IS NULL OR name = "")'
+        ) as cursor:
+            unnamed = await cursor.fetchall()
+        for thread_id, raw_metadata in unnamed:
+            metadata = {}
+            if isinstance(raw_metadata, str) and raw_metadata.strip():
+                try:
+                    metadata = json.loads(raw_metadata)
+                except Exception:
+                    metadata = {}
+            elif isinstance(raw_metadata, dict):
+                metadata = raw_metadata
+            title = _thread_name_from_metadata(metadata)
+            if title:
+                await conn.execute('UPDATE threads SET name = ? WHERE id = ?', (title, thread_id))
+        await conn.commit()
+
+
 class NativeHistoryDataLayer(SQLAlchemyDataLayer):  # type: ignore[misc]
+    _THREAD_UPSERT_COLUMNS = (
+        "id",
+        "createdAt",
+        "name",
+        "userId",
+        "userIdentifier",
+        "tags",
+        "metadata",
+    )
+
     async def _resolve_current_user_binding(self) -> tuple[str | None, str | None]:
         try:
             session_user = cl_context.session.user
@@ -354,7 +503,11 @@ class NativeHistoryDataLayer(SQLAlchemyDataLayer):  # type: ignore[misc]
             "tags": json.dumps(tags) if tags is not None else None,
             "metadata": json.dumps(merged_metadata) if merged_metadata is not None else None,
         }
-        parameters = {key: value for key, value in payload.items() if value is not None}
+        parameters = {
+            key: value
+            for key, value in payload.items()
+            if key in self._THREAD_UPSERT_COLUMNS and value is not None
+        }
         columns = ", ".join(f'"{key}"' for key in parameters.keys())
         values = ", ".join(f":{key}" for key in parameters.keys())
         updates = ", ".join(
@@ -414,7 +567,10 @@ if _native_history_requested() and _native_history_auth_enabled():
         expected_user = (os.getenv("CHAINLIT_AUTH_USERNAME", "") or "").strip()
         expected_pass = os.getenv("CHAINLIT_AUTH_PASSWORD", "") or ""
         display_name = (os.getenv("CHAINLIT_AUTH_DISPLAY_NAME", "") or "").strip() or expected_user
-        if username != expected_user or password != expected_pass:
+        if not (
+            hmac.compare_digest(username or "", expected_user)
+            and hmac.compare_digest(password or "", expected_pass)
+        ):
             return None
         return User(
             identifier=expected_user,
@@ -483,8 +639,10 @@ def _thread_memory_load(thread_id: str | None) -> list[dict[str, str]]:
     tid = (thread_id or "").strip()
     if not tid:
         return []
+    _cleanup_thread_caches()
     cached = _THREAD_MEMORY.get(tid)
     if cached is not None:
+        _mark_thread_used(tid)
         return cached
 
     raw = _thread_history_payload_load(tid)
@@ -503,6 +661,7 @@ def _thread_memory_load(thread_id: str | None) -> list[dict[str, str]]:
         loaded.append({"role": role, "content": content})
     if loaded:
         _THREAD_MEMORY[tid] = loaded
+        _mark_thread_used(tid)
     return loaded
 
 
@@ -536,6 +695,8 @@ def _thread_memory_add(thread_id: str | None, role: str, content: str) -> None:
     if len(buf) > _THREAD_MEMORY_MAX_MSGS:
         buf = buf[-_THREAD_MEMORY_MAX_MSGS:]
     _THREAD_MEMORY[tid] = buf
+    _mark_thread_used(tid)
+    _cleanup_thread_caches()
     _thread_memory_persist(tid)
 
 
@@ -543,7 +704,11 @@ def _thread_pipeline_get(thread_id: str | None) -> RAGPipeline | None:
     tid = (thread_id or "").strip()
     if not tid:
         return None
-    return _THREAD_PIPELINES.get(tid)
+    _cleanup_thread_caches()
+    pipeline = _THREAD_PIPELINES.get(tid)
+    if pipeline is not None:
+        _mark_thread_used(tid)
+    return pipeline
 
 
 def _thread_pipeline_set(thread_id: str | None, pipeline: RAGPipeline | None) -> None:
@@ -551,6 +716,8 @@ def _thread_pipeline_set(thread_id: str | None, pipeline: RAGPipeline | None) ->
     if not tid or pipeline is None:
         return
     _THREAD_PIPELINES[tid] = pipeline
+    _mark_thread_used(tid)
+    _cleanup_thread_caches()
 
 
 def _normalize_thread_state(raw: Any) -> dict[str, Any]:
@@ -732,7 +899,8 @@ async def _schedule_auto_exit_if_idle() -> None:
         # Double-check state right before exiting.
         async with _EXIT_LOCK:
             if _ACTIVE_CHAT_SESSIONS <= 0:
-                os._exit(0)  # noqa: S404 - intentional hard-exit for dev convenience
+                print("[auto-exit] requesting graceful shutdown", flush=True)
+                signal.raise_signal(signal.SIGINT)
 
     await _cancel_exit_task()
     _EXIT_TASK = asyncio.create_task(_worker())
@@ -744,70 +912,6 @@ ACCEPTED_MIME = [
     "image/jpeg",
 ]
 
-_SMALLTALK_PATTERNS = [
-    # Turkish
-    r"^(merhaba|selam|slm|selamlar)\b",
-    r"\bnasılsın\b|\bnaber\b|\bnasılsınız\b",
-    r"^(teşekkür(ler)?|tesekkur(ler)?|sağ ol|sagol|eyvallah|rica ederim)\b",
-    r"^(günaydın|iyi akşamlar|iyi geceler|iyi günler)\b",
-    r"\bkimsin\b|\bsen kimsin\b|\bne yapıyorsun\b",
-    # Follow-up smalltalk
-    r"\bben\s+nas\w*ls\w*m\b",
-    r"\bsorm\w*\s+m\w*s\w*n\b",  # "sormicak mısın / sormayacak mısın" etc.
-    r"\bemin\s+m\w*s\w*n\b|\bgercekten\s+mi\b|\bciddi\s+misin\b",
-    # English
-    r"^(hi|hello|hey)\b",
-    r"\bhow are you\b|\bhow's it going\b",
-    r"^(thanks|thank you)\b",
-    r"\bwho are you\b",
-    r"\bare you sure\b|\breally\??\b",
-]
-
-_PRAISE_PATTERNS = [
-    # Turkish praise / compliments
-    r"^(aferin|bravo|helal|tebrik(ler)?|güzel|guzel|iyi\s*i[şs])\b",
-    r"\b(harikasın|harikasin|mükemmel|mukemmel|süpersin|supersin|kralsın|kralsin)\b",
-    # English praise
-    r"\b(great job|well done|nice work|awesome|you are awesome|you're awesome|congrats)\b",
-]
-
-_NEGATIVE_FEELING_PATTERNS = [
-    # Turkish negative mood
-    r"\b(üzgünüm|uzgunum|moralim bozuk|canım sıkkın|canim sikkin)\b",
-    r"\b(kötüyüm|kotuyum|berbatım|berbatim|cok kotuyum|çok kötüyüm)\b",
-    r"\b(stresliyim|kaygılıyım|kaygiliyim|endişeliyim|endiseliyim|yoruldum|bıktım|biktim)\b",
-    # English negative mood
-    r"\b(i am sad|i'm sad|i feel bad|i am upset|i'm upset|bad day|feeling down)\b",
-]
-
-_CHAT_MODE_REQUEST_PATTERNS = [
-    # Turkish
-    r"\bsohbet\s+modu\b",
-    r"\bsohbet\s+moduna\b.*\b(geç|gec|aç|ac)\w*\b",
-    r"\bchat\s+modu\b",
-    r"\bchat\s+moduna\b.*\b(geç|gec)\w*\b",
-    r"\bsohbete\b.*\b(geç|gec)\w*\b",
-    # English
-    r"\bchat\s+mode\b",
-    r"\bswitch\s+to\s+chat\b",
-]
-
-_DOC_CUE_PATTERNS = [
-    r"\bbelge\b|\bdoküman\b|\bdokuman\b|\bpdf\b|\bdosya\b",
-    r"\bsayfa\b|\bbaşlık\b|\bbölüm\b|\bmadde\b|\biçerik\b|\bicerik\b",
-    r"\bnelerdir\b|\blistele\b|\bsırala\b|\bsirala\b|\bhepsi\b|\btümü\b|\btumu\b",
-]
-
-_DOC_MODE_REQUEST_PATTERNS = [
-    # Turkish
-    r"\bbelge\s+modu\b|\bdoküman\s+modu\b|\bdokuman\s+modu\b",
-    r"\bbelge\s+moduna\b.*\b(dön|don|geç|gec)\w*\b",
-    r"\bbelge\s+moduna\s+nasıl\b|\bbelge\s+moduna\s+nas\w*l\b",
-    r"\bbelge\s+moduna\s+nas\w*l\s+d\w*n\w*",
-    # English
-    r"\bdoc\s+mode\b|\bdocument\s+mode\b",
-]
-
 _CHAT_PROFILE_TO_PROVIDER = {
     "Gemini": "gemini",
     "OpenAI": "openai",
@@ -817,7 +921,6 @@ _CHAT_PROFILE_TO_PROVIDER = {
 _CHAT_HISTORY_KEY = "recent_user_messages"
 _CHAT_HISTORY_MAX = 12
 _RUNTIME_OVERRIDES_KEY = "runtime_overrides"
-_SETTINGS_VIEW_VALUES = ["basic", "advanced"]
 _RUNTIME_PRESET_VALUES = ["custom", "online_best", "hybrid_best", "local_best", "fast"]
 _PROCESSING_MODE_VALUES = ["classic", "multimodal"]
 _MULTIMODAL_ANSWER_MODE_VALUES = ["off", "auto", "on"]
@@ -825,6 +928,7 @@ _VISUAL_CHUNK_LEVEL_VALUES = ["page", "region"]
 _VISUAL_REGION_SOURCE_VALUES = ["heuristic", "detector"]
 _VISUAL_DETECTOR_BACKEND_VALUES = ["none", "docai", "docling", "sidecar"]
 _TOGGLE_VALUES = ["on", "off"]
+_PDF_TEXT_BACKEND_VALUES = ["auto", "pymupdf", "docling"]
 _OCR_BACKEND_VALUES = ["docai", "paddle_vl", "paddle", "tesseract_legacy"]
 _TABLE_STRUCTURE_BACKEND_VALUES = ["off", "auto", "docai", "gemini", "heuristic"]
 _LLM_PROVIDER_VALUES = ["gemini", "openai", "local", "none"]
@@ -895,6 +999,9 @@ def _sanitize_select_value(value, allowed: list[str], fallback: str) -> str:
 
 def _resolve_embedding_model_choice(choice: str, embedding_device: str) -> str:
     selected = (choice or "").strip().lower()
+    if selected.startswith("gemini-embedding-") and importlib.util.find_spec("google.genai") is None:
+        selected = "auto"
+        choice = "auto"
     if selected == "auto":
         use_cuda = _cuda_available() and embedding_device != "cpu"
         return "intfloat/multilingual-e5-base" if use_cuda else "intfloat/multilingual-e5-small"
@@ -989,6 +1096,7 @@ def _settings_dependency_summary(
     vlm_mode: str,
     vlm_provider: str,
     vlm_max_pages: int,
+    pdf_text_backend: str = "pymupdf",
 ) -> str:
     layout_line = "disabled"
     if processing_mode != "multimodal":
@@ -1024,6 +1132,7 @@ def _settings_dependency_summary(
     )
     return "\n".join(
         [
+            f"PDF text: {pdf_text_backend}",
             f"OCR: {ocr_enabled} / {ocr_backend}",
             f"Multimodal answer: {multimodal_answer_line}",
             f"Layout detector: {layout_line}",
@@ -1034,17 +1143,58 @@ def _settings_dependency_summary(
     )
 
 
+def _runtime_dependency_flags(
+    *,
+    processing_mode: str,
+    visual_chunk_level: str,
+    visual_region_source: str,
+    ocr_enabled: str,
+    table_enabled: str,
+    llm_provider: str,
+    embedding_model_choice: str,
+    vlm_mode: str,
+) -> dict[str, bool]:
+    multimodal_active = processing_mode == "multimodal"
+    region_mode_active = multimodal_active and visual_chunk_level == "region"
+    detector_mode_active = region_mode_active and visual_region_source == "detector"
+    ocr_active = ocr_enabled == "on"
+    table_stage_available = multimodal_active
+    table_active = table_stage_available and table_enabled == "on"
+    llm_active = llm_provider != "none"
+    llm_supports_multimodal_answer = llm_provider == "gemini"
+    embedding_device_relevant = not str(embedding_model_choice or "").strip().lower().startswith("gemini-embedding-")
+    vlm_active = vlm_mode != "off"
+    return {
+        "generation_model": not llm_active,
+        "ocr_backend": not ocr_active,
+        "visual_chunk_level": not multimodal_active,
+        "table_structure_enabled": not table_stage_available,
+        "multimodal_answer_mode": not (multimodal_active and llm_supports_multimodal_answer),
+        "visual_region_source": not region_mode_active,
+        "visual_detector_backend": not detector_mode_active,
+        "table_structure_backend": not table_active,
+        "vlm_provider": not vlm_active,
+        "vlm_max_pages": not vlm_active,
+        "embedding_device": not embedding_device_relevant,
+    }
+
+
 def _preset_defaults(pipeline: RAGPipeline, settings, preset: str) -> dict[str, str | int]:
     selected = (preset or "custom").strip().lower()
+    docai_ocr_ready = bool(getattr(settings, "docai_ocr_processor_id", ""))
+    docai_layout_ready = bool(getattr(settings, "docai_layout_processor_id", ""))
+    docling_ready = bool(getattr(settings, "docling_python_bin", ""))
+    online_ocr_backend = "docai" if docai_ocr_ready else "paddle_vl"
+    online_layout_backend = "docai" if docai_layout_ready else ("docling" if docling_ready else "none")
     if selected == "online_best":
         return {
             "ocr_enabled": "on",
-            "ocr_backend": "docai",
+            "ocr_backend": online_ocr_backend,
             "processing_mode": "multimodal",
             "multimodal_answer_mode": "auto",
             "visual_chunk_level": "region",
             "visual_region_source": "detector",
-            "visual_detector_backend": "docai",
+            "visual_detector_backend": online_layout_backend,
             "table_structure_enabled": "on",
             "table_structure_backend": "auto",
             "llm_provider": "gemini",
@@ -1063,7 +1213,7 @@ def _preset_defaults(pipeline: RAGPipeline, settings, preset: str) -> dict[str, 
             "multimodal_answer_mode": "auto",
             "visual_chunk_level": "region",
             "visual_region_source": "detector",
-            "visual_detector_backend": "docai",
+            "visual_detector_backend": online_layout_backend,
             "table_structure_enabled": "on",
             "table_structure_backend": "auto",
             "llm_provider": "gemini",
@@ -1136,6 +1286,7 @@ def _effective_settings_values(pipeline: RAGPipeline) -> dict[str, str | int]:
         "vlm_mode": getattr(current_vlm, "mode", "auto") if current_vlm else "auto",
         "vlm_provider": getattr(current_vlm, "provider", "gemini") if current_vlm else "gemini",
         "vlm_max_pages": int(getattr(current_vlm, "max_pages", _VLM_MAX_PAGES_DEFAULT) if current_vlm else _VLM_MAX_PAGES_DEFAULT),
+        "pdf_text_backend": getattr(pipeline, "pdf_text_backend", "pymupdf"),
     }
 
 
@@ -1144,7 +1295,14 @@ def _matches_preset(values: dict[str, str | int], preset: str, pipeline: RAGPipe
     if not defaults:
         return False
     for key, preset_value in defaults.items():
-        if values.get(key) != preset_value:
+        actual_value = values.get(key)
+        expected_value = preset_value
+        if key == "embedding_model_choice":
+            expected_value = _resolve_embedding_model_choice(
+                str(preset_value),
+                str(defaults.get("embedding_device", "auto") or "auto"),
+            )
+        if actual_value != expected_value:
             return False
     return True
 
@@ -1195,6 +1353,10 @@ def _settings_fallback_summary(
     else:
         lines.append(f"Generation path: `{resolved_llm_provider}` aktif.")
 
+    embedding_choice = str(getattr(pipeline, "embedding_model", "") or "")
+    if embedding_choice.startswith("gemini-embedding-") and not _gemini_sdk_available():
+        lines.append("Embedding fallback: `google-genai` paketi yok, local embedding fallback kullanilir.")
+
     resolved_vlm_provider, vlm_warning = _resolve_vlm_provider_choice(
         vlm_provider,
         settings,
@@ -1217,6 +1379,25 @@ def _settings_fallback_summary(
     return "\n".join(lines)
 
 
+def _settings_documents_summary(pipeline: RAGPipeline) -> str:
+    docs = pipeline.list_documents() if pipeline else []
+    active_doc = pipeline.active_document_name if pipeline else ""
+    mode = cl.user_session.get("mode") or "doc"
+
+    lines = [
+        f"Mode: {mode}",
+        f"Active doc: {active_doc or '-'}",
+        f"Loaded docs: {len(docs)}",
+    ]
+    if docs:
+        lines.extend(f"- {doc}" for doc in docs[:6])
+        if len(docs) > 6:
+            lines.append(f"... +{len(docs) - 6} more")
+    else:
+        lines.append("- Henuz belge yuklenmedi")
+    return "\n".join(lines)
+
+
 def _runtime_overrides() -> dict:
     try:
         raw = cl.user_session.get(_RUNTIME_OVERRIDES_KEY)
@@ -1229,7 +1410,21 @@ def _get_runtime_value(key: str, fallback):
     return _runtime_overrides().get(key, fallback)
 
 
+def _gemini_sdk_available() -> bool:
+    return importlib.util.find_spec("google.genai") is not None
+
+
+def _gemini_auth_stack_available() -> bool:
+    return _gemini_sdk_available() and importlib.util.find_spec("google.auth") is not None
+
+
 def _has_gemini_backend(settings) -> bool:
+    try:
+        from src.core.gemini_client import use_vertex_ai
+    except Exception:
+        return False
+    if not _gemini_auth_stack_available():
+        return False
     if use_vertex_ai():
         return True
     return bool((settings.gemini_api_key or "").strip())
@@ -1288,6 +1483,117 @@ def _resolve_vlm_provider_choice(requested_provider: str, settings, ollama_cfg: 
         return "gemini", "Gemini VLM auth hazir degil. Yukleme sirasinda VLM devre disi kalabilir."
 
     return provider or "gemini", None
+
+
+def _embedding_choice_values(pipeline: RAGPipeline) -> list[str]:
+    embedding_values = list(_EMBEDDING_MODEL_PRESETS)
+    current_choice = str(_get_runtime_value("embedding_model_choice", pipeline.embedding_model) or "").strip()
+    if pipeline.embedding_model not in embedding_values:
+        embedding_values.append(pipeline.embedding_model)
+    if current_choice and current_choice not in embedding_values:
+        embedding_values.append(current_choice)
+    return embedding_values
+
+
+def _settings_sidebar_payload(pipeline: RAGPipeline) -> dict[str, Any]:
+    settings = _get_cached_settings()
+    effective = _effective_settings_values(pipeline)
+    runtime_preset = _sanitize_select_value(
+        _get_runtime_value("runtime_preset", "custom"),
+        _RUNTIME_PRESET_VALUES,
+        "custom",
+    )
+    saved = {"runtime_preset": runtime_preset, **effective}
+    generation_models = {
+        provider: _generation_model_values(
+            pipeline,
+            settings,
+            provider,
+            str(saved.get("generation_model_choice", "")),
+        )
+        for provider in ("gemini", "openai", "local")
+    }
+    dependency_summary = _settings_dependency_summary(
+        processing_mode=str(saved.get("processing_mode", "classic")),
+        visual_chunk_level=str(saved.get("visual_chunk_level", "page")),
+        visual_region_source=str(saved.get("visual_region_source", "heuristic")),
+        visual_detector_backend=str(saved.get("visual_detector_backend", "none")),
+        ocr_enabled=str(saved.get("ocr_enabled", "on")),
+        ocr_backend=str(saved.get("ocr_backend", "docai")),
+        table_enabled=str(saved.get("table_structure_enabled", "off")),
+        table_backend=str(saved.get("table_structure_backend", "auto")),
+        llm_provider=str(saved.get("llm_provider", "gemini")),
+        generation_model=str(saved.get("generation_model_choice", "")),
+        vlm_mode=str(saved.get("vlm_mode", "auto")),
+        vlm_provider=str(saved.get("vlm_provider", "gemini")),
+        vlm_max_pages=int(saved.get("vlm_max_pages", _VLM_MAX_PAGES_DEFAULT)),
+        pdf_text_backend=str(saved.get("pdf_text_backend", "pymupdf")),
+    )
+    fallback_summary = _settings_fallback_summary(
+        pipeline=pipeline,
+        settings=settings,
+        ocr_enabled=str(saved.get("ocr_enabled", "on")),
+        ocr_backend=str(saved.get("ocr_backend", "docai")),
+        visual_region_source=str(saved.get("visual_region_source", "heuristic")),
+        visual_detector_backend=str(saved.get("visual_detector_backend", "none")),
+        llm_provider=str(saved.get("llm_provider", "gemini")),
+        vlm_provider=str(saved.get("vlm_provider", "gemini")),
+        table_enabled=str(saved.get("table_structure_enabled", "off")),
+        table_backend=str(saved.get("table_structure_backend", "auto")),
+    )
+    preset_defaults = {
+        preset: _preset_defaults(pipeline, settings, preset)
+        for preset in _RUNTIME_PRESET_VALUES
+        if preset != "custom"
+    }
+    return {
+        "source": "docqa-settings-server",
+        "kind": "state",
+        "payload": {
+            "saved": saved,
+            "options": {
+                "runtime_preset": list(_RUNTIME_PRESET_VALUES),
+                "processing_mode": list(_PROCESSING_MODE_VALUES),
+                "ocr_enabled": list(_TOGGLE_VALUES),
+                "ocr_backend": list(_OCR_BACKEND_VALUES),
+                "llm_provider": list(_LLM_PROVIDER_VALUES),
+                "generation_models": generation_models,
+                "embedding_model": _embedding_choice_values(pipeline),
+                "embedding_device": list(_EMBEDDING_DEVICE_VALUES),
+                "vlm_mode": list(_VLM_MODE_VALUES),
+                "vlm_provider": list(_VLM_PROVIDER_VALUES),
+                "visual_chunk_level": list(_VISUAL_CHUNK_LEVEL_VALUES),
+                "visual_region_source": list(_VISUAL_REGION_SOURCE_VALUES),
+                "visual_detector_backend": list(_VISUAL_DETECTOR_BACKEND_VALUES),
+                "pdf_text_backend": list(_PDF_TEXT_BACKEND_VALUES),
+                "table_structure_enabled": list(_TOGGLE_VALUES),
+                "table_structure_backend": list(_TABLE_STRUCTURE_BACKEND_VALUES),
+                "multimodal_answer_mode": list(_MULTIMODAL_ANSWER_MODE_VALUES),
+                "vlm_max_pages": {
+                    "min": 0,
+                    "max": _VLM_MAX_PAGES_LIMIT,
+                    "default": _VLM_MAX_PAGES_DEFAULT,
+                },
+            },
+            "preset_defaults": preset_defaults,
+            "summaries": {
+                "applied": dependency_summary,
+                "fallback": fallback_summary,
+                "documents": _settings_documents_summary(pipeline),
+            },
+        },
+    }
+
+
+async def _send_settings_sidebar_state(pipeline: RAGPipeline | None = None) -> None:
+    if pipeline is None:
+        pipeline = cl.user_session.get("pipeline")
+    if pipeline is None:
+        return
+    try:
+        await cl.send_window_message(_settings_sidebar_payload(pipeline))
+    except Exception:
+        return
 
 
 def _settings_widgets(pipeline: RAGPipeline) -> list:
@@ -1394,7 +1700,7 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
     table_stage_available = multimodal_active
     table_active = table_enabled_current == "on" and table_stage_available
     llm_active = llm_provider_current != "none"
-    llm_supports_multimodal_answer = llm_provider_current in ("gemini", "openai")
+    llm_supports_multimodal_answer = llm_provider_current == "gemini"
     vlm_active = vlm_mode_current != "off"
     embedding_device_relevant = not str(embedding_choice_current or "").strip().lower().startswith("gemini-embedding-")
     dependency_summary = _settings_dependency_summary(
@@ -1411,11 +1717,6 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
         vlm_mode=vlm_mode_current,
         vlm_provider=vlm_provider_current,
         vlm_max_pages=vlm_pages_current,
-    )
-    settings_view_current = _sanitize_select_value(
-        _get_runtime_value("settings_view", "basic"),
-        _SETTINGS_VIEW_VALUES,
-        "basic",
     )
     runtime_preset_current = _sanitize_select_value(
         _get_runtime_value("runtime_preset", "custom"),
@@ -1540,7 +1841,7 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
             label="Multimodal Answer Generation",
             values=_MULTIMODAL_ANSWER_MODE_VALUES,
             initial_value=multimodal_answer_mode_current,
-            description="Gemini/OpenAI + multimodal zincirinde anlamli.",
+            description="Gemini + multimodal zincirinde anlamli.",
             disabled=not (multimodal_active and llm_supports_multimodal_answer),
         )
     )
@@ -1654,14 +1955,20 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
     generation_model_choice = str(
         overrides.get("generation_model_choice", _llm_model_for_provider(pipeline, requested_llm_provider))
     ).strip()
+    generation_model_choice = _normalize_generation_model_choice(
+        pipeline,
+        settings,
+        resolved_llm_provider,
+        generation_model_choice,
+    )
     gemini_model_next = None
     openai_model_next = None
     local_llm_model_next = None
-    if requested_llm_provider == "gemini" and generation_model_choice:
+    if resolved_llm_provider == "gemini" and generation_model_choice:
         gemini_model_next = generation_model_choice
-    elif requested_llm_provider == "openai" and generation_model_choice:
+    elif resolved_llm_provider == "openai" and generation_model_choice:
         openai_model_next = generation_model_choice
-    elif requested_llm_provider == "local" and generation_model_choice:
+    elif resolved_llm_provider == "local" and generation_model_choice:
         local_llm_model_next = generation_model_choice
 
     pipeline.reconfigure_runtime(
@@ -1717,6 +2024,11 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
         vlm_mode=_sanitize_select_value(overrides.get("vlm_mode"), _VLM_MODE_VALUES, vlm_mode_default),
         vlm_provider=_sanitize_select_value(overrides.get("vlm_provider"), _VLM_PROVIDER_VALUES, vlm_provider_default),
         vlm_max_pages=_clamp_int(overrides.get("vlm_max_pages"), vlm_pages_default, 0, _VLM_MAX_PAGES_LIMIT),
+        pdf_text_backend=_sanitize_select_value(
+            overrides.get("pdf_text_backend"),
+            _PDF_TEXT_BACKEND_VALUES,
+            getattr(pipeline, "pdf_text_backend", "pymupdf"),
+        ),
     )
 
 
@@ -1763,78 +2075,11 @@ def _apply_chat_profile_to_pipeline(pipeline: RAGPipeline) -> str | None:
 
 async def _sync_profile_to_pipeline(pipeline: RAGPipeline) -> None:
     warning = _apply_chat_profile_to_pipeline(pipeline)
+    _apply_runtime_overrides_to_pipeline(pipeline)
     previous = cl.user_session.get(_PROFILE_WARNING_KEY)
     if warning and warning != previous:
         await cl.Message(content=warning).send()
     cl.user_session.set(_PROFILE_WARNING_KEY, warning or "")
-
-
-def _shorten_for_sidebar(text: str, limit: int = 84) -> str:
-    clean = re.sub(r"\s+", " ", (text or "").strip())
-    if len(clean) <= limit:
-        return clean
-    return clean[: max(0, limit - 3)] + "..."
-
-
-def _embedding_runtime_label(model_name: str | None, device: str | None) -> str:
-    model = (model_name or "").strip().lower()
-    dev = (device or "").strip().lower() or "-"
-    if model.startswith("gemini-embedding-"):
-        return "remote api"
-    return dev
-
-
-def _sidebar_chip(text: str | None) -> str:
-    return f"`{(text or '-').strip()}`"
-
-
-def _render_sidebar_panel(
-    *,
-    mode: str,
-    llm_provider: str,
-    llm_model: str,
-    embedding_model: str,
-    embedding_runtime: str,
-    ocr_backend: str,
-    ocr_enabled: str,
-    vlm_provider: str,
-    vlm_mode: str,
-    vlm_max_pages: str,
-    visual_chunk_level: str,
-    visual_region_source: str,
-    visual_detector_backend: str,
-    active_doc: str | None,
-    docs: list[str],
-) -> str:
-    loaded_docs = "\n".join(f"- {doc}" for doc in docs[:6]) if docs else "- Henüz belge yüklenmedi"
-    active_doc_text = active_doc or "Aktif belge yok"
-    return "\n".join(
-        [
-            "**Oturum Durumu**",
-            f"- **Mod**: {_sidebar_chip(mode)}",
-            f"- **LLM**: {_sidebar_chip(llm_provider)} {_sidebar_chip(llm_model)}",
-            f"- **Embedding**: {_sidebar_chip(embedding_model)} {_sidebar_chip(embedding_runtime)}",
-            f"- **OCR**: {_sidebar_chip(ocr_backend)} {_sidebar_chip(ocr_enabled)}",
-            f"- **VLM**: {_sidebar_chip(vlm_provider)} {_sidebar_chip(vlm_mode)} {_sidebar_chip(f'pages {vlm_max_pages}')}",
-            f"- **Visual Level**: {_sidebar_chip(visual_chunk_level)}",
-            f"- **Region Source**: {_sidebar_chip(visual_region_source)}",
-            f"- **Detector Backend**: {_sidebar_chip(visual_detector_backend)}",
-            "",
-            "---",
-            "",
-            "**Belge Bağlamı**",
-            f"- **Aktif Belge**: {active_doc_text}",
-            "- **Yüklenen Belgeler**:",
-            loaded_docs,
-            "",
-            "---",
-            "",
-            "**Hızlı Komutlar**",
-            f"- Aktif belge seç: {_sidebar_chip('/use <dosya>')}",
-            f"- Belge modu: {_sidebar_chip('/doc')}",
-            f"- Sohbet modu: {_sidebar_chip('/chat')}",
-        ]
-    )
 
 
 def _get_chat_history() -> list[str]:
@@ -1856,99 +2101,12 @@ def _append_chat_history_user_message(message: str) -> None:
     cl.user_session.set(_CHAT_HISTORY_KEY, items)
 
 
-def _looks_like_doc_mode_request(query: str) -> bool:
-    q = (query or "").strip().lower()
-    if not q:
-        return False
-    for pat in _DOC_MODE_REQUEST_PATTERNS:
-        if re.search(pat, q, flags=re.IGNORECASE):
-            return True
-    return False
-
-
-def _looks_like_chat_mode_request(query: str) -> bool:
-    q = (query or "").strip().lower()
-    if not q:
-        return False
-    for pat in _CHAT_MODE_REQUEST_PATTERNS:
-        if re.search(pat, q, flags=re.IGNORECASE):
-            return True
-    return False
-
-
 def _looks_like_doc_switch(query: str, pipeline: RAGPipeline) -> bool:
-    """
-    Heuristic to auto-switch from chat → doc when the user asks about documents.
-    Conservative by design: only triggers if there are loaded documents AND the
-    message contains clear document cues or mentions a loaded filename.
-    """
-    if not pipeline or not pipeline.has_documents:
-        return False
-    q = (query or "").strip().lower()
-    if not q:
-        return False
-
-    # Filename mention is a strong signal.
-    try:
-        for name in pipeline.list_documents():
-            if name and name.lower() in q:
-                return True
-    except Exception:
-        pass
-
-    # Otherwise require explicit document cue words.
-    for pat in _DOC_CUE_PATTERNS[:2]:
-        if re.search(pat, q, flags=re.IGNORECASE):
-            return True
-    return False
-
-
-def _looks_like_smalltalk(query: str) -> bool:
-    """
-    Answer small-talk in chat mode even during doc sessions.
-    Document-agnostic: uses only surface-form heuristics and avoids triggering
-    when the message contains obvious document cues.
-    """
-    q = (query or "").strip().lower()
-    if not q:
-        return False
-    for pat in _DOC_CUE_PATTERNS:
-        if re.search(pat, q, flags=re.IGNORECASE):
-            return False
-    if len(q) <= 80:
-        for pat in _SMALLTALK_PATTERNS:
-            if re.search(pat, q, flags=re.IGNORECASE):
-                return True
-        for pat in _PRAISE_PATTERNS:
-            if re.search(pat, q, flags=re.IGNORECASE):
-                return True
-        for pat in _NEGATIVE_FEELING_PATTERNS:
-            if re.search(pat, q, flags=re.IGNORECASE):
-                return True
-    return False
-
-
-def _smalltalk_style(query: str) -> str:
-    """
-    Return style hint for chat response:
-      - "empathetic" for negative feelings
-      - "congratulatory" for praise
-      - "neutral" otherwise
-    """
-    q = (query or "").strip().lower()
-    if not q:
-        return "neutral"
-    for pat in _DOC_CUE_PATTERNS:
-        if re.search(pat, q, flags=re.IGNORECASE):
-            return "neutral"
-
-    for pat in _NEGATIVE_FEELING_PATTERNS:
-        if re.search(pat, q, flags=re.IGNORECASE):
-            return "empathetic"
-    for pat in _PRAISE_PATTERNS:
-        if re.search(pat, q, flags=re.IGNORECASE):
-            return "congratulatory"
-    return "neutral"
+    return _looks_like_doc_switch_base(
+        query,
+        has_documents=bool(pipeline and pipeline.has_documents),
+        document_names=(pipeline.list_documents() if pipeline else []),
+    )
 
 
 def _get_pipeline() -> RAGPipeline:
@@ -1974,6 +2132,7 @@ def _get_pipeline() -> RAGPipeline:
             chroma_dir=settings.chroma_dir,
             gemini_api_key=settings.gemini_api_key,
             gemini_model=settings.gemini_model,
+            gemini_fallback_model=getattr(settings, "gemini_fallback_model", ""),
             ocr_config=OCRConfig(
                 enabled=getattr(settings, "ocr_enabled", True),
                 backend=getattr(settings, "ocr_backend", "docai"),
@@ -1990,8 +2149,10 @@ def _get_pipeline() -> RAGPipeline:
                 docai_timeout_seconds=getattr(settings, "docai_timeout_seconds", 120),
             ),
             embedding_device=getattr(settings, "embedding_device", "auto"),
+            embedding_dimension=getattr(settings, "embedding_dimension", 3072),
             processing_mode=getattr(settings, "processing_mode", "classic"),
             multimodal_answer_mode=getattr(settings, "multimodal_answer_mode", "auto"),
+            section_fetch_max_depth=getattr(settings, "section_fetch_max_depth", 2),
             visual_chunk_level=getattr(settings, "visual_chunk_level", "page"),
             visual_region_source=getattr(settings, "visual_region_source", "heuristic"),
             visual_detector_backend=getattr(settings, "visual_detector_backend", "none"),
@@ -2005,6 +2166,7 @@ def _get_pipeline() -> RAGPipeline:
             docling_layout_model=getattr(settings, "docling_layout_model", "docling-layout-heron-101"),
             docling_artifacts_path=getattr(settings, "docling_artifacts_path", None),
             docling_device=getattr(settings, "docling_device", "auto"),
+            pdf_text_backend=getattr(settings, "pdf_text_backend", "pymupdf"),
             table_structure_config=TableStructureConfig(
                 enabled=getattr(settings, "table_structure_enabled", False),
                 backend=getattr(settings, "table_structure_backend", "auto"),
@@ -2112,7 +2274,7 @@ async def on_chat_start():
             identifier = str(getattr(session_user, "identifier", "") or "").strip()
             conninfo = _native_history_conninfo()
             if conninfo and identifier:
-                _native_history_backfill_user_binding(conninfo, identifier)
+                await _native_history_backfill_user_binding_async(conninfo, identifier)
         except Exception:
             pass
 
@@ -2133,6 +2295,7 @@ async def on_chat_start():
     cl.user_session.set(_PROFILE_WARNING_KEY, profile_warning or "")
     await cl.ChatSettings(_settings_widgets(pipeline)).send()
     await _update_documents_sidebar(pipeline)
+    await _send_settings_sidebar_state(pipeline)
 
 
 @cl.on_chat_resume
@@ -2145,7 +2308,7 @@ async def on_chat_resume(thread: ThreadDict):
             identifier = str(getattr(session_user, "identifier", "") or "").strip()
             conninfo = _native_history_conninfo()
             if conninfo and identifier:
-                _native_history_backfill_user_binding(conninfo, identifier)
+                await _native_history_backfill_user_binding_async(conninfo, identifier)
         except Exception:
             pass
     pipeline = _restore_thread_state(thread_id, metadata=metadata)
@@ -2153,25 +2316,21 @@ async def on_chat_resume(thread: ThreadDict):
         await _sync_profile_to_pipeline(pipeline)
         _apply_runtime_overrides_to_pipeline(pipeline)
     await _update_documents_sidebar(pipeline)
+    await _send_settings_sidebar_state(pipeline)
 
-
-@cl.on_settings_update
-async def on_settings_update(values: dict):
-    pipeline: RAGPipeline | None = cl.user_session.get("pipeline")
-    if not pipeline:
-        pipeline = _get_pipeline()
-
+async def _apply_runtime_settings(
+    pipeline: RAGPipeline,
+    values: dict,
+    *,
+    announce: bool = True,
+    resend_chat_settings: bool = True,
+    sync_sidebar: bool = True,
+):
     current_overrides = _runtime_overrides()
     current_vlm = pipeline.vlm_config
     current_pages = current_vlm.max_pages if current_vlm else _VLM_MAX_PAGES_DEFAULT
     current_ocr = pipeline.ocr_config
     current_table = pipeline.table_structure_config
-    selected_settings_view = _sanitize_select_value(
-        values.get("settings_view"),
-        _SETTINGS_VIEW_VALUES,
-        str(current_overrides.get("settings_view", "basic") or "basic"),
-    )
-
     selected_device = _sanitize_select_value(
         values.get("embedding_device"),
         _EMBEDDING_DEVICE_VALUES,
@@ -2201,6 +2360,11 @@ async def on_settings_update(values: dict):
         values.get("visual_detector_backend"),
         _VISUAL_DETECTOR_BACKEND_VALUES,
         getattr(pipeline, "visual_detector_backend", "none"),
+    )
+    selected_pdf_text_backend = _sanitize_select_value(
+        values.get("pdf_text_backend"),
+        _PDF_TEXT_BACKEND_VALUES,
+        getattr(pipeline, "pdf_text_backend", "pymupdf"),
     )
     selected_ocr_enabled = _normalize_toggle_value(
         values.get("ocr_enabled"),
@@ -2285,12 +2449,40 @@ async def on_settings_update(values: dict):
             selected_vlm_provider = str(preset_values.get("vlm_provider", selected_vlm_provider))
             selected_vlm_pages = _clamp_int(preset_values.get("vlm_max_pages"), selected_vlm_pages, 0, _VLM_MAX_PAGES_LIMIT)
             resolved_model = _resolve_embedding_model_choice(selected_model_choice, selected_device) or pipeline.embedding_model
-    selected_generation_model = _normalize_generation_model_choice(
-        pipeline,
-        settings,
-        selected_llm_provider,
-        selected_generation_model,
+    current_effective = _effective_settings_values(pipeline)
+    dependency_flags = _runtime_dependency_flags(
+        processing_mode=selected_processing_mode,
+        visual_chunk_level=selected_visual_chunk_level,
+        visual_region_source=selected_visual_region_source,
+        ocr_enabled=selected_ocr_enabled,
+        table_enabled=selected_table_enabled,
+        llm_provider=selected_llm_provider,
+        embedding_model_choice=selected_model_choice,
+        vlm_mode=selected_vlm_mode,
     )
+    if dependency_flags["generation_model"]:
+        selected_generation_model = str(current_effective.get("generation_model_choice", "") or "")
+    if dependency_flags["ocr_backend"]:
+        selected_ocr_backend = str(current_effective.get("ocr_backend", selected_ocr_backend) or selected_ocr_backend)
+    if dependency_flags["visual_chunk_level"]:
+        selected_visual_chunk_level = str(current_effective.get("visual_chunk_level", selected_visual_chunk_level) or selected_visual_chunk_level)
+    if dependency_flags["table_structure_enabled"]:
+        selected_table_enabled = str(current_effective.get("table_structure_enabled", selected_table_enabled) or selected_table_enabled)
+    if dependency_flags["multimodal_answer_mode"]:
+        selected_multimodal_answer_mode = str(current_effective.get("multimodal_answer_mode", selected_multimodal_answer_mode) or selected_multimodal_answer_mode)
+    if dependency_flags["visual_region_source"]:
+        selected_visual_region_source = str(current_effective.get("visual_region_source", selected_visual_region_source) or selected_visual_region_source)
+    if dependency_flags["visual_detector_backend"]:
+        selected_visual_detector_backend = str(current_effective.get("visual_detector_backend", selected_visual_detector_backend) or selected_visual_detector_backend)
+    if dependency_flags["table_structure_backend"]:
+        selected_table_backend = str(current_effective.get("table_structure_backend", selected_table_backend) or selected_table_backend)
+    if dependency_flags["vlm_provider"]:
+        selected_vlm_provider = str(current_effective.get("vlm_provider", selected_vlm_provider) or selected_vlm_provider)
+    if dependency_flags["vlm_max_pages"]:
+        selected_vlm_pages = int(current_effective.get("vlm_max_pages", selected_vlm_pages) or selected_vlm_pages)
+    if dependency_flags["embedding_device"]:
+        selected_device = str(current_effective.get("embedding_device", selected_device) or selected_device)
+        resolved_model = _resolve_embedding_model_choice(selected_model_choice, selected_device) or pipeline.embedding_model
     resolved_vlm_provider, vlm_warning = _resolve_vlm_provider_choice(
         selected_vlm_provider,
         settings,
@@ -2301,14 +2493,20 @@ async def on_settings_update(values: dict):
         settings,
         ollama_cfg,
     )
+    selected_generation_model = _normalize_generation_model_choice(
+        pipeline,
+        settings,
+        resolved_llm_provider,
+        selected_generation_model,
+    )
     gemini_model_next = None
     openai_model_next = None
     local_llm_model_next = None
-    if selected_llm_provider == "gemini" and selected_generation_model:
+    if resolved_llm_provider == "gemini" and selected_generation_model:
         gemini_model_next = selected_generation_model
-    elif selected_llm_provider == "openai" and selected_generation_model:
+    elif resolved_llm_provider == "openai" and selected_generation_model:
         openai_model_next = selected_generation_model
-    elif selected_llm_provider == "local" and selected_generation_model:
+    elif resolved_llm_provider == "local" and selected_generation_model:
         local_llm_model_next = selected_generation_model
     effective_after_apply = {}
 
@@ -2331,6 +2529,7 @@ async def on_settings_update(values: dict):
         vlm_mode=selected_vlm_mode,
         vlm_provider=resolved_vlm_provider,
         vlm_max_pages=selected_vlm_pages,
+        pdf_text_backend=selected_pdf_text_backend,
     )
     effective_after_apply = _effective_settings_values(pipeline)
     stored_runtime_preset = selected_runtime_preset
@@ -2339,7 +2538,6 @@ async def on_settings_update(values: dict):
     cl.user_session.set(
         _RUNTIME_OVERRIDES_KEY,
         {
-            "settings_view": selected_settings_view,
             "runtime_preset": stored_runtime_preset,
             "ocr_enabled": selected_ocr_enabled,
             "ocr_backend": selected_ocr_backend,
@@ -2352,11 +2550,12 @@ async def on_settings_update(values: dict):
             "visual_detector_backend": selected_visual_detector_backend,
             "table_structure_enabled": selected_table_enabled,
             "table_structure_backend": selected_table_backend,
-            "llm_provider": selected_llm_provider,
+            "llm_provider": resolved_llm_provider,
             "generation_model_choice": selected_generation_model,
             "vlm_mode": selected_vlm_mode,
             "vlm_provider": resolved_vlm_provider,
             "vlm_max_pages": selected_vlm_pages,
+            "pdf_text_backend": selected_pdf_text_backend,
         },
     )
     cl.user_session.set("pipeline", pipeline)
@@ -2377,7 +2576,7 @@ async def on_settings_update(values: dict):
         messages = [
             "**Runtime ayarlari guncellendi**",
             f"- OCR: `{selected_ocr_enabled}` | backend=`{getattr(pipeline.ocr_config, 'backend', 'docai')}`",
-            f"- Preset: `{stored_runtime_preset}` | view=`{selected_settings_view}`",
+            f"- Preset: `{stored_runtime_preset}`",
             f"- Processing: `{getattr(pipeline, 'processing_mode', 'classic')}`",
             f"- Multimodal Answer Gen: `{getattr(pipeline, 'multimodal_answer_mode', 'auto')}`",
             f"- Visual Chunk Level: `{getattr(pipeline, 'visual_chunk_level', 'page')}`",
@@ -2414,20 +2613,60 @@ async def on_settings_update(values: dict):
             messages.append("- Preset secimi manuel override nedeniyle `custom` moduna gecti.")
         elif selected_runtime_preset != previous_preset:
             messages.append(f"- Preset `{selected_runtime_preset}` uygulandi.")
+        if str(selected_model_choice).strip().lower().startswith("gemini-embedding-") and resolved_model != selected_model_choice:
+            messages.append("- Not: `google-genai` paketi hazir olmadigi icin embedding local fallback ile calisiyor.")
         if selected_visual_region_source == "detector" and selected_visual_detector_backend == "none":
             messages.append("- Not: `Visual Region Source=detector` iken backend `none`; bu durumda heuristic fallback kullanilir.")
         if llm_warning:
             messages.append(f"- Not: {llm_warning}")
         if vlm_warning:
             messages.append(f"- Not: {vlm_warning}")
-        await cl.Message(content="\n".join(messages)).send()
+        if announce:
+            await cl.Message(content="\n".join(messages)).send()
 
-    await cl.ChatSettings(_settings_widgets(pipeline)).send()
+    if resend_chat_settings:
+        await cl.ChatSettings(_settings_widgets(pipeline)).send()
+    if sync_sidebar:
+        await _send_settings_sidebar_state(pipeline)
+    return result
+
+
+@cl.on_settings_update
+async def on_settings_update(values: dict):
+    pipeline: RAGPipeline | None = cl.user_session.get("pipeline")
+    if not pipeline:
+        pipeline = _get_pipeline()
+    await _apply_runtime_settings(pipeline, values, announce=True, resend_chat_settings=True, sync_sidebar=True)
+
+
+@cl.on_window_message
+async def on_window_message(data):
+    if not isinstance(data, dict):
+        return
+    if str(data.get("source") or "") != "docqa-settings-ui":
+        return
+
+    action = str(data.get("action") or "").strip().lower()
+    pipeline: RAGPipeline | None = cl.user_session.get("pipeline")
+    if not pipeline:
+        pipeline = _get_pipeline()
+
+    if action == "request_state":
+        await _send_settings_sidebar_state(pipeline)
+        return
+    if action == "reset":
+        await _send_settings_sidebar_state(pipeline)
+        return
+    if action == "apply":
+        payload = data.get("payload")
+        if isinstance(payload, dict):
+            await _apply_runtime_settings(pipeline, payload, announce=True, resend_chat_settings=True, sync_sidebar=True)
     await _update_documents_sidebar(pipeline)
 
 
 @cl.on_chat_end
 async def on_chat_end() -> None:
+    _drop_thread_cache(_active_thread_id())
     # Decrement active sessions and auto-exit if enabled.
     async with _EXIT_LOCK:
         global _ACTIVE_CHAT_SESSIONS
@@ -2491,71 +2730,15 @@ def _extract_uploaded_file_info(elem) -> tuple[str | None, str]:
 
 async def _update_documents_sidebar(pipeline: RAGPipeline | None = None) -> None:
     """
-    Render a small "loaded docs + active doc" panel in the left sidebar.
-    UI-only helper; does not affect retrieval/generation logic.
+    Close the Chainlit element sidebar; document context now lives in the
+    reactive runtime settings panel to avoid right-rail overlap.
     """
     try:
         pipeline = _resolve_sidebar_pipeline(pipeline)
         _thread_state_persist(_active_thread_id(), pipeline)
-
-        mode = cl.user_session.get("mode") or "doc"
-        docs = pipeline.list_documents() if pipeline else []
-        active = pipeline.active_document_name if pipeline else None
-        llm_provider = (pipeline.llm_provider if pipeline else "gemini") or "gemini"
-        llm_model = _active_llm_model(pipeline)
-        embedding_model = pipeline.embedding_model if pipeline else "-"
-        embedding_runtime = _embedding_runtime_label(
-            pipeline.embedding_model if pipeline else "-",
-            pipeline.embedding_device if pipeline else "-",
-        )
-        vlm_provider = (pipeline.vlm_config.provider if (pipeline and pipeline.vlm_config) else "-")
-        vlm_mode = (pipeline.vlm_config.mode if (pipeline and pipeline.vlm_config) else "-")
-        vlm_max_pages = (pipeline.vlm_config.max_pages if (pipeline and pipeline.vlm_config) else "-")
-        ocr_backend = getattr(getattr(pipeline, "ocr_config", None), "backend", "docai") if pipeline else "-"
-        ocr_enabled = "on" if bool(getattr(getattr(pipeline, "ocr_config", None), "enabled", False)) else "off"
-        visual_chunk_level = getattr(pipeline, "visual_chunk_level", "page") if pipeline else "-"
-        visual_region_source = getattr(pipeline, "visual_region_source", "heuristic") if pipeline else "-"
-        visual_detector_backend = getattr(pipeline, "visual_detector_backend", "none") if pipeline else "-"
-
-        print(
-            f"[ui] sidebar update: docs={docs}, active={active}, mode={mode}",
-            flush=True,
-        )
-
-        content = _render_sidebar_panel(
-            mode=mode,
-            llm_provider=llm_provider,
-            llm_model=llm_model,
-            embedding_model=embedding_model,
-            embedding_runtime=embedding_runtime,
-            ocr_backend=str(ocr_backend),
-            ocr_enabled=ocr_enabled,
-            vlm_provider=vlm_provider,
-            vlm_mode=vlm_mode,
-            vlm_max_pages=str(vlm_max_pages),
-            visual_chunk_level=str(visual_chunk_level),
-            visual_region_source=str(visual_region_source),
-            visual_detector_backend=str(visual_detector_backend),
-            active_doc=active,
-            docs=docs,
-        )
-        await cl.ElementSidebar.set_title("Belge Durumu")
-        sidebar_key = f"belge-durumu-{_next_sidebar_rev()}"
-        await cl.ElementSidebar.set_elements(
-            [
-                cl.Text(
-                    name="belge-durumu",
-                    content=content,
-                    display="inline",
-                )
-            ],
-            key=sidebar_key,
-        )
+        await cl.ElementSidebar.set_elements([], key=f"belge-durumu-hidden-{_next_sidebar_rev()}")
     except Exception as err:
-        # Sidebar updates are best-effort and must not break chat flow.
-        import traceback
-        print(f"[ui] sidebar update failed: {err}", flush=True)
-        traceback.print_exc()
+        print(f"[ui] sidebar close failed: {err}", flush=True)
         return
 
 
@@ -2600,56 +2783,14 @@ async def _stream_text_response(text: str, chunk_size: int = 24) -> None:
     await msg.update()
 
 
+async def _run_chat_response(pipeline: RAGPipeline, query: str, chat_style: str) -> str:
+    async with _chat_qa_semaphore():
+        return await cl.make_async(pipeline.chat)(query, chat_style)
+
+
 def _build_qa_response(result, mode: str) -> str:
     answer = result.answer
     return f"{answer}{_build_qa_debug_suffix(result, mode)}"
-
-
-def _build_qa_debug_suffix(result, mode: str) -> str:
-    debug_lines = [
-        f"- **Mod**: {mode}",
-        f"- **Intent**: {result.intent}",
-        f"- **Citation sayisi**: {result.citations_found}",
-    ]
-    if result.coverage_expected is not None:
-        status_emoji = "OK" if result.coverage_ok else "EKSIK"
-        debug_lines.append(
-            f"- **Kapsam**: beklenen={result.coverage_expected}, "
-            f"bulunan={result.coverage_actual}, durum={status_emoji}"
-        )
-    debug_text = "\n".join(debug_lines)
-    return (
-        f"\n\n"
-        f"---\n"
-        f"<details><summary>Debug Bilgisi</summary>\n\n"
-        f"{debug_text}\n\n"
-        f"</details>"
-    )
-
-
-def _build_evidence_panel(result) -> str:
-    evidence_summary = getattr(result, "evidence_summary", None) or []
-    if not evidence_summary:
-        return ""
-    return "\n".join(
-        [
-            "**Kullanilan Kanitlar**",
-            "",
-            *evidence_summary,
-        ]
-    )
-
-
-def _format_standard_error(title: str, err: Exception | str) -> str:
-    detail = re.sub(r"\s+", " ", str(err or "")).strip() or "Bilinmeyen hata"
-    if len(detail) > 320:
-        detail = detail[:320] + "..."
-    return (
-        f"**{title}**\n"
-        f"- Islem tamamlanamadi.\n"
-        f"- Detay: `{detail}`\n"
-        f"- `Tekrar dene` ile ayni istegi yeniden calistirabilirsin."
-    )
 
 
 async def _send_standard_error(
@@ -2683,13 +2824,33 @@ async def _stream_doc_answer_live(
     def _on_token(token: str) -> None:
         token_queue.put(token)
 
-    worker = asyncio.create_task(
-        cl.make_async(pipeline.ask_stream)(query, _on_token)
-    )
+    async with _doc_qa_semaphore():
+        worker = asyncio.create_task(
+            cl.make_async(pipeline.ask_stream)(query, _on_token)
+        )
 
-    streamed_chars = 0
-    thinking_removed = False
-    while not worker.done():
+        streamed_chars = 0
+        thinking_removed = False
+        while not worker.done():
+            while True:
+                try:
+                    token = token_queue.get_nowait()
+                except Empty:
+                    break
+                if token:
+                    if thinking_msg and not thinking_removed:
+                        try:
+                            await thinking_msg.remove()
+                        except Exception:
+                            pass
+                        thinking_removed = True
+                    if stream_msg is None:
+                        stream_msg = cl.Message(content="")
+                        await stream_msg.send()
+                    streamed_chars += len(token)
+                    await stream_msg.stream_token(token)
+            await asyncio.sleep(0.03)
+
         while True:
             try:
                 token = token_queue.get_nowait()
@@ -2707,27 +2868,8 @@ async def _stream_doc_answer_live(
                     await stream_msg.send()
                 streamed_chars += len(token)
                 await stream_msg.stream_token(token)
-        await asyncio.sleep(0.03)
 
-    while True:
-        try:
-            token = token_queue.get_nowait()
-        except Empty:
-            break
-        if token:
-            if thinking_msg and not thinking_removed:
-                try:
-                    await thinking_msg.remove()
-                except Exception:
-                    pass
-                thinking_removed = True
-            if stream_msg is None:
-                stream_msg = cl.Message(content="")
-                await stream_msg.send()
-            streamed_chars += len(token)
-            await stream_msg.stream_token(token)
-
-    result = await worker
+        result = await worker
     if thinking_msg and not thinking_removed:
         try:
             await thinking_msg.remove()
@@ -2762,17 +2904,32 @@ async def _process_uploaded_file_with_progress(file_path: str, file_name: str) -
     progress_msg = cl.Message(content=_render_upload_progress(file_name, seen_steps, in_progress))
     await progress_msg.send()
 
-    worker = asyncio.create_task(
-        cl.make_async(_process_uploaded_file_sync_with_progress)(
-            file_path,
-            file_name,
-            pipeline,
-            _on_progress,
+    async with _upload_work_semaphore():
+        worker = asyncio.create_task(
+            cl.make_async(_process_uploaded_file_sync_with_progress)(
+                file_path,
+                file_name,
+                pipeline,
+                _on_progress,
+            )
         )
-    )
 
-    while not worker.done():
-        updated = False
+        while not worker.done():
+            updated = False
+            while True:
+                try:
+                    step = progress_queue.get_nowait()
+                except Empty:
+                    break
+                if not seen_steps or seen_steps[-1] != step:
+                    seen_steps.append(step)
+                    in_progress = step
+                    updated = True
+            if updated:
+                progress_msg.content = _render_upload_progress(file_name, seen_steps, in_progress)
+                await progress_msg.update()
+            await asyncio.sleep(0.25)
+
         while True:
             try:
                 step = progress_queue.get_nowait()
@@ -2781,22 +2938,8 @@ async def _process_uploaded_file_with_progress(file_path: str, file_name: str) -
             if not seen_steps or seen_steps[-1] != step:
                 seen_steps.append(step)
                 in_progress = step
-                updated = True
-        if updated:
-            progress_msg.content = _render_upload_progress(file_name, seen_steps, in_progress)
-            await progress_msg.update()
-        await asyncio.sleep(0.25)
 
-    while True:
-        try:
-            step = progress_queue.get_nowait()
-        except Empty:
-            break
-        if not seen_steps or seen_steps[-1] != step:
-            seen_steps.append(step)
-            in_progress = step
-
-    status = await worker
+        status = await worker
     status_lower = status.lower()
     is_error = "hata olustu" in status_lower or status_lower.startswith("hata:")
     final_state = "error" if is_error else "done"
@@ -2838,7 +2981,7 @@ async def on_retry_last(action: cl.Action):
     await thinking_msg.send()
     try:
         if kind == "chat":
-            answer = await cl.make_async(pipeline.chat)(query, chat_style)
+            answer = await _run_chat_response(pipeline, query, chat_style)
             await thinking_msg.remove()
             await _stream_text_response(answer)
             await _update_documents_sidebar(pipeline)
@@ -2956,7 +3099,7 @@ async def on_message(message: cl.Message):
         thinking_msg = cl.Message(content="Dusunuyorum...")
         await thinking_msg.send()
         try:
-            answer = await cl.make_async(pipeline.chat)(query, chat_style)
+            answer = await _run_chat_response(pipeline, query, chat_style)
         except Exception as e:
             await thinking_msg.remove()
             await _send_standard_error(
@@ -3025,7 +3168,7 @@ async def on_message(message: cl.Message):
             thinking_msg = cl.Message(content="Dusunuyorum...")
             await thinking_msg.send()
             try:
-                answer = await cl.make_async(pipeline.chat)(query, chat_style)
+                answer = await _run_chat_response(pipeline, query, chat_style)
             except Exception as e:
                 await thinking_msg.remove()
                 await _send_standard_error(

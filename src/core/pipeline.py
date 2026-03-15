@@ -34,7 +34,7 @@ from .doc_cache import CachedDocument, DocumentCache
 from .local_llm import OllamaConfig
 from .eventlog import JsonlEventLogger
 from .indexing import LocalIndex
-from .ingestion import ingest_any, IngestResult
+from .ingestion import ingest_any, IngestResult, DoclingTextConfig
 from .layout_detector import resolve_sidecar_path
 from .multimodal import MultimodalConfig, visual_chunks_from_ingest
 from .ocr_backend import OCRConfig
@@ -71,9 +71,12 @@ class RAGPipeline:
     gemini_api_key: str
     gemini_model: str
     ocr_config: OCRConfig
+    gemini_fallback_model: str = ""
     embedding_device: str = "auto"
+    embedding_dimension: int = 3072
     processing_mode: str = "classic"
     multimodal_answer_mode: str = "auto"
+    section_fetch_max_depth: int = 2
     visual_chunk_level: str = "page"
     visual_region_source: str = "heuristic"
     visual_detector_backend: str = "none"
@@ -87,6 +90,7 @@ class RAGPipeline:
     docling_layout_model: str = "docling-layout-heron-101"
     docling_artifacts_path: Optional[Path] = None
     docling_device: str = "auto"
+    pdf_text_backend: str = "pymupdf"   # "auto" | "pymupdf" | "docling"
     table_structure_config: Optional[TableStructureConfig] = None
     vlm_config: Optional[VLMConfig] = None
     llm_provider: str = "gemini"  # "gemini" | "openai" | "local" | "none"
@@ -195,6 +199,7 @@ class RAGPipeline:
             chroma_dir=self.chroma_dir,
             embedding_model=self.embedding_model,
             embedding_device=self.embedding_device,
+            embedding_dimension=self.embedding_dimension,
             allowed_doc_ids=set(self._documents.keys()),
             collection_name=collection_name,
             chunks=self._all_chunks,
@@ -244,6 +249,7 @@ class RAGPipeline:
                 f"visual_chunk_level={self.visual_chunk_level}",
                 f"visual_region_source={self.visual_region_source}",
                 f"visual_detector_backend={self.visual_detector_backend}",
+                "visual_docai_input_mode=pdf_v1",
                 f"docai_location={self.docai_location}",
                 f"docai_processor_id={self.docai_layout_processor_id}",
                 f"docai_processor_version={self.docai_layout_processor_version}",
@@ -356,6 +362,7 @@ class RAGPipeline:
                 docling_artifacts_path=self.docling_artifacts_path,
                 docling_device=self.docling_device,
             ),
+            docling_text=self._build_docling_text_config(),
         )
         _progress("Belge yapisi analiz ediliyor...")
         root = build_section_tree(ingest)
@@ -427,6 +434,7 @@ class RAGPipeline:
                 chroma_dir=self.chroma_dir,
                 embedding_model=self.embedding_model,
                 embedding_device=self.embedding_device,
+                embedding_dimension=self.embedding_dimension,
             )
         state.collection_name = self._index.store.collection_name if self._index else "chunks"
         _index_ms = (time.perf_counter() - _t0) * 1000
@@ -605,6 +613,21 @@ class RAGPipeline:
     def total_chunks(self) -> int:
         return len(self._all_chunks)
 
+    def _build_docling_text_config(self) -> Optional[DoclingTextConfig]:
+        """Return DoclingTextConfig if Docling text extraction is enabled."""
+        backend = (self.pdf_text_backend or "auto").strip().lower()
+        if backend == "pymupdf":
+            return None  # explicitly disabled
+        if backend == "auto" and not (self.docling_python_bin or "").strip():
+            return None  # no binary configured → skip silently
+        return DoclingTextConfig(
+            python_bin=(self.docling_python_bin or "").strip(),
+            model_name=(self.docling_layout_model or "docling-layout-heron-101").strip(),
+            artifacts_path=self.docling_artifacts_path,
+            device=(self.docling_device or "auto").strip(),
+            do_table_structure=True,
+        )
+
     def reconfigure_runtime(
         self,
         *,
@@ -626,6 +649,7 @@ class RAGPipeline:
         vlm_mode: Optional[str] = None,
         vlm_provider: Optional[str] = None,
         vlm_max_pages: Optional[int] = None,
+        pdf_text_backend: Optional[str] = None,
     ) -> Dict[str, bool]:
         """
         Update runtime knobs from UI.
@@ -715,6 +739,9 @@ class RAGPipeline:
         if gemini_model_next and gemini_model_next != self.gemini_model:
             self.gemini_model = gemini_model_next
             llm_changed = True
+            if self.table_structure_config is not None and gemini_model_next != self.table_structure_config.gemini_model:
+                self.table_structure_config = replace(self.table_structure_config, gemini_model=gemini_model_next)
+                table_structure_changed = True
         openai_model_next = (openai_model or "").strip()
         if openai_model_next and openai_model_next != self.openai_model:
             self.openai_model = openai_model_next
@@ -742,6 +769,8 @@ class RAGPipeline:
 
         vlm_before = self.vlm_config
         vlm_after = vlm_before
+        if gemini_model_next and getattr(vlm_after, "model", "") != gemini_model_next:
+            vlm_after = replace(vlm_after, model=gemini_model_next)
         if vlm_mode in ("off", "auto", "force"):
             vlm_after = replace(vlm_after, mode=vlm_mode)
         if vlm_provider in ("gemini", "local"):
@@ -753,6 +782,12 @@ class RAGPipeline:
         if vlm_changed:
             self.vlm_config = vlm_after
 
+        pdf_text_backend_changed = False
+        pdf_backend_next = (pdf_text_backend or "").strip().lower()
+        if pdf_backend_next in ("auto", "pymupdf", "docling") and pdf_backend_next != self.pdf_text_backend:
+            self.pdf_text_backend = pdf_backend_next
+            pdf_text_backend_changed = True
+
         index_rebuilt = False
         if embedding_changed and self._all_chunks:
             self._index = LocalIndex.build(
@@ -760,6 +795,7 @@ class RAGPipeline:
                 chroma_dir=self.chroma_dir,
                 embedding_model=self.embedding_model,
                 embedding_device=self.embedding_device,
+                embedding_dimension=self.embedding_dimension,
             )
             index_rebuilt = True
 
@@ -774,6 +810,7 @@ class RAGPipeline:
             "table_structure_changed": table_structure_changed,
             "llm_changed": llm_changed,
             "vlm_changed": vlm_changed,
+            "pdf_text_backend_changed": pdf_text_backend_changed,
             "index_rebuilt": index_rebuilt,
         }
 
@@ -794,18 +831,22 @@ class RAGPipeline:
                     openai_api_key=self.openai_api_key,
                     openai_model=self.openai_model,
                 )
-            elif self.llm_provider == "local" and self.ollama_config:
-                result = generate_answer_local(
-                    retrieval=empty,
-                    query=query,
-                    ollama_cfg=self.ollama_config,
-                )
+            elif self.llm_provider == "local":
+                if self.ollama_config:
+                    result = generate_answer_local(
+                        retrieval=empty,
+                        query=query,
+                        ollama_cfg=self.ollama_config,
+                    )
+                else:
+                    result = generate_extractive_answer(retrieval=empty, query=query)
             else:
                 result = generate_answer(
                     retrieval=empty,
                     query=query,
                     gemini_api_key=self.gemini_api_key,
                     gemini_model=self.gemini_model,
+                    gemini_fallback_model=self.gemini_fallback_model,
                     multimodal_answer_mode=self.multimodal_answer_mode,
                 )
             result = replace(result, evidence_summary=self._summarize_evidence(empty))
@@ -840,7 +881,12 @@ class RAGPipeline:
 
         _t_ret = time.perf_counter()
         doc_hint = self._resolve_doc_id_hint(query)
-        ret = retrieve(self._index, query, doc_id=doc_hint)
+        ret = retrieve(
+            self._index,
+            query,
+            doc_id=doc_hint,
+            section_fetch_max_depth=self.section_fetch_max_depth,
+        )
         _retrieval_ms = (time.perf_counter() - _t_ret) * 1000
 
         _t_gen = time.perf_counter()
@@ -853,18 +899,22 @@ class RAGPipeline:
                 openai_api_key=self.openai_api_key,
                 openai_model=self.openai_model,
             )
-        elif self.llm_provider == "local" and self.ollama_config:
-            result = generate_answer_local(
-                retrieval=ret,
-                query=query,
-                ollama_cfg=self.ollama_config,
-            )
+        elif self.llm_provider == "local":
+            if self.ollama_config:
+                result = generate_answer_local(
+                    retrieval=ret,
+                    query=query,
+                    ollama_cfg=self.ollama_config,
+                )
+            else:
+                result = generate_extractive_answer(retrieval=ret, query=query)
         else:
             result = generate_answer(
                 retrieval=ret,
                 query=query,
                 gemini_api_key=self.gemini_api_key,
                 gemini_model=self.gemini_model,
+                gemini_fallback_model=self.gemini_fallback_model,
                 multimodal_answer_mode=self.multimodal_answer_mode,
             )
         result = replace(result, evidence_summary=self._summarize_evidence(ret))
@@ -925,19 +975,25 @@ class RAGPipeline:
                     openai_model=self.openai_model,
                     on_token=on_token,
                 )
-            elif self.llm_provider == "local" and self.ollama_config:
-                result = generate_answer_local_stream(
-                    retrieval=empty,
-                    query=query,
-                    ollama_cfg=self.ollama_config,
-                    on_token=on_token,
-                )
+            elif self.llm_provider == "local":
+                if self.ollama_config:
+                    result = generate_answer_local_stream(
+                        retrieval=empty,
+                        query=query,
+                        ollama_cfg=self.ollama_config,
+                        on_token=on_token,
+                    )
+                else:
+                    result = generate_extractive_answer(retrieval=empty, query=query)
+                    if on_token and result.answer:
+                        on_token(result.answer)
             else:
                 result = generate_answer_stream(
                     retrieval=empty,
                     query=query,
                     gemini_api_key=self.gemini_api_key,
                     gemini_model=self.gemini_model,
+                    gemini_fallback_model=self.gemini_fallback_model,
                     multimodal_answer_mode=self.multimodal_answer_mode,
                     on_token=on_token,
                 )
@@ -946,7 +1002,12 @@ class RAGPipeline:
 
         _t_ret = time.perf_counter()
         doc_hint = self._resolve_doc_id_hint(query)
-        ret = retrieve(self._index, query, doc_id=doc_hint)
+        ret = retrieve(
+            self._index,
+            query,
+            doc_id=doc_hint,
+            section_fetch_max_depth=self.section_fetch_max_depth,
+        )
         _retrieval_ms = (time.perf_counter() - _t_ret) * 1000
 
         _t_gen = time.perf_counter()
@@ -962,19 +1023,25 @@ class RAGPipeline:
                 openai_model=self.openai_model,
                 on_token=on_token,
             )
-        elif self.llm_provider == "local" and self.ollama_config:
-            result = generate_answer_local_stream(
-                retrieval=ret,
-                query=query,
-                ollama_cfg=self.ollama_config,
-                on_token=on_token,
-            )
+        elif self.llm_provider == "local":
+            if self.ollama_config:
+                result = generate_answer_local_stream(
+                    retrieval=ret,
+                    query=query,
+                    ollama_cfg=self.ollama_config,
+                    on_token=on_token,
+                )
+            else:
+                result = generate_extractive_answer(retrieval=ret, query=query)
+                if on_token and result.answer:
+                    on_token(result.answer)
         else:
             result = generate_answer_stream(
                 retrieval=ret,
                 query=query,
                 gemini_api_key=self.gemini_api_key,
                 gemini_model=self.gemini_model,
+                gemini_fallback_model=self.gemini_fallback_model,
                 multimodal_answer_mode=self.multimodal_answer_mode,
                 on_token=on_token,
             )
@@ -1029,16 +1096,22 @@ class RAGPipeline:
                 openai_model=self.openai_model,
                 chat_style=chat_style,
             )
-        if self.llm_provider == "local" and self.ollama_config:
-            return generate_chat_answer_local(
-                query=query,
-                ollama_cfg=self.ollama_config,
-                chat_style=chat_style,
+        if self.llm_provider == "local":
+            if self.ollama_config:
+                return generate_chat_answer_local(
+                    query=query,
+                    ollama_cfg=self.ollama_config,
+                    chat_style=chat_style,
+                )
+            return (
+                "Local sohbet modu hazir degil (Ollama baglantisi yok). "
+                "Provider secimini guncelleyip tekrar deneyebilirsin."
             )
         return generate_chat_answer(
             query=query,
             gemini_api_key=self.gemini_api_key,
             gemini_model=self.gemini_model,
+            gemini_fallback_model=self.gemini_fallback_model,
             chat_style=chat_style,
         )
 
@@ -1049,4 +1122,9 @@ class RAGPipeline:
         if self._index is None:
             return RetrievalResult(intent=classify_query(query), evidences=[], section_complete=False, coverage=None)
         doc_hint = self._resolve_doc_id_hint(query)
-        return retrieve(self._index, query, doc_id=doc_hint)
+        return retrieve(
+            self._index,
+            query,
+            doc_id=doc_hint,
+            section_fetch_max_depth=self.section_fetch_max_depth,
+        )

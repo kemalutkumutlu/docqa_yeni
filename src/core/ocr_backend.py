@@ -298,6 +298,7 @@ def _ocr_with_paddle(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            timeout=180,
         )
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()

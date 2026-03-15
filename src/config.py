@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib.util
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -28,11 +29,14 @@ class Settings:
     openai_model: str
     gemini_api_key: str
     gemini_model: str
+    gemini_fallback_model: str
 
     embedding_model: str
     embedding_device: EmbeddingDevice
+    embedding_dimension: int
     processing_mode: ProcessingMode
     multimodal_answer_mode: MultimodalAnswerMode
+    section_fetch_max_depth: int
 
     data_dir: Path
     chroma_dir: Path
@@ -65,6 +69,7 @@ class Settings:
     docling_layout_model: str
     docling_artifacts_path: Optional[Path]
     docling_device: str
+    pdf_text_backend: str
     table_structure_enabled: bool
     table_structure_backend: TableStructureBackend
     table_structure_min_confidence: float
@@ -169,6 +174,8 @@ def load_settings() -> Settings:
     docling_artifacts_path = Path(docling_artifacts_raw) if docling_artifacts_raw else None
     docling_device_raw = (os.getenv("DOCLING_DEVICE", "auto") or "auto").strip().lower()
     docling_device = docling_device_raw if docling_device_raw in ("auto", "cpu", "cuda", "mps", "xpu") else "auto"
+    pdf_text_backend_raw = (os.getenv("PDF_TEXT_BACKEND", "pymupdf") or "pymupdf").strip().lower()
+    pdf_text_backend = pdf_text_backend_raw if pdf_text_backend_raw in ("auto", "pymupdf", "docling") else "pymupdf"
     table_structure_enabled_raw = (os.getenv("TABLE_STRUCTURE_ENABLED", "0") or "0").strip().lower()
     table_structure_enabled = table_structure_enabled_raw in ("1", "true", "yes", "y", "on")
     table_structure_backend_raw = (os.getenv("TABLE_STRUCTURE_BACKEND", "auto") or "auto").strip().lower()
@@ -203,6 +210,11 @@ def load_settings() -> Settings:
         if embedding_device_raw in ("auto", "cpu", "cuda")
         else "auto"
     )
+    try:
+        embedding_dimension = int((os.getenv("EMBEDDING_DIMENSION", "3072") or "3072").strip())
+    except Exception:
+        embedding_dimension = 3072
+    embedding_dimension = max(128, min(3072, embedding_dimension))
 
     processing_mode_raw = (os.getenv("DOC_PROCESSING_MODE", "classic") or "classic").strip().lower()
     processing_mode: ProcessingMode = (
@@ -217,6 +229,11 @@ def load_settings() -> Settings:
         if multimodal_answer_mode_raw in ("off", "auto", "on")
         else "auto"
     )
+    try:
+        section_fetch_max_depth = int((os.getenv("SECTION_FETCH_MAX_DEPTH", "2") or "2").strip())
+    except Exception:
+        section_fetch_max_depth = 2
+    section_fetch_max_depth = max(0, min(10, section_fetch_max_depth))
 
     # Embedding model selection:
     # - Default: Gemini embedding for highest remote quality.
@@ -225,6 +242,9 @@ def load_settings() -> Settings:
     #     - otherwise -> multilingual-e5-small
     embedding_model_raw = (os.getenv("EMBEDDING_MODEL", "gemini-embedding-001") or "gemini-embedding-001").strip()
     if embedding_model_raw.lower() == "auto":
+        cuda_ok = _cuda_available() and embedding_device != "cpu"
+        embedding_model = "intfloat/multilingual-e5-base" if cuda_ok else "intfloat/multilingual-e5-small"
+    elif embedding_model_raw.lower().startswith("gemini-embedding-") and importlib.util.find_spec("google.genai") is None:
         cuda_ok = _cuda_available() and embedding_device != "cpu"
         embedding_model = "intfloat/multilingual-e5-base" if cuda_ok else "intfloat/multilingual-e5-small"
     else:
@@ -236,10 +256,13 @@ def load_settings() -> Settings:
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        gemini_fallback_model=(os.getenv("GEMINI_FALLBACK_MODEL", "") or "").strip(),
         embedding_model=embedding_model,
         embedding_device=embedding_device,
+        embedding_dimension=embedding_dimension,
         processing_mode=processing_mode,
         multimodal_answer_mode=multimodal_answer_mode,
+        section_fetch_max_depth=section_fetch_max_depth,
         data_dir=data_dir,
         chroma_dir=chroma_dir,
         ocr_enabled=ocr_enabled,
@@ -268,6 +291,7 @@ def load_settings() -> Settings:
         docling_layout_model=docling_layout_model,
         docling_artifacts_path=docling_artifacts_path,
         docling_device=docling_device,
+        pdf_text_backend=pdf_text_backend,
         table_structure_enabled=table_structure_enabled,
         table_structure_backend=table_structure_backend,
         table_structure_min_confidence=table_structure_min_confidence,

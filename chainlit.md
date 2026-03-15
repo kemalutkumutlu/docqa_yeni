@@ -37,6 +37,7 @@ Projede varsayilan Chainlit gecmisi yerine ek bir ozel sidebar mantigi vardir.
 - `public/history_sidebar.js` desktop'ta mini sohbet gecmisi paneli ekler
 - thread secimi tarayici `localStorage` ile tutulur
 - native Chainlit thread history acik degilse bu fallback davranis calisir
+- panel ustunde TUSAS logo + kucuk marka alani bulunur
 
 ## Settings Panel
 
@@ -71,8 +72,13 @@ Detayli backend ayarlari:
 - `Table Structure Backend`
 - `VLM Provider`
 - `VLM Max Pages`
-- `Active Pipeline Summary`
-- `Why Fallback Happens`
+
+Panelin ust kisminda ozet kartlari bulunur:
+
+- `Current Draft`
+- `Applied Pipeline`
+- `Fallback Notes`
+- `Document Context`
 
 ## Ayar Bagimliliklari
 
@@ -90,15 +96,16 @@ Bu tercih bilincli:
 - kullanici hangi alanin var oldugunu gorsun
 - ama desteklenmeyen kombinasyonda secim yapamasin
 
-## Onemli UI Limiti
+## Onemli UI Davranisi
 
-Mevcut `Chainlit ChatSettings` panelinde:
+Mevcut runtime ayarlari artik `Chainlit ChatSettings` yerine custom sag panelden yonetilir:
 
-- alan degisimi backend'e anlik gitmez
-- ayarlar `Confirm` ile uygulanir
-- yani dependency zinciri secim aninda backend tarafinda yeniden hesaplanmaz
+- alan degisimi panelin draft state'ine hemen yansir
+- backend pipeline degisikligi sadece `Apply` ile olur
+- `Reset` aktif draft'i son uygulanmis duruma dondurur
+- belge baglami ve fallback ozeti ayni panelde gorulur
 
-Bu su anki teknik sinirdir. Daha ileri seviye reactive settings deneyimi istenirse ayrik custom frontend panel gerekir.
+Bu tasarimla onceki ayri `Belge Durumu` sag sidebar'i kaldirilmistir; sag tarafta tek panel kalir.
 
 ## Chat Profile / Provider Davranisi
 
@@ -133,10 +140,12 @@ Ozellikle:
 
 ## UI Debug Ozeti
 
-Panelde iki bilgilendirme alani vardir:
+Panelde dort bilgilendirme alani vardir:
 
-- `Active Pipeline Summary`
-- `Why Fallback Happens`
+- `Current Draft`
+- `Applied Pipeline`
+- `Fallback Notes`
+- `Document Context`
 
 Bunlar salt okunurdur ve secili kombinasyonun neye donustugunu anlatir.
 
@@ -147,4 +156,3 @@ Bu UI bir operasyon paneli degil, gelistirme ve demo panelidir. Bu yuzden:
 - backend secenekleri gozukur
 - kombinasyonlar kilitlenerek korunur
 - ama tam reactive config editor hedeflenmemistir
-

@@ -11,9 +11,50 @@
 
 /* Background + typography */
 body {
-  background: radial-gradient(1200px 600px at 20% -10%, rgba(20, 184, 166, 0.20), transparent 60%),
-              radial-gradient(1000px 500px at 90% 0%, rgba(13, 148, 136, 0.16), transparent 55%),
-              var(--tusas-bg) !important;
+  background:
+    radial-gradient(1200px 600px at 20% -10%, rgba(20, 184, 166, 0.20), transparent 60%),
+    radial-gradient(1000px 500px at 90% 0%, rgba(13, 148, 136, 0.16), transparent 55%),
+    var(--tusas-bg) !important;
+  background-attachment: fixed, fixed, fixed;
+}
+
+#root {
+  position: relative;
+  z-index: 0;
+}
+
+#root::before {
+  content: "";
+  position: fixed;
+  /* Sohbet alanıyla hizalı: sağdaki 430px settings panelini dışarıda bırak */
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 430px;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(560px 260px at 50% 44%, rgba(255, 255, 255, 0.06), transparent 70%),
+    url("/public/logo_brand_white.png") center 42% / 400px auto no-repeat;
+  opacity: 0.28;
+  filter: drop-shadow(0 0 40px rgba(255, 255, 255, 0.08));
+  mix-blend-mode: screen;
+}
+
+@media (max-width: 1279px) {
+  #root::before {
+    right: 0;
+    background:
+      radial-gradient(560px 260px at 50% 44%, rgba(255, 255, 255, 0.06), transparent 70%),
+      url("/public/logo_brand_white.png") center 42% / 340px auto no-repeat;
+  }
+}
+
+#root > *:not(#docqa-history-panel):not(#docqa-settings-panel),
+header,
+.cl-header {
+  position: relative;
+  z-index: 1;
 }
 
 /* Header brand */
@@ -218,7 +259,255 @@ code {
   color: #e5e7eb;
 }
 
+/* Reactive settings sidebar */
+#docqa-settings-panel {
+  box-sizing: border-box;
+  position: fixed;
+  top: 0;
+  right: var(--docqa-settings-offset, 0px);
+  bottom: 0;
+  width: min(430px, calc(100vw - 280px));
+  z-index: 1400;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 16px 14px;
+  background: rgba(11, 18, 32, 0.94);
+  border-left: 1px solid rgba(255,255,255,0.08);
+  backdrop-filter: blur(14px);
+  color: var(--tusas-text);
+}
+
+.docqa-settings-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.docqa-settings-head h2 {
+  margin: 4px 0 0;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.docqa-settings-kicker {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8ee8dc;
+  font-weight: 800;
+}
+
+.docqa-settings-tabbar {
+  display: inline-flex;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.05);
+}
+
+.docqa-settings-tabbar button {
+  border: 0;
+  background: transparent;
+  color: var(--tusas-muted);
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.docqa-settings-tabbar button.active {
+  background: rgba(20, 184, 166, 0.18);
+  color: #d7fffb;
+}
+
+.docqa-settings-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.docqa-settings-summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.docqa-settings-summary-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--tusas-muted);
+}
+
+.docqa-settings-summary-toggle {
+  border: 0;
+  background: rgba(255,255,255,0.04);
+  color: var(--tusas-muted);
+  cursor: pointer;
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 6px;
+  line-height: 1.4;
+  transition: background 0.15s, color 0.15s;
+  pointer-events: all !important;
+  position: relative;
+  z-index: 2;
+}
+
+.docqa-settings-summary-toggle:hover {
+  background: rgba(255,255,255,0.09);
+  color: var(--tusas-text);
+}
+
+.docqa-settings-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.docqa-settings-card {
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.03);
+  border-radius: 14px;
+  padding: 9px 11px;
+  min-height: 0;
+}
+
+.docqa-settings-card-title {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8ee8dc;
+  margin-bottom: 6px;
+}
+
+.docqa-settings-card pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.3;
+  color: #dbe4ee;
+  max-height: 68px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.docqa-settings-sections {
+  flex: 1;
+  min-height: 0;
+}
+
+.docqa-settings-section {
+  display: none;
+  height: 100%;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.docqa-settings-section.active {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.docqa-settings-field {
+  display: grid;
+  gap: 5px;
+  padding: 11px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.03);
+}
+
+.docqa-settings-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #f3f4f6;
+}
+
+.docqa-settings-field select,
+.docqa-settings-field input[type="range"] {
+  width: 100%;
+}
+
+.docqa-settings-field select {
+  background: rgba(255,255,255,0.04);
+  color: var(--tusas-text);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color-scheme: dark;
+}
+
+.docqa-settings-field select option {
+  color: #e5e7eb;
+  background: #111827;
+}
+
+.docqa-settings-field select option:disabled {
+  color: #64748b;
+  background: #111827;
+}
+
+.docqa-settings-field select:disabled,
+.docqa-settings-field input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.docqa-settings-help {
+  color: var(--tusas-muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.docqa-settings-range-value {
+  justify-self: end;
+  font-size: 12px;
+  color: #dbe4ee;
+  font-weight: 700;
+}
+
+.docqa-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 4px;
+  margin-top: auto;
+}
+
+.docqa-settings-actions button {
+  border: 0;
+  padding: 10px 14px;
+  font-weight: 700;
+  cursor: pointer;
+  background: rgba(255,255,255,0.06);
+  color: #f3f4f6;
+}
+
+.docqa-settings-actions button.accent {
+  background: #e91e63;
+  color: white;
+}
+
+@media (max-width: 1279px) {
+  #docqa-settings-panel {
+    display: none !important;
+  }
+}
+
+@media (max-width: 1500px) {
+  .docqa-settings-summary-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .docqa-sidebar-command code {
   white-space: nowrap;
 }
-

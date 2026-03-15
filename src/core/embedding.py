@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 from typing import Iterable, List, Literal, Optional
 
-from .gemini_client import build_gemini_client
 from .models import Chunk
 
 EmbeddingDevice = Literal["auto", "cpu", "cuda"]
@@ -17,6 +16,7 @@ EmbeddingDevice = Literal["auto", "cpu", "cuda"]
 class Embedder:
     model_name: str
     device: EmbeddingDevice = "auto"
+    output_dimension: int = 3072
 
     _model: object | None = None
     _gemini_client: object | None = None
@@ -66,16 +66,13 @@ class Embedder:
         return self._model
 
     def _gemini_dimension(self) -> int:
-        raw = (os.getenv("EMBEDDING_DIMENSION", "3072") or "3072").strip()
-        try:
-            dim = int(raw)
-        except Exception:
-            dim = 3072
-        return max(128, min(3072, dim))
+        return max(128, min(3072, int(self.output_dimension or 3072)))
 
     def _load_gemini_client(self):
         if self._gemini_client is not None:
             return self._gemini_client
+
+        from .gemini_client import build_gemini_client
 
         self._gemini_client = build_gemini_client(
             os.getenv("GEMINI_API_KEY", ""),
@@ -177,10 +174,27 @@ class Embedder:
         if not chunk_list:
             return []
         if self._uses_gemini():
-            return [
-                self._embed_chunk_via_gemini(chunk, task_type="RETRIEVAL_DOCUMENT")
-                for chunk in chunk_list
-            ]
+            text_positions: list[int] = []
+            text_payloads: list[str] = []
+            out: list[List[float] | None] = [None] * len(chunk_list)
+            for idx, chunk in enumerate(chunk_list):
+                can_use_visual = (
+                    chunk.modality == "visual"
+                    and bool(chunk.image_path)
+                    and "embedding-2" in (self.model_name or "").lower()
+                )
+                if can_use_visual:
+                    out[idx] = self._embed_chunk_via_gemini(chunk, task_type="RETRIEVAL_DOCUMENT")
+                    continue
+                text_positions.append(idx)
+                text_payloads.append((chunk.text or "").strip() or f"{chunk.file_name} page {chunk.page_start}")
+            if text_payloads:
+                text_embeddings = self._embed_via_gemini(text_payloads, task_type="RETRIEVAL_DOCUMENT")
+                for idx, embedding in zip(text_positions, text_embeddings):
+                    out[idx] = embedding
+            if any(embedding is None for embedding in out):
+                raise ValueError("Gemini embedding uretimi tamamlanamadi.")
+            return [embedding for embedding in out if embedding is not None]
         return self.embed_texts([chunk.text for chunk in chunk_list])
 
     def embed_query(self, text: str) -> List[float]:

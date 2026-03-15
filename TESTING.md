@@ -32,6 +32,10 @@ Beklenen:
 - `[OK] vlm ...`
 - `[OK] preflight passed`
 
+Not:
+
+- Preflight artik secili provider yolunu da dikkate alir; sadece Gemini varsayimi yapmaz.
+
 ### 1. Syntax ve import kapisi
 
 En hizli regresyon kapisi:
@@ -177,6 +181,41 @@ Pratik sorular:
 - `Bu tabloda hangi sutunlar var?`
 - `Tablonun ikinci satirinda ne yaziyor?`
 
+### Docling text backend smoke
+
+Docling text extraction aktifse (`PDF_TEXT_BACKEND=docling` veya UI'dan secilmisse):
+
+```bash
+.venv-docling/bin/python scripts/docling_text_runner.py \
+  --source test_data/Case_Study_20260205.pdf \
+  --output /tmp/docling_text_test.json
+```
+
+Beklenen cikti (`/tmp/docling_text_test.json`):
+
+```json
+{"pages": {"1": "...", "2": "..."}, "warnings": []}
+```
+
+Kontrol edilenler:
+
+- `warnings` bos olmali
+- her sayfa icin metin uretilmeli
+- tablolar icin markdown (`|` karakterleri) gozukebilir
+
+Ana uygulamadan dogru calistirildigi icin ek test:
+
+```bash
+.venv-gpu/bin/python - <<'PY'
+from pathlib import Path
+from src.core.ingestion import DoclingTextConfig, _docling_extract_page_texts
+cfg = DoclingTextConfig(python_bin=".venv-docling/bin/python")
+pages = _docling_extract_page_texts(Path("test_data/Case_Study_20260205.pdf"), cfg)
+print(f"Sayfalar: {sorted(pages.keys())}")
+print(f"Ilk sayfa uzunluk: {len(pages.get(1, ''))}")
+PY
+```
+
 ## UI Testleri
 
 ### Settings panel
@@ -184,22 +223,26 @@ Pratik sorular:
 Manual kontrol:
 
 1. `./run.sh`
-2. Settings panel ac
+2. sagdaki runtime settings panelinin acildigini dogrula
 3. `Basic` tabda sadece ust seviye ayarlar gorunmeli
 4. `Advanced` tabda detay alanlar gorunmeli
 5. Desteklenmeyen alanlar kaybolmamak yerine `disabled` olmali
+6. Ayri bir `Belge Durumu` sag sidebar'i acilmamali
 
 Beklenen:
 
 - `OCR=off` ise `OCR Backend` gorunur ama secilemez
 - `VLM Mode=off` ise `VLM Provider` ve `VLM Max Pages` gorunur ama secilemez
 - `classic` modda layout/table zinciri gorunur ama secilemez
+- ustte `Current Draft`, `Applied Pipeline`, `Fallback Notes`, `Document Context` kartlari gorunmeli
+- `Apply` olmadan pipeline degismemeli
+- `Apply` sonrasi ozet kartlari yeni effective ayarlari gostermeli
 
-Onemli sinir:
+Onemli davranis:
 
-- Chainlit settings backend'e `Confirm` ile uygular
-- yani secim aninda pipeline backend tarafinda yeniden hesaplanmaz
-- bu bug degil, mevcut panel yuzeyinin siniridir
+- custom runtime panel secimleri once draft olarak tutulur
+- pipeline backend tarafi sadece `Apply` ile degisir
+- bu bilincli davranistir; mevcut draft ile effective pipeline ayridir
 
 ### Belge yukleme
 
@@ -214,6 +257,20 @@ Beklenen:
 
 - yeni mode/backend yalnizca yeni ingestionlarda etkili olur
 - yuklu belge eski ayarlarla kalir
+- `Document Context` karti yuklenen belge durumunu guncellemeli
+
+### Sidebar ve branding
+
+Kontrol:
+
+1. desktop genislikte uygulamayi ac
+2. sol custom sohbet panelini kontrol et
+
+Beklenen:
+
+- sol panelin ustunde TUSAS logo alani gorunmeli
+- sohbet listesi okunabilir kalmali
+- sagda ek bir Chainlit element sidebar acilmamali
 
 ## Demo Oncesi Minimum Checklist
 
@@ -284,4 +341,3 @@ Kontrol et:
 ## Not
 
 Bu belge "bugun neyi nasil test ederiz" sorusunun cevabidir. Tarihsel test sonuclari ve karar gunlugu icin `DEVLOG.md` dosyasina bak.
-

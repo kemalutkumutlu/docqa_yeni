@@ -3,7 +3,7 @@
 
 # Core
 python-dotenv==1.2.1
-pydantic==2.12.5
+httpx==0.28.1
 
 # Parsing / PDF / images
 pymupdf==1.26.7
@@ -22,6 +22,6 @@ google-cloud-documentai==3.6.0
 
 # UI
 chainlit==2.9.6
-sqlalchemy
-aiosqlite
+sqlalchemy==2.0.43
+aiosqlite==0.21.0
 

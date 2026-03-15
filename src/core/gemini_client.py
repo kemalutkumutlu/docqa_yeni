@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+from typing import Any
 
-import google.auth
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 
 def _env_true(name: str) -> bool:
@@ -43,6 +42,8 @@ def _resolve_project_id() -> str:
         return explicit_project
 
     try:
+        import google.auth
+
         _, adc_project = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
@@ -96,6 +97,8 @@ def build_gemini_client(api_key: str = "", model_name: str = ""):
     Vertex AI takes precedence when VERTEX_ENABLED / GOOGLE_GENAI_USE_VERTEXAI is enabled.
     """
     load_dotenv(override=False)
+    from google import genai
+    from google.genai import types
 
     if use_vertex_ai():
         project = _resolve_project_id()
@@ -116,9 +119,13 @@ def build_gemini_client(api_key: str = "", model_name: str = ""):
     return genai.Client(api_key=key)
 
 
-def gemini_model_candidates(primary_model: str, fallback_env: str = "GEMINI_FALLBACK_MODEL") -> list[str]:
+def gemini_model_candidates(
+    primary_model: str,
+    fallback_env: str = "GEMINI_FALLBACK_MODEL",
+    fallback_model: str = "",
+) -> list[str]:
     primary = (primary_model or "").strip()
-    fallback = (os.getenv(fallback_env, "") or "").strip()
+    fallback = (fallback_model or os.getenv(fallback_env, "") or "").strip()
     out: list[str] = []
     for item in (primary, fallback):
         if item and item not in out:
@@ -130,12 +137,110 @@ def vertex_location_for_model(model_name: str) -> str:
     return _resolve_vertex_location(model_name=model_name)
 
 
+def _coerce_status_code(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        try:
+            return int(value.strip())
+        except Exception:
+            return None
+    return None
+
+
+def _status_candidates(exc: Exception) -> list[Any]:
+    response = getattr(exc, "response", None)
+    payload = getattr(exc, "body", None)
+    items: list[Any] = [
+        getattr(exc, "status_code", None),
+        getattr(exc, "code", None),
+        getattr(exc, "status", None),
+        getattr(exc, "reason", None),
+    ]
+    if response is not None:
+        items.extend(
+            [
+                getattr(response, "status_code", None),
+                getattr(response, "status", None),
+                getattr(response, "reason_phrase", None),
+            ]
+        )
+        try:
+            payload = response.json()
+        except Exception:
+            pass
+    if isinstance(payload, dict):
+        error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+        items.extend(
+            [
+                error_payload.get("code"),
+                error_payload.get("status"),
+                error_payload.get("message"),
+            ]
+        )
+    return [item for item in items if item not in (None, "")]
+
+
+def _error_status_code(exc: Exception) -> int | None:
+    for candidate in _status_candidates(exc):
+        code = _coerce_status_code(candidate)
+        if code is not None:
+            return code
+    return None
+
+
+def _error_status_names(exc: Exception) -> set[str]:
+    names: set[str] = set()
+    for candidate in _status_candidates(exc):
+        if isinstance(candidate, str):
+            normalized = candidate.strip().upper().replace(" ", "_")
+            if normalized:
+                names.add(normalized)
+    return names
+
+
+def is_retryable_api_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, OSError, socket.timeout)):
+        return True
+
+    status_code = _error_status_code(exc)
+    if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+        return True
+
+    status_names = _error_status_names(exc)
+    if status_names.intersection(
+        {
+            "RESOURCE_EXHAUSTED",
+            "UNAVAILABLE",
+            "INTERNAL",
+            "DEADLINE_EXCEEDED",
+            "ABORTED",
+            "TOO_MANY_REQUESTS",
+            "SERVICE_UNAVAILABLE",
+            "GATEWAY_TIMEOUT",
+            "BAD_GATEWAY",
+        }
+    ):
+        return True
+    return False
+
+
 def is_model_not_found_error(exc: Exception) -> bool:
-    msg = str(exc or "")
-    lowered = msg.lower()
+    status_code = _error_status_code(exc)
+    if status_code == 404:
+        return True
+
+    status_names = _error_status_names(exc)
+    if "NOT_FOUND" in status_names:
+        return True
+
+    msg = str(exc or "").lower()
+    if not msg:
+        return False
     return (
-        "not_found" in lowered
-        or "publisher model" in lowered
-        or "was not found" in lowered
-        or "does not have access to it" in lowered
+        "publisher model" in msg
+        or "was not found" in msg
+        or "does not have access to it" in msg
     )

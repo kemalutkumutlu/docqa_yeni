@@ -4,8 +4,6 @@ Local LLM / VLM backend via Ollama HTTP API.
 This module provides thin wrappers around the Ollama REST API so that:
   - generate_answer_local() can replace Gemini for RAG answer generation
   - extract_text_from_image_local() can replace Gemini VLM for extract-only ingestion
-
-No external dependency beyond `urllib` (stdlib).  Ollama must be running locally.
 """
 from __future__ import annotations
 
@@ -13,11 +11,10 @@ import base64
 import io
 import json
 import time
-import urllib.request
-import urllib.error
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import httpx
 from PIL import Image
 
 
@@ -38,18 +35,27 @@ class OllamaConfig:
     timeout: int = 120
 
 
+_RETRYABLE_OLLAMA_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _ollama_retryable(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_OLLAMA_STATUS_CODES
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError, OSError, TimeoutError))
+
+
 def ollama_is_available(cfg: OllamaConfig) -> tuple[bool, str]:
     """
     Lightweight health check for the local Ollama service.
     Returns (available, detail).
     """
     url = f"{cfg.base_url.rstrip('/')}/api/tags"
-    req = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=min(int(cfg.timeout), 10)) as resp:
-            if 200 <= getattr(resp, "status", 0) < 300:
+        with httpx.Client(timeout=min(int(cfg.timeout), 10), follow_redirects=True) as client:
+            resp = client.get(url)
+            if 200 <= resp.status_code < 300:
                 return True, "ok"
-            return False, f"HTTP {getattr(resp, 'status', 'unknown')}"
+            return False, f"HTTP {resp.status_code}"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
 
@@ -85,24 +91,18 @@ def _ollama_generate(
     if images:
         payload["images"] = images
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
     # Simple retry for transient connection errors (Ollama might be loading a model).
     last_err: Optional[Exception] = None
     for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                return (body.get("response") or "").strip()
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                resp = client.post(url, json=payload)
+                resp.raise_for_status()
+                body = resp.json()
+                return str(body.get("response") or "").strip()
+        except (httpx.HTTPError, OSError, TimeoutError) as e:
             last_err = e
-            if attempt >= 3:
+            if attempt >= 3 or not _ollama_retryable(e):
                 raise
             time.sleep(min(8.0, 1.5 * (2 ** (attempt - 1))))
 
@@ -149,20 +149,21 @@ def _ollama_generate_stream(
 
     for attempt in range(1, 4):
         emitted_any = bool(text_parts)
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
+            with httpx.stream(
+                "POST",
+                url,
+                json=payload,
+                timeout=timeout,
+                follow_redirects=True,
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
                     if not line:
                         continue
                     event = json.loads(line)
-                    token = (event.get("response") or "")
+                    token = str(event.get("response") or "")
                     if token:
                         text_parts.append(token)
                         if on_token:
@@ -171,9 +172,9 @@ def _ollama_generate_stream(
                     if event.get("done"):
                         return "".join(text_parts).strip()
                 return "".join(text_parts).strip()
-        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as e:
+        except (httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as e:
             last_err = e
-            if attempt >= 3 or emitted_any:
+            if attempt >= 3 or emitted_any or not _ollama_retryable(e):
                 raise
             time.sleep(min(8.0, 1.5 * (2 ** (attempt - 1))))
 

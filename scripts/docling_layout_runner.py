@@ -73,7 +73,7 @@ def _resolve_device(device_name: str) -> Any:
         return cleaned
 
 
-def _make_converter(*, image_path: Path, model_name: str, artifacts_path: str, device_name: str):
+def _make_converter(*, source_path: Path, model_name: str, artifacts_path: str, device_name: str):
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
     from docling.document_converter import DocumentConverter
@@ -81,6 +81,7 @@ def _make_converter(*, image_path: Path, model_name: str, artifacts_path: str, d
         from docling.document_converter import ImageFormatOption as DoclingImageFormatOption
     except Exception:
         from docling.document_converter import PdfFormatOption as DoclingImageFormatOption
+    from docling.document_converter import PdfFormatOption
 
     pipeline_options = PdfPipelineOptions()
     for attr_name, attr_value in (
@@ -112,9 +113,10 @@ def _make_converter(*, image_path: Path, model_name: str, artifacts_path: str, d
     converter = DocumentConverter(
         format_options={
             InputFormat.IMAGE: DoclingImageFormatOption(pipeline_options=pipeline_options),
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
         }
     )
-    return converter.convert(source=image_path)
+    return converter.convert(source=source_path)
 
 
 def _iter_pages(document) -> list[tuple[int, Any]]:
@@ -187,10 +189,12 @@ def _collect_rows(
     *,
     image_width: int,
     image_height: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    page_number: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
     page_dims = _page_dimensions(document)
     special_rows: list[dict[str, Any]] = []
     text_rows: list[dict[str, Any]] = []
+    stats = {"special_candidates": 0, "text_candidates": 0}
     collection_specs = (
         ("tables", "table", "docling_table", 0.95, True),
         ("pictures", "picture", "docling_picture", 0.80, True),
@@ -206,6 +210,8 @@ def _collect_rows(
             label = str(getattr(item, "label", "") or default_label).strip().lower() or default_label
             for prov in prov_list:
                 page_no = int(getattr(prov, "page_no", 1) or 1)
+                if page_number is not None and page_no != int(page_number):
+                    continue
                 page_width, page_height = page_dims.get(page_no, (float(image_width), float(image_height)))
                 bbox = _normalize_bbox(
                     getattr(prov, "bbox", None),
@@ -227,10 +233,71 @@ def _collect_rows(
                     "summary_text": text,
                 }
                 if special:
+                    stats["special_candidates"] += 1
                     special_rows.append(row)
                 else:
+                    stats["text_candidates"] += 1
                     text_rows.append(row)
-    return special_rows, text_rows
+    return special_rows, text_rows, stats
+
+
+def _collect_iter_item_rows(
+    document,
+    *,
+    image_width: int,
+    image_height: int,
+    page_number: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    page_dims = _page_dimensions(document)
+    rows: list[dict[str, Any]] = []
+    stats = {"iter_items_seen": 0, "iter_items_kept": 0}
+    seen: set[tuple[int, int, int, int, str]] = set()
+    for item, _level in document.iterate_items():
+        stats["iter_items_seen"] += 1
+        prov_list = getattr(item, "prov", None) or []
+        if not prov_list:
+            continue
+        label = str(getattr(item, "label", "") or "").strip().lower()
+        if label in ("picture", "table", "caption", "footnote", "page_footer", "page_header"):
+            continue
+        crop_type = "docling_block"
+        if "table" in label:
+            crop_type = "docling_table"
+        elif "form" in label or "key" in label or "value" in label:
+            crop_type = "docling_form"
+        text = _text_from_item(item)
+        for prov in prov_list:
+            page_no = int(getattr(prov, "page_no", 1) or 1)
+            if page_number is not None and page_no != int(page_number):
+                continue
+            page_width, page_height = page_dims.get(page_no, (float(image_width), float(image_height)))
+            bbox = _normalize_bbox(
+                getattr(prov, "bbox", None),
+                image_width=image_width,
+                image_height=image_height,
+                page_width=page_width,
+                page_height=page_height,
+            )
+            if bbox is None:
+                continue
+            key = (bbox[0], bbox[1], bbox[2], bbox[3], crop_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "bbox_left": bbox[0],
+                    "bbox_top": bbox[1],
+                    "bbox_right": bbox[2],
+                    "bbox_bottom": bbox[3],
+                    "label": label or "block",
+                    "crop_type": crop_type,
+                    "confidence": 0.58 if crop_type == "docling_block" else 0.74,
+                    "summary_text": text,
+                }
+            )
+            stats["iter_items_kept"] += 1
+    return rows, stats
 
 
 def _x_overlap_ratio(a: dict[str, Any], b: dict[str, Any]) -> float:
@@ -297,33 +364,79 @@ def _merge_text_rows(text_rows: list[dict[str, Any]], *, image_height: int) -> l
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", required=True)
+    parser.add_argument("--source", default="")
+    parser.add_argument("--image", default="")
     parser.add_argument("--output", required=True)
     parser.add_argument("--document-name", default="")
+    parser.add_argument("--page-number", type=int, default=1)
+    parser.add_argument("--image-width", type=int, default=0)
+    parser.add_argument("--image-height", type=int, default=0)
     args = parser.parse_args()
 
-    image_path = Path(args.image)
+    source_arg = (args.source or args.image or "").strip()
+    if not source_arg:
+        raise SystemExit("source path is required")
+    source_path = Path(source_arg)
     output_path = Path(args.output)
-    image = Image.open(image_path)
+    if source_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"):
+        image = Image.open(source_path)
+        image_width = int(image.width)
+        image_height = int(image.height)
+    else:
+        image_width = max(1, int(args.image_width or 0))
+        image_height = max(1, int(args.image_height or 0))
+        if image_width <= 1 or image_height <= 1:
+            raise SystemExit("image width/height are required for non-image sources")
 
     conversion = _make_converter(
-        image_path=image_path,
+        source_path=source_path,
         model_name=(os.getenv("DOCLING_LAYOUT_MODEL", "docling-layout-heron-101") or "docling-layout-heron-101").strip(),
         artifacts_path=(os.getenv("DOCLING_ARTIFACTS_PATH", "") or "").strip(),
         device_name=(os.getenv("DOCLING_DEVICE", "auto") or "auto").strip(),
     )
     document = getattr(conversion, "document", conversion)
-    special_rows, text_rows = _collect_rows(
+    special_rows, text_rows, collect_stats = _collect_rows(
         document,
-        image_width=image.width,
-        image_height=image.height,
+        image_width=image_width,
+        image_height=image_height,
+        page_number=args.page_number,
     )
     rows = list(special_rows)
-    merged_text = _merge_text_rows(text_rows, image_height=image.height)
+    merged_text = _merge_text_rows(text_rows, image_height=image_height)
     if merged_text:
         rows.extend(merged_text[: max(0, 8 - len(rows))])
+    iter_rows: list[dict[str, Any]] = []
+    iter_stats = {"iter_items_seen": 0, "iter_items_kept": 0}
+    if not rows:
+        iter_rows, iter_stats = _collect_iter_item_rows(
+            document,
+            image_width=image_width,
+            image_height=image_height,
+            page_number=args.page_number,
+        )
+        rows.extend(iter_rows[:8])
     rows.sort(key=lambda row: (int(row["bbox_top"]), int(row["bbox_left"])))
-    payload = {"regions": rows[:8], "warnings": []}
+    warnings: list[str] = []
+    if not rows:
+        warnings.append(
+            "Docling debug: page="
+            f"{args.page_number} source={source_path.suffix.lower() or 'unknown'} "
+            f"special={collect_stats['special_candidates']} text={collect_stats['text_candidates']} "
+            f"iter_seen={iter_stats['iter_items_seen']} iter_kept={iter_stats['iter_items_kept']}"
+        )
+    payload = {
+        "regions": rows[:8],
+        "warnings": warnings,
+        "debug": {
+            "page_number": int(args.page_number),
+            "source_suffix": source_path.suffix.lower(),
+            "special_candidates": collect_stats["special_candidates"],
+            "text_candidates": collect_stats["text_candidates"],
+            "iter_items_seen": iter_stats["iter_items_seen"],
+            "iter_items_kept": iter_stats["iter_items_kept"],
+            "returned_regions": len(rows[:8]),
+        },
+    }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
 

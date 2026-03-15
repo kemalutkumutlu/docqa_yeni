@@ -353,6 +353,7 @@ def plan_regions(
     source: VisualRegionSource,
     summary_text: str,
     document_name: str = "",
+    source_document_path: Path | None = None,
     detector_backend: str = "none",
     detector_dir: Path | None = None,
     docai_project_id: str = "",
@@ -389,6 +390,7 @@ def plan_regions(
             page_number=page_number,
             summary_text=summary_text,
             document_name=document_name,
+            source_document_path=source_document_path,
         )
         if detector_regions_available(result.regions):
             width = int(getattr(img, "width", 0) or 0)

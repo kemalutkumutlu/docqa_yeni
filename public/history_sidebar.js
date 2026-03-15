@@ -116,13 +116,31 @@
         color: #e5e7eb;
       }
       #docqa-history-head {
-        padding: 12px;
+        padding: 14px 12px 12px;
         border-bottom: 1px solid rgba(255,255,255,0.08);
       }
+      #docqa-history-brand {
+        display: grid;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      #docqa-history-brand img {
+        width: 118px;
+        height: auto;
+        opacity: 0.96;
+      }
+      #docqa-history-kicker {
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: rgba(142, 232, 220, 0.92);
+      }
       #docqa-history-title {
-        font-size: 14px;
+        font-size: 13px;
         font-weight: 700;
         margin: 0;
+        color: #e5e7eb;
       }
       #docqa-history-list {
         margin: 0;
@@ -431,6 +449,10 @@
     rootEl.id = "docqa-history-panel";
     rootEl.innerHTML = `
       <div id="docqa-history-head">
+        <div id="docqa-history-brand">
+          <img src="/public/logo_brand_white.png" alt="TUSAS" />
+          <div id="docqa-history-kicker">Document QA Workspace</div>
+        </div>
         <div id="docqa-history-title">Gecmis Sohbetler</div>
       </div>
       <div id="docqa-history-empty">Henuz sohbet yok.</div>

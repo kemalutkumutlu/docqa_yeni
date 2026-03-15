@@ -10,8 +10,10 @@ PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Proje, belgeyi
 - OCR backends: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`
 - Layout detector backends: `none`, `sidecar`, `docai`, `docling`
 - Table structure backends: `off`, `auto`, `docai`, `gemini`, `heuristic`
+- PDF text backends: `pymupdf` (default), `docling`, `auto`
 - Processing mode: `classic` veya `multimodal`
 - UI: Chainlit tabanli; `Basic` ve `Advanced` ayar sekmeleri var
+- Desktop UI: sol tarafta custom sohbet gecmisi paneli, sag tarafta custom runtime settings paneli
 
 ## Mimari
 
@@ -64,6 +66,7 @@ Gercek davranis:
 - `PaddleOCR`
 - `Tesseract legacy`
 - `Docling layout detector`
+- `Docling text extraction` (PDF text backend)
 - `Ollama LLM`
 - `Ollama VLM`
 - local `sentence-transformers` embedding
@@ -201,6 +204,25 @@ Docling backend icin:
 - `DOCLING_LAYOUT_MODEL` varsayilan: `docling-layout-heron-101`
 - detector subprocess ile calisir; ana uygulamayi dusurmez
 
+### PDF text backend
+
+PDF metin cikarimi icin kullanilan backend secimi:
+
+- `pymupdf` (default): PyMuPDF ile hizli metin cikarimi
+- `docling`: Docling ile yapisal metin + tablo markdown cikarimi
+- `auto`: `DOCLING_PYTHON_BIN` ayarliysa Docling kullanir, degilse PyMuPDF
+
+Secim icin:
+
+- `PDF_TEXT_BACKEND=docling` `.env` dosyasina eklenebilir
+- veya UI Advanced ayarlarindan runtime'da degistirilebilir
+
+Not:
+
+- `docling` secilirse `DOCLING_PYTHON_BIN` ile ayri bir venv gosterilmesi gerekir (`.venv-docling`)
+- Docling PDF uzerinde tablo yapisini markdown olarak cikarir; ayri table structure stage'ine gerek kalmaz
+- Docling kazandigi sayfalarda OCR tetiklenmez
+
 ### Table structure
 
 Table stage artik ayri bir katmandir.
@@ -219,15 +241,18 @@ Chainlit UI su an:
 
 - chat/doc modlarini destekler
 - birden fazla belgeyi ayni session icinde tutabilir
-- `Basic` ve `Advanced` settings sekmeleri sunar
+- desktop'ta custom `Basic` ve `Advanced` settings paneli sunar
 - `Runtime Preset` ile hazir kombinasyon secilebilir
 - disabled alanlarla bagimliliklari gorunur hale getirir
+- `Current Draft`, `Applied Pipeline`, `Fallback Notes` ve `Document Context` ozet kartlari vardir
+- onceki ayri `Belge Durumu` element sidebar'i kaldirilmistir; belge baglami runtime paneline tasinmistir
+- sol sohbet panelinde TUSAS markalama alani bulunur
 
 Onemli sinir:
 
-- Chainlit `ChatSettings` paneli degisiklikleri backend'e `Confirm` ile yollar
-- yani ayar zinciri secim aninda backend tarafinda yeniden hesaplanmaz
-- sekmeler anlik gorunur, fakat pipeline degisikligi `Confirm` sonrasi uygulanir
+- custom runtime panel degisiklikleri backend'e `Apply` ile yollar
+- draft secimleri panel icinde hemen gorunur, ancak pipeline sadece `Apply` sonrasi degisir
+- mode/backend degisikligi mevcut yuklu belgeleri geriye donuk degistirmez; gerekirse belge yeniden yuklenmelidir
 
 Detay icin: `chainlit.md`
 
@@ -272,6 +297,7 @@ En kritik alanlar:
 - `TABLE_STRUCTURE_BACKEND`
 - `VLM_MODE`
 - `VLM_PROVIDER`
+- `PDF_TEXT_BACKEND` (opsiyonel, default: `pymupdf`)
 
 Google kullaniyorsan:
 
@@ -345,6 +371,7 @@ chainlit.md
 
 scripts/
   docling_layout_runner.py
+  docling_text_runner.py
   generate_layout_sidecar.py
   inspect_regions.py
   paddle_ocr_runner.py
@@ -373,4 +400,3 @@ Proje bugun itibariyla "tek bir sade RAG" olmaktan cikmis durumda; artik OCR, la
 - once profil/preset sec
 - sonra belgeyi yukle
 - mode veya backend degisirse belgeyi yeniden yukle
-

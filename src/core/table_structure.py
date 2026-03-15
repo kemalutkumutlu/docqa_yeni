@@ -9,9 +9,6 @@ import re
 from typing import Literal, Optional
 
 from PIL import Image
-from google.genai import types
-
-from .gemini_client import build_gemini_client, gemini_model_candidates, is_model_not_found_error
 from .models import Chunk, IngestResult, StructuredTable, TableCell, VisualAsset
 
 
@@ -44,6 +41,14 @@ Rules:
 - If the table has merged cells, duplicate the visible value into affected cells.
 - Return strict JSON matching the provided schema.
 """
+
+
+def _gemini_helpers():
+    from google.genai import types
+
+    from .gemini_client import build_gemini_client, gemini_model_candidates, is_model_not_found_error
+
+    return types, build_gemini_client, gemini_model_candidates, is_model_not_found_error
 
 
 @dataclass(frozen=True)
@@ -270,6 +275,7 @@ def _extract_via_docai(asset: VisualAsset, cfg: TableStructureConfig) -> Structu
 
 
 def _extract_via_gemini(asset: VisualAsset, cfg: TableStructureConfig) -> StructuredTable:
+    types, build_gemini_client, gemini_model_candidates, is_model_not_found_error = _gemini_helpers()
     img_bytes = Path(asset.image_path).read_bytes()
     last_error: Exception | None = None
     model_name = (cfg.gemini_model or "").strip()
