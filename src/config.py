@@ -11,7 +11,7 @@ import os
 
 LLMProvider = Literal["none", "openai", "gemini", "local"]
 VLMProvider = Literal["gemini", "local"]
-VLMMode = Literal["off", "auto", "force"]
+VLMMode = Literal["off", "auto", "smart", "force"]
 OCRBackend = Literal["docai", "paddle_vl", "paddle", "tesseract_legacy"]
 VisualChunkLevel = Literal["page", "region"]
 VisualRegionSource = Literal["heuristic", "detector"]
@@ -27,6 +27,7 @@ class Settings:
     llm_provider: LLMProvider
     openai_api_key: str
     openai_model: str
+    openai_base_url: str
     gemini_api_key: str
     gemini_model: str
     gemini_fallback_model: str
@@ -122,7 +123,7 @@ def load_settings() -> Settings:
     # VLM: keep UI behavior by default (force, 25 pages), but allow env override.
     vlm_mode_raw = os.getenv("VLM_MODE", "force").strip().lower()
     vlm_mode: VLMMode = "force"
-    if vlm_mode_raw in ("off", "auto", "force"):
+    if vlm_mode_raw in ("off", "auto", "smart", "force"):
         vlm_mode = vlm_mode_raw  # type: ignore[assignment]
 
     try:
@@ -254,6 +255,7 @@ def load_settings() -> Settings:
         llm_provider=llm_provider,
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
         gemini_fallback_model=(os.getenv("GEMINI_FALLBACK_MODEL", "") or "").strip(),
