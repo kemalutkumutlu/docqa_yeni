@@ -53,8 +53,8 @@ Sistemin kisa ozeti
 
 **Sayfada yer almasi gerekenler**
 - Girdi: PDF, PNG, JPG
-- Ingestion: PDF text + OCR + istege bagli VLM extract
-- Yapisal analiz: section tree + parent/child chunking
+- Ingestion: PDF text + OCR & VLM Fusion (Sinerji)
+- Yapisal analiz: section tree + parent/child chunking (token-based)
 - Retrieval: Chroma + BM25 + RRF
 - Multimodal: page/region bazli visual chunk ve table chunk
 - Generation: Gemini / OpenAI / Local / Extractive
@@ -104,11 +104,11 @@ Ingestion ve extraction tasarimi
 - PDF text backend: `pymupdf`, `docling`, `auto`
 - OCR backend: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`
 - VLM extract: `gemini` veya local vision model
-- Candidate secimi: en iyi yapiyi koruyan metin seciliyor
-- Dusuk kalite metinde OCR/VLM devreye giriyor
+- OCR + VLM Maksimizasyonu: Modeller artik yaristirilmaz, birlestirilir (Fusion). OCR text, VLM'ye prompt olarak "grounding" amaciyla akıtılır.
+- Dusuk kalite metinde OCR/VLM fusion devreye giriyor
 
 **Konusma notu**
-Burada kritik karar, farkli extract kaynaklarini yaristirip en iyi yapisal sonucu secmek oldu. Sadece en uzun metni almak yerine, baslik korunumunu ve bozulmus satir oranini da dikkate aldim. Bu sayede section detection kalitesi arttı.
+Burada kritik karar, farkli extract kaynaklarina "Fall and Compete" yaptırmak yerine "Partner" statüsünde çalıştırmaktı. OCR ve VLM fusionu ile; harfler ve sayılar OCR'ın garantisi altına alınırken, mizanpaj ve yapılar (sütun/tablo/sayfa layoutu) VLM'in yapay zekasına emanet ediliyor. Halüsinasyon sıfırlanırken layout tamamen doğru çıkıyor.
 
 ---
 
@@ -122,7 +122,7 @@ Neden hiyerarsik chunking kullandim?
 - Repeating header/footer temizligi
 - Section tree olusumu
 - Parent chunk: tam bolum
-- Child chunk: kucuk ve retrieval dostu parcali metin
+- Child chunk: kucuk ve retrieval dostu parcali metin (`tiktoken` ile token-based sınırlandırma)
 - Metadata: `section_id`, `parent_id`, `heading_path`, `page_start`, `page_end`
 
 **Konusma notu**

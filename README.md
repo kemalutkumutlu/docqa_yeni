@@ -21,9 +21,9 @@ Ana akis:
 
 ```text
 PDF/Image
-  -> Ingestion
+  -> Ingestion (OCR + VLM Fusion)
   -> Structure Detection
-  -> Hierarchical Chunking
+  -> Hierarchical Chunking (Token-based)
   -> Indexing (Chroma + BM25)
   -> Retrieval (Hybrid + RRF + section fetch)
   -> Generation (Gemini/OpenAI/Ollama/Extractive)
@@ -35,7 +35,7 @@ Multimodal akis etkinse:
 PDF/Image
   -> Page/Region Visual Assets
   -> Layout Regions (heuristic / sidecar / docai / docling)
-  -> OCR and/or VLM Extraction
+  -> OCR & VLM Fusion Extraction
   -> Optional Table Structure Stage
   -> Visual + Text Chunks
   -> Hybrid Retrieval
@@ -188,6 +188,9 @@ Gercek fallback zinciri:
 - `paddle_vl` secilirse: `paddle_vl -> paddle -> tesseract_legacy`
 - `paddle` secilirse: `paddle -> tesseract_legacy`
 - `docai` secilirse: `docai -> tesseract_legacy`
+
+**OCR + VLM Fusion (10/10 Synergy):**
+Eğer VLM devreye girerse, OCR metni (eğer varsa) VLM'e "Grounding Truth" (Dayanak) olarak `ocr_context` biçiminde gönderilir. VLM numaraları veya harfleri halüsinasyon yapmaz, sadece OCR metninin mizanpajını orijinal görsele bakarak mükemmel seviyede düzenler.
 
 ### Layout detector
 

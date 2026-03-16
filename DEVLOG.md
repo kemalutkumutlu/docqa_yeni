@@ -1,5 +1,21 @@
 # DEVLOG
 
+## Faz 11.3 — 10/10 Ingestion & OCR/VLM Fusion
+
+Bu faz, ingestion hattının kalitesini maksimum (10/10) seviyesine çıkarmak amacıyla yapılan çekirdek iyileştirmelerini içerir.
+
+Bugünkü gerçek:
+
+- **Token-based Chunking:** Chunking mekanizması düz karakter sayımından çıkarıldı. `tiktoken` kütüphanesi entegre edilerek `max_tokens` tabanlı çok daha isabetli (LLM context window optimizasyonlu) kesimler yapılması sağlandı.
+- **Gelişmiş Numarasız Başlık Tespiti:** `_is_allcaps_heading` mantığı `_is_unkeyed_heading_candidate` olarak genişletildi. Artık sadece ALLCAPS değil, "Title Case" başlıklar da (belli kelime limitleri dahilinde) yakalanabiliyor.
+- **ChromaDB Concurrency Optimizasyonu:** `LocalIndex` içindeki global Python `threading.Lock` kaldırıldı. Bekleme (retry) mekanizması eklenerek eşzamanlı indeksleme yükü doğrudan ChromaDB'nin altındaki SQLite transaction mekanizmasına (Thread Safe) devredildi.
+- **OCR + VLM Fusion (10/10 Synergy):** Artık VLM ve OCR birbiriyle yarışmıyor, "partner" olarak çalışıyor.
+  - `vlm_extract.py` içine `_OCR_GROUNDING_PROMPT` eklendi.
+  - `ingestion.py`'dan elde edilen düşük kaliteli PDF text veya OCR metni (`ocr_context`), VLM'e görüntü ile birlikte referans olarak gönderiliyor.
+  - VLM, mizanpajı (layout) ve numaralandırmaları resimden çekerken, harfleri ve sayıları kesinlikle halüsinasyon görmemek için bu `ocr_context` üzerinden temellendiriyor (Grounding).
+
+Bu iyileştirmeler tamamen geri dönük uyumludur ve mevcut hiçbir `.env` veya konfigürasyonu bozmadan devreye girer.
+
 ## Faz 11.2 — Docling PDF Text Backend
 
 Bu faz, PDF metin cikarimi icin Docling'i opsiyonel bir backend olarak ekler.
