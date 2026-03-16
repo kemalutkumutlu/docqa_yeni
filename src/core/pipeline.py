@@ -771,7 +771,7 @@ class RAGPipeline:
         vlm_after = vlm_before
         if gemini_model_next and getattr(vlm_after, "model", "") != gemini_model_next:
             vlm_after = replace(vlm_after, model=gemini_model_next)
-        if vlm_mode in ("off", "auto", "force"):
+        if vlm_mode in ("off", "auto", "smart", "force"):
             vlm_after = replace(vlm_after, mode=vlm_mode)
         if vlm_provider in ("gemini", "local"):
             vlm_after = replace(vlm_after, provider=vlm_provider)

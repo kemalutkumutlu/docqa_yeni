@@ -946,7 +946,7 @@ _EMBEDDING_MODEL_PRESETS = [
     "intfloat/multilingual-e5-base",
 ]
 _EMBEDDING_DEVICE_VALUES = ["auto", "cpu", "cuda"]
-_VLM_MODE_VALUES = ["off", "auto", "force"]
+_VLM_MODE_VALUES = ["off", "auto", "smart", "force"]
 _VLM_PROVIDER_VALUES = ["gemini", "local"]
 _VLM_MAX_PAGES_LIMIT = 200
 _VLM_MAX_PAGES_DEFAULT = 25

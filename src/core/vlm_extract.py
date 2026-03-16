@@ -15,7 +15,8 @@ class VLMConfig:
     mode:
       - "off": never call VLM
       - "auto": call VLM only when text quality is low
-      - "force": always call VLM (expensive)
+      - "smart": call VLM when text quality is low OR page has visual content (images/charts)
+      - "force": always call VLM on every page (expensive)
 
     provider:
       - "gemini": use Google Gemini API (default, backward compatible)

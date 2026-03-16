@@ -23,6 +23,29 @@ from .utils import normalize_whitespace, sha256_file
 from .vlm_extract import VLMConfig, extract_text_from_image
 
 
+def _page_is_visual_heavy(page: "fitz.Page", *, image_area_threshold: float = 0.10) -> bool:
+    """
+    Returns True if the page contains significant visual content (images, charts, etc.).
+    Uses PyMuPDF image bounding boxes to compute image-area / page-area ratio.
+    Threshold default 10% — pages with a small logo are not considered visual-heavy.
+    """
+    try:
+        images = page.get_images(full=True)
+        if not images:
+            return False
+        page_area = page.rect.width * page.rect.height
+        if page_area <= 0:
+            return False
+        total_img_area = 0.0
+        for img in images:
+            xref = img[0]
+            for rect in page.get_image_rects(xref):
+                total_img_area += rect.width * rect.height
+        return (total_img_area / page_area) >= image_area_threshold
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _text_quality_low(text: str) -> bool:
     """
     Document-agnostic heuristic to decide whether extracted text is low quality.
@@ -624,7 +647,13 @@ def ingest_pdf(
                 getattr(vlm, "provider", "gemini") == "local" or bool(getattr(vlm, "api_key", ""))
             ):
                 try:
-                    should_vlm = vlm.mode == "force" or (vlm.mode == "auto" and _text_quality_low(text_norm))
+                    should_vlm = (
+                        vlm.mode == "force"
+                        or (vlm.mode == "auto" and _text_quality_low(text_norm))
+                        or (vlm.mode == "smart" and (
+                            _text_quality_low(text_norm) or _page_is_visual_heavy(page)
+                        ))
+                    )
                     if should_vlm:
                         pix = page.get_pixmap(dpi=200)
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
