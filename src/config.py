@@ -12,7 +12,7 @@ import os
 LLMProvider = Literal["none", "openai", "gemini", "local"]
 VLMProvider = Literal["gemini", "local"]
 VLMMode = Literal["off", "auto", "smart", "force"]
-OCRBackend = Literal["docai", "paddle_vl", "paddle", "tesseract_legacy"]
+OCRBackend = Literal["docai", "paddle_vl", "paddle", "tesseract_legacy", "smart"]
 VisualChunkLevel = Literal["page", "region"]
 VisualRegionSource = Literal["heuristic", "detector"]
 VisualDetectorBackend = Literal["none", "sidecar", "docai", "docling"]
@@ -109,7 +109,7 @@ def load_settings() -> Settings:
     ocr_backend_raw = (os.getenv("OCR_BACKEND", "docai") or "docai").strip().lower()
     ocr_backend: OCRBackend = (
         ocr_backend_raw  # type: ignore[assignment]
-        if ocr_backend_raw in ("docai", "paddle_vl", "paddle", "tesseract_legacy")
+        if ocr_backend_raw in ("docai", "paddle_vl", "paddle", "tesseract_legacy", "smart")
         else "docai"
     )
     ocr_lang = (os.getenv("OCR_LANG", "tur+eng") or "tur+eng").strip()
@@ -176,7 +176,7 @@ def load_settings() -> Settings:
     docling_device_raw = (os.getenv("DOCLING_DEVICE", "auto") or "auto").strip().lower()
     docling_device = docling_device_raw if docling_device_raw in ("auto", "cpu", "cuda", "mps", "xpu") else "auto"
     pdf_text_backend_raw = (os.getenv("PDF_TEXT_BACKEND", "pymupdf") or "pymupdf").strip().lower()
-    pdf_text_backend = pdf_text_backend_raw if pdf_text_backend_raw in ("auto", "pymupdf", "docling") else "pymupdf"
+    pdf_text_backend = pdf_text_backend_raw if pdf_text_backend_raw in ("auto", "pymupdf", "docling", "smart") else "pymupdf"
     table_structure_enabled_raw = (os.getenv("TABLE_STRUCTURE_ENABLED", "0") or "0").strip().lower()
     table_structure_enabled = table_structure_enabled_raw in ("1", "true", "yes", "y", "on")
     table_structure_backend_raw = (os.getenv("TABLE_STRUCTURE_BACKEND", "auto") or "auto").strip().lower()

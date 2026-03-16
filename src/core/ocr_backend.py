@@ -73,6 +73,10 @@ def ocr_image_text(
     image_kind: str,
 ) -> OCRResult:
     backend = (cfg.backend or "tesseract_legacy").strip().lower()
+    # "smart" should have been resolved to a concrete backend in ingestion.py before
+    # reaching here; fall back to paddle_vl if it somehow arrives unresolved.
+    if backend == "smart":
+        backend = "paddle_vl"
     if backend == "docai":
         return _ocr_with_docai_or_fallback(
             img,

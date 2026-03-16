@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 import re
@@ -460,6 +460,30 @@ class DoclingTextConfig:
     device: str = "auto"
     do_table_structure: bool = True
     timeout: int = 300                                       # subprocess timeout in seconds
+    smart: bool = False  # skip subprocess if PyMuPDF quality is already sufficient
+
+
+def _docling_smart_should_run(pdf: "fitz.Document", sample_pages: int = 3) -> bool:
+    """
+    Check if running Docling is worth the subprocess overhead.
+    Samples up to `sample_pages` pages with PyMuPDF; if most already have
+    good-quality text, Docling is skipped.
+    Returns True when Docling should run, False when PyMuPDF is sufficient.
+    """
+    good = 0
+    checked = 0
+    for i in range(min(sample_pages, pdf.page_count)):
+        try:
+            text = normalize_whitespace(pdf.load_page(i).get_text("text") or "")
+            if len(text) >= 40 and not _text_quality_low(text):
+                good += 1
+            checked += 1
+        except Exception:  # noqa: BLE001
+            checked += 1
+    if checked == 0:
+        return True
+    # Run Docling only when fewer than 70% of sampled pages have good quality.
+    return (good / checked) < 0.70
 
 
 def _docling_text_env(cfg: DoclingTextConfig) -> dict[str, str]:
@@ -579,12 +603,17 @@ def ingest_pdf(
     # ── Optional Docling text extraction (runs once for whole PDF) ───────────
     docling_page_texts: dict[int, str] = {}
     if docling_text is not None:
-        try:
-            docling_page_texts = _docling_extract_page_texts(path, docling_text)
-            if not docling_page_texts:
-                warnings.append("Docling PDF metin çıkarma sonuç vermedi; PyMuPDF kullanılıyor.")
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"Docling PDF metin çıkarma başarısız: {e}")
+        # Smart mode: skip subprocess if PyMuPDF quality is already sufficient.
+        _run_docling = not docling_text.smart or _docling_smart_should_run(pdf)
+        if not _run_docling:
+            warnings.append("Docling smart: PyMuPDF kalitesi yeterli, Docling atlandi.")
+        else:
+            try:
+                docling_page_texts = _docling_extract_page_texts(path, docling_text)
+                if not docling_page_texts:
+                    warnings.append("Docling PDF metin çıkarma sonuç vermedi; PyMuPDF kullanılıyor.")
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"Docling PDF metin çıkarma başarısız: {e}")
 
     try:
         vlm_pages_used = 0
@@ -617,11 +646,19 @@ def ingest_pdf(
             )
             if should_try_ocr:
                 try:
+                    # OCR smart routing: fully scanned page → docai (heavy, accurate)
+                    #                    partial quality page  → paddle_vl (light, fast)
+                    _ocr_cfg = ocr
+                    if (ocr.backend or "").strip().lower() == "smart":
+                        if len(pdf_text_raw.strip()) < 40:
+                            _ocr_cfg = replace(ocr, backend="docai")
+                        else:
+                            _ocr_cfg = replace(ocr, backend="paddle_vl")
                     pix = page.get_pixmap(dpi=200)  # good speed/quality tradeoff
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_result = ocr_image_text(
                         img,
-                        cfg=ocr,
+                        cfg=_ocr_cfg,
                         document_name=file_name,
                         page_number=page_no,
                         image_kind="pdf_page",

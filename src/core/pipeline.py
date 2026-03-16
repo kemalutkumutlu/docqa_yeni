@@ -627,6 +627,7 @@ class RAGPipeline:
             artifacts_path=self.docling_artifacts_path,
             device=(self.docling_device or "auto").strip(),
             do_table_structure=True,
+            smart=backend == "smart",
         )
 
     def reconfigure_runtime(
@@ -788,7 +789,7 @@ class RAGPipeline:
 
         pdf_text_backend_changed = False
         pdf_backend_next = (pdf_text_backend or "").strip().lower()
-        if pdf_backend_next in ("auto", "pymupdf", "docling") and pdf_backend_next != self.pdf_text_backend:
+        if pdf_backend_next in ("auto", "pymupdf", "docling", "smart") and pdf_backend_next != self.pdf_text_backend:
             self.pdf_text_backend = pdf_backend_next
             pdf_text_backend_changed = True
 
