@@ -54,6 +54,7 @@ def _gemini_helpers():
 @dataclass(frozen=True)
 class TableStructureConfig:
     enabled: bool = False
+    smart: bool = False  # only run external extraction on OCR/VLM pages (not native PDF)
     backend: TableStructureBackend = "auto"
     min_confidence: float = 0.55
     gemini_api_key: str = ""

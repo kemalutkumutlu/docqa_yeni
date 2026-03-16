@@ -346,7 +346,8 @@ class RAGPipeline:
             vlm=self.vlm_config,
             table_config=self.table_structure_config,
             multimodal=MultimodalConfig(
-                enabled=self.processing_mode == "multimodal",
+                enabled=self.processing_mode in ("multimodal", "smart"),
+                smart_mode=self.processing_mode == "smart",
                 assets_dir=assets_dir,
                 chunk_level=self.visual_chunk_level,
                 region_source=self.visual_region_source,
@@ -368,7 +369,7 @@ class RAGPipeline:
         root = build_section_tree(ingest)
         _progress("Chunk'lar olusturuluyor...")
         chunks = section_tree_to_chunks(ingest, root)
-        if self.processing_mode == "multimodal":
+        if self.processing_mode in ("multimodal", "smart"):
             chunks.extend(visual_chunks_from_ingest(ingest))
         chunks.extend(table_chunks_from_ingest(ingest))
 
@@ -641,6 +642,7 @@ class RAGPipeline:
         visual_region_source: Optional[str] = None,
         visual_detector_backend: Optional[str] = None,
         table_structure_enabled: Optional[bool] = None,
+        table_structure_smart: Optional[bool] = None,
         table_structure_backend: Optional[str] = None,
         llm_provider: Optional[str] = None,
         gemini_model: Optional[str] = None,
@@ -681,7 +683,7 @@ class RAGPipeline:
 
         processing_mode_changed = False
         mode_next = (processing_mode or "").strip().lower()
-        if mode_next in ("classic", "multimodal") and mode_next != self.processing_mode:
+        if mode_next in ("classic", "multimodal", "smart") and mode_next != self.processing_mode:
             self.processing_mode = mode_next
             processing_mode_changed = True
 
@@ -723,6 +725,8 @@ class RAGPipeline:
         table_after = self.table_structure_config
         if table_structure_enabled is not None and bool(table_structure_enabled) != bool(getattr(table_after, "enabled", False)):
             table_after = replace(table_after, enabled=bool(table_structure_enabled))
+        if table_structure_smart is not None and bool(table_structure_smart) != bool(getattr(table_after, "smart", False)):
+            table_after = replace(table_after, smart=bool(table_structure_smart))
         table_backend_next = (table_structure_backend or "").strip().lower()
         if table_backend_next in ("off", "auto", "docai", "gemini", "heuristic") and table_backend_next != getattr(table_after, "backend", "auto"):
             table_after = replace(table_after, backend=table_backend_next)

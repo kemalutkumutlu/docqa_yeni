@@ -18,7 +18,7 @@ VisualRegionSource = Literal["heuristic", "detector"]
 VisualDetectorBackend = Literal["none", "sidecar", "docai", "docling"]
 TableStructureBackend = Literal["off", "auto", "docai", "gemini", "heuristic"]
 EmbeddingDevice = Literal["auto", "cpu", "cuda"]
-ProcessingMode = Literal["classic", "multimodal"]
+ProcessingMode = Literal["classic", "multimodal", "smart"]
 MultimodalAnswerMode = Literal["off", "auto", "on"]
 
 
@@ -220,7 +220,7 @@ def load_settings() -> Settings:
     processing_mode_raw = (os.getenv("DOC_PROCESSING_MODE", "classic") or "classic").strip().lower()
     processing_mode: ProcessingMode = (
         processing_mode_raw  # type: ignore[assignment]
-        if processing_mode_raw in ("classic", "multimodal")
+        if processing_mode_raw in ("classic", "multimodal", "smart")
         else "classic"
     )
 

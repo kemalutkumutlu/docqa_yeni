@@ -9,6 +9,7 @@ from .models import Chunk, IngestResult
 @dataclass(frozen=True)
 class MultimodalConfig:
     enabled: bool = False
+    smart_mode: bool = False  # only create visual assets for visually-heavy pages
     assets_dir: Path | None = None
     attach_images_to_generation: bool = True
     chunk_level: str = "page"

@@ -922,7 +922,8 @@ _CHAT_HISTORY_KEY = "recent_user_messages"
 _CHAT_HISTORY_MAX = 12
 _RUNTIME_OVERRIDES_KEY = "runtime_overrides"
 _RUNTIME_PRESET_VALUES = ["custom", "online_best", "hybrid_best", "local_best", "fast"]
-_PROCESSING_MODE_VALUES = ["classic", "multimodal"]
+_PROCESSING_MODE_VALUES = ["classic", "multimodal", "smart"]
+_TABLE_STRUCTURE_MODE_VALUES = ["off", "on", "smart"]
 _MULTIMODAL_ANSWER_MODE_VALUES = ["off", "auto", "on"]
 _VISUAL_CHUNK_LEVEL_VALUES = ["page", "region"]
 _VISUAL_REGION_SOURCE_VALUES = ["heuristic", "detector"]
@@ -1154,12 +1155,12 @@ def _runtime_dependency_flags(
     embedding_model_choice: str,
     vlm_mode: str,
 ) -> dict[str, bool]:
-    multimodal_active = processing_mode == "multimodal"
+    multimodal_active = processing_mode in ("multimodal", "smart")
     region_mode_active = multimodal_active and visual_chunk_level == "region"
     detector_mode_active = region_mode_active and visual_region_source == "detector"
     ocr_active = ocr_enabled == "on"
     table_stage_available = multimodal_active
-    table_active = table_stage_available and table_enabled == "on"
+    table_active = table_stage_available and table_enabled in ("on", "smart")
     llm_active = llm_provider != "none"
     llm_supports_multimodal_answer = llm_provider == "gemini"
     embedding_device_relevant = not str(embedding_model_choice or "").strip().lower().startswith("gemini-embedding-")
@@ -1566,7 +1567,7 @@ def _settings_sidebar_payload(pipeline: RAGPipeline) -> dict[str, Any]:
                 "visual_region_source": list(_VISUAL_REGION_SOURCE_VALUES),
                 "visual_detector_backend": list(_VISUAL_DETECTOR_BACKEND_VALUES),
                 "pdf_text_backend": list(_PDF_TEXT_BACKEND_VALUES),
-                "table_structure_enabled": list(_TOGGLE_VALUES),
+                "table_structure_enabled": list(_TABLE_STRUCTURE_MODE_VALUES),
                 "table_structure_backend": list(_TABLE_STRUCTURE_BACKEND_VALUES),
                 "multimodal_answer_mode": list(_MULTIMODAL_ANSWER_MODE_VALUES),
                 "vlm_max_pages": {
@@ -1660,9 +1661,11 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
         _OCR_BACKEND_VALUES,
         getattr(ocr_cfg, "backend", "docai"),
     )
-    table_enabled_current = _normalize_toggle_value(
-        _get_runtime_value("table_structure_enabled", "on" if getattr(table_cfg, "enabled", False) else "off"),
-        "on" if getattr(table_cfg, "enabled", False) else "off",
+    _table_default = ("smart" if getattr(table_cfg, "smart", False) else "on") if getattr(table_cfg, "enabled", False) else "off"
+    table_enabled_current = _sanitize_select_value(
+        _get_runtime_value("table_structure_enabled", _table_default),
+        _TABLE_STRUCTURE_MODE_VALUES,
+        _table_default,
     )
     table_backend_current = _sanitize_select_value(
         _get_runtime_value("table_structure_backend", getattr(table_cfg, "backend", "auto")),
@@ -1693,12 +1696,12 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
         0,
         _VLM_MAX_PAGES_LIMIT,
     )
-    multimodal_active = processing_mode_current == "multimodal"
+    multimodal_active = processing_mode_current in ("multimodal", "smart")
     region_mode_active = multimodal_active and visual_chunk_level_current == "region"
     detector_mode_active = region_mode_active and visual_region_source_current == "detector"
     ocr_active = ocr_enabled_current == "on"
     table_stage_available = multimodal_active
-    table_active = table_enabled_current == "on" and table_stage_available
+    table_active = table_enabled_current in ("on", "smart") and table_stage_available
     llm_active = llm_provider_current != "none"
     llm_supports_multimodal_answer = llm_provider_current == "gemini"
     vlm_active = vlm_mode_current != "off"
@@ -1829,9 +1832,9 @@ def _settings_widgets(pipeline: RAGPipeline) -> list:
         Select(
             id="table_structure_enabled",
             label="Table Structure",
-            values=_TOGGLE_VALUES,
+            values=_TABLE_STRUCTURE_MODE_VALUES,
             initial_value=table_enabled_current,
-            description="Tablo gorunen regionlarda yapisal table extraction katmanini acip kapatir.",
+            description="on: her sayfada calisir. smart: sadece taranmis/OCR sayfalarda calisir (native PDF tablolari zaten islenir).",
             disabled=not table_stage_available,
         )
     )
@@ -2006,10 +2009,8 @@ def _apply_runtime_overrides_to_pipeline(pipeline: RAGPipeline) -> None:
             _VISUAL_DETECTOR_BACKEND_VALUES,
             getattr(pipeline, "visual_detector_backend", "none"),
         ),
-        table_structure_enabled=_toggle_to_bool(
-            overrides.get("table_structure_enabled"),
-            bool(getattr(getattr(pipeline, "table_structure_config", None), "enabled", False)),
-        ),
+        table_structure_enabled=overrides.get("table_structure_enabled", "off") in ("on", "smart"),
+        table_structure_smart=overrides.get("table_structure_enabled") == "smart",
         table_structure_backend=_sanitize_select_value(
             overrides.get("table_structure_backend"),
             _TABLE_STRUCTURE_BACKEND_VALUES,
@@ -2375,9 +2376,10 @@ async def _apply_runtime_settings(
         _OCR_BACKEND_VALUES,
         getattr(current_ocr, "backend", "docai"),
     )
-    selected_table_enabled = _normalize_toggle_value(
+    selected_table_enabled = _sanitize_select_value(
         values.get("table_structure_enabled"),
-        "on" if getattr(current_table, "enabled", False) else "off",
+        _TABLE_STRUCTURE_MODE_VALUES,
+        ("smart" if getattr(current_table, "smart", False) else "on") if getattr(current_table, "enabled", False) else "off",
     )
     selected_table_backend = _sanitize_select_value(
         values.get("table_structure_backend"),
@@ -2518,7 +2520,8 @@ async def _apply_runtime_settings(
         visual_chunk_level=selected_visual_chunk_level,
         visual_region_source=selected_visual_region_source,
         visual_detector_backend=selected_visual_detector_backend,
-        table_structure_enabled=_toggle_to_bool(selected_table_enabled, getattr(current_table, "enabled", False)),
+        table_structure_enabled=selected_table_enabled in ("on", "smart"),
+        table_structure_smart=selected_table_enabled == "smart",
         table_structure_backend=selected_table_backend,
         llm_provider=resolved_llm_provider,
         gemini_model=gemini_model_next,

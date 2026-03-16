@@ -688,13 +688,17 @@ def ingest_pdf(
                     source=source,  # type: ignore[arg-type]
                 )
             )
+            # Processing smart mode: skip visual assets for non-visual pages.
+            _effective_multimodal = multimodal
+            if multimodal and getattr(multimodal, "smart_mode", False) and not _page_is_visual_heavy(page):
+                _effective_multimodal = None
             assets, asset_warnings = _pdf_page_visual_assets(
                 page,
                 ingest_doc_id=doc_id,
                 file_name=file_name,
                 page_number=page_no,
                 summary_text=text_norm,
-                multimodal=multimodal,
+                multimodal=_effective_multimodal,
                 source_document_path=path,
             )
             if asset_warnings:
@@ -706,7 +710,13 @@ def ingest_pdf(
     finally:
         pdf.close()
     if table_config is not None:
-        structured_tables, table_warnings = extract_tables_from_assets(visual_assets, cfg=table_config)
+        # Table smart mode: skip external extraction for pages with native PDF text layer
+        # (PyMuPDF find_tables already handled them). Only run on OCR/VLM pages.
+        table_assets = visual_assets
+        if getattr(table_config, "smart", False):
+            ocr_pages = {p.page_number for p in pages if p.source not in ("pdf_text", "docling_text")}
+            table_assets = [a for a in visual_assets if a.page_number in ocr_pages]
+        structured_tables, table_warnings = extract_tables_from_assets(table_assets, cfg=table_config)
         for warning in table_warnings:
             if warning not in warnings:
                 warnings.append(warning)
