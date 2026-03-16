@@ -33,19 +33,24 @@ async def main():
     print("Ingesting...")
     pipe.add_document(doc_path, "Case_Study_20260205.pdf")
     print("Retrieving...")
-    ret = pipe.get_retrieval("Fonksiyonel gereksinimler nelerdir")
-    print(ret)
+    ret = pipe.get_retrieval("Teslimatlar nelerdir")
+    print("Evidences format for section_list:")
+    for ev in ret.evidences:
+        if ev.kind == "parent":
+            print(f"PARENT TEXT:\n{ev.text}")
+            
     print("Generating...")
     # we need an async call for generation usually or if it's sync, let's look at pipeline
     try:
         from src.core.generation import Generator
         gen = Generator(settings)
         res = await gen.generate_answer(
-            query="Fonksiyonel gereksinimler nelerdir",
+            query="Teslimatlar nelerdir",
             retrieval_result=ret,
             document_context="",
             chat_history=[]
         )
+        print("DONE", res.answer)
         print("DONE", res.answer)
     except Exception as e:
         import traceback

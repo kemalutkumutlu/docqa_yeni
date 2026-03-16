@@ -189,6 +189,9 @@ from .prompts import (
     chat_style_addendum,
 )
 
+_COMPLETE_ENDINGS = (".", "!", "?", '."', '!"', '?"')
+_INCOMPLETE_ENDINGS = (",", " ve", " ile", " veya", " çünkü", " ama", " fakat", " Ancak", " Ayrıca")
+
 def _response_looks_incomplete(text: str) -> bool:
     """
     Heuristic guard against provider answers that end mid-sentence.

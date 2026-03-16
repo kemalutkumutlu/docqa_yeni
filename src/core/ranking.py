@@ -159,7 +159,7 @@ def rerank_by_embedding(
         logger.warning("Embedding re-rank failed: chunk embedding fetch error", exc_info=True)
         return hybrid_scores
 
-    if not chunk_embeddings or len(chunk_embeddings) != len(chunk_ids_got):
+    if chunk_embeddings is None or len(chunk_embeddings) == 0 or len(chunk_embeddings) != len(chunk_ids_got):
         return hybrid_scores
 
     cosine_scores: Dict[str, float] = {}
