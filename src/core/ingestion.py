@@ -694,7 +694,7 @@ def ingest_pdf(
                     if should_vlm:
                         pix = page.get_pixmap(dpi=200)
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                        vlm_text = extract_text_from_image(img, cfg=vlm)
+                        vlm_text = extract_text_from_image(img, cfg=vlm, ocr_context=text_norm)
                         vlm_text_norm = _finalize_extracted_text(vlm_text, source="vlm")
                         # Dual-quality selection: keep whichever preserves structure better.
                         text_norm, source = _pick_best_candidate([(text_norm, source), (vlm_text_norm, "vlm")])
@@ -803,7 +803,7 @@ def ingest_image(
         getattr(vlm, "provider", "gemini") == "local" or bool(getattr(vlm, "api_key", ""))
     ):
         try:
-            vlm_text = extract_text_from_image(img_rgb, cfg=vlm)
+            vlm_text = extract_text_from_image(img_rgb, cfg=vlm, ocr_context=text_norm)
             vlm_text_norm = _finalize_extracted_text(vlm_text, source="vlm")
             cands.append((vlm_text_norm, "vlm"))
         except Exception as e:  # noqa: BLE001

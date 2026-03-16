@@ -49,6 +49,21 @@ Rules:
 """
 
 
+
+_OCR_GROUNDING_PROMPT = """\
+
+---
+SUPPLEMENTARY OCR TRUTH:
+Below is the raw text extracted by a standard formatting engine. It may have poor layout formatting, but its character and number recognition is highly accurate.
+Use this text strictly as a grounding reference to prevent hallucinations.
+Correct the layout using the visual image, but rely on the OCR text for exact spellings, numbers, and punctuation.
+
+[OCR TEXT START]
+{ocr_context}
+[OCR TEXT END]
+"""
+
+
 def _gemini_helpers():
     from google.genai import types
 
@@ -57,20 +72,25 @@ def _gemini_helpers():
     return types, build_gemini_client, gemini_model_candidates, is_model_not_found_error
 
 
-def extract_text_from_image(image: Image.Image, cfg: VLMConfig) -> str:
+def extract_text_from_image(image: Image.Image, cfg: VLMConfig, ocr_context: Optional[str] = None) -> str:
     """
     Extract text from an image using a multimodal model (extract-only).
     Dispatches to Gemini API or local Ollama based on cfg.provider.
     Returns extracted text (may be empty).
     """
     if cfg.provider == "local":
-        return _extract_via_ollama(image, cfg)
-    return _extract_via_gemini(image, cfg)
+        return _extract_via_ollama(image, cfg, ocr_context)
+    return _extract_via_gemini(image, cfg, ocr_context)
 
 
-def _extract_via_gemini(image: Image.Image, cfg: VLMConfig) -> str:
+def _extract_via_gemini(image: Image.Image, cfg: VLMConfig, ocr_context: Optional[str] = None) -> str:
     """Gemini API path (existing behavior)."""
     types, build_gemini_client, gemini_model_candidates, is_model_not_found_error = _gemini_helpers()
+    
+    prompt = _EXTRACT_ONLY_PROMPT
+    if ocr_context and ocr_context.strip():
+        # Limit the context size defensively (e.g. 5000 chars) to prevent prompt blowup
+        prompt += _OCR_GROUNDING_PROMPT.format(ocr_context=ocr_context.strip()[:5000])
     # Encode image as PNG bytes
     buf = io.BytesIO()
     image.save(buf, format="PNG")
@@ -83,7 +103,7 @@ def _extract_via_gemini(image: Image.Image, cfg: VLMConfig) -> str:
             resp = client.models.generate_content(
                 model=model_name,
                 contents=[
-                    types.Part.from_text(text=_EXTRACT_ONLY_PROMPT),
+                    types.Part.from_text(text=prompt),
                     types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
                 ],
                 config=types.GenerateContentConfig(
@@ -101,9 +121,13 @@ def _extract_via_gemini(image: Image.Image, cfg: VLMConfig) -> str:
     return ""
 
 
-def _extract_via_ollama(image: Image.Image, cfg: VLMConfig) -> str:
+def _extract_via_ollama(image: Image.Image, cfg: VLMConfig, ocr_context: Optional[str] = None) -> str:
     """Local Ollama vision-model path."""
     from .local_llm import OllamaConfig, ollama_vision_extract
+    
+    prompt = _EXTRACT_ONLY_PROMPT
+    if ocr_context and ocr_context.strip():
+        prompt += _OCR_GROUNDING_PROMPT.format(ocr_context=ocr_context.strip()[:5000])
 
     ollama_cfg = OllamaConfig(
         base_url=cfg.ollama_base_url,
@@ -113,7 +137,7 @@ def _extract_via_ollama(image: Image.Image, cfg: VLMConfig) -> str:
     return ollama_vision_extract(
         cfg=ollama_cfg,
         image=image,
-        prompt=_EXTRACT_ONLY_PROMPT,
+        prompt=prompt,
         temperature=0.0,
         max_tokens=4096,
     )
