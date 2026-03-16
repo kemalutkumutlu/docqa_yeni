@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Set, Tuple
@@ -7,579 +8,69 @@ from typing import Dict, List, Literal, Optional, Set, Tuple
 from .indexing import LocalIndex
 from .models import Chunk
 
+logger = logging.getLogger(__name__)
 
-# ── 1) Query Classification ──────────────────────────────────────────────────
-QueryIntent = Literal["section_list", "normal_qa"]
+from .query_classification import (
+    QueryIntent,
+    classify_query,
+    query_prefers_visual_region,
+    topic_heading_relevant,
+    expand_query_morphological,
+)
+from .evidence import (
+    Evidence,
+    RetrievalResult,
+    CoverageInfo,
+    meta_to_evidence,
+    fetch_section_and_subtree,
+    enrich_with_parent_context,
+)
+from .ranking import (
+    region_aware_scores,
+    rerank_by_embedding,
+    filter_low_relevance,
+    pick_best_section,
+    count_list_items,
+)
 
-# Patterns that signal "give me everything under a heading / list all X"
-_SECTION_LIST_PATTERNS: list[re.Pattern[str]] = [
-    # Turkish
-    re.compile(r"nelerdir", re.IGNORECASE),
-    re.compile(r"nedir.*(maddeleri|listesi|gereksinimleri|başlıkları)", re.IGNORECASE),
-    re.compile(r"(listele|sırala|say\b|maddeleri)", re.IGNORECASE),
-    re.compile(r"(altında(ki)?|içindeki)\s+(tüm|her|bütün)", re.IGNORECASE),
-    re.compile(r"(tüm|bütün|hepsi|eksiksiz)\s+.*(madde|gereksinim|başlık|teslimat|adım)", re.IGNORECASE),
-    re.compile(r"kaç\s+(madde|gereksinim|başlık|teslimat|adım)", re.IGNORECASE),
-    # "X başlığı/bölümü altındakiler" style requests
-    re.compile(
-        r"(başlığ\w*|bölüm\w*|kısm\w*)\s+.*(altında\w*|içinde\w*|altındak\w*|içindek\w*)",
-        re.IGNORECASE,
-    ),
-    # "hepsini/tamamını ver" when it's clearly asking for all details/items
-    re.compile(
-        r"(bilgi(leri|sini|lerinin)|madde(leri|sini|lerinin)|satır(ları|larını))\s+.*(hepsini|tamamını|tümünü)\s+(ver|yaz|göster)",
-        re.IGNORECASE,
-    ),
-    # English
-    re.compile(r"what\s+are\s+(the|all)", re.IGNORECASE),
-    re.compile(r"list\s+(all|the|every)", re.IGNORECASE),
-    re.compile(r"(enumerate|summarize\s+all)", re.IGNORECASE),
-    re.compile(r"how\s+many\s+(items?|requirements?|sections?)", re.IGNORECASE),
-]
+# ── Query expansion ─────────────────────────────────────────────────────────
 
-_VISUAL_REGION_QUERY_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\b(tablo|table|satır|satir|row|sütun|sutun|column|hücre|hucre|cell)\b", re.IGNORECASE),
-    re.compile(r"\b(form|alan|field|checkbox|label|değer|deger|value|imza|signature)\b", re.IGNORECASE),
-    re.compile(r"\b(görsel|gorsel|resim|image|layout|yerleşim|yerlesim|sayfadaki|page|region|bölge|bolge)\b", re.IGNORECASE),
-]
-
-
-def classify_query(query: str) -> QueryIntent:
+def _multi_query_expand(
+    query: str,
+    *,
+    gemini_api_key: str = "",
+    gemini_model: str = "",
+) -> List[str]:
     """
-    Rule-based intent classifier (document-agnostic).
-
-    Returns "section_list" if the query looks like it wants a full list /
-    section extraction; "normal_qa" otherwise.
+    Use Gemini to generate 2 alternative query formulations.
+    Returns [original_query, alt1, alt2].
+    Falls back to [original_query] on any error.
     """
-    for pat in _SECTION_LIST_PATTERNS:
-        if pat.search(query):
-            return "section_list"
-    return "normal_qa"
+    import os
+    api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+    model = gemini_model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    if not api_key:
+        return [query]
 
-
-def _query_prefers_visual_region(query: str) -> bool:
-    text = (query or "").strip()
-    if not text:
-        return False
-    return any(pat.search(text) for pat in _VISUAL_REGION_QUERY_PATTERNS)
-
-
-# ── 2) Evidence gathering ────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class Evidence:
-    chunk_id: str
-    text: str
-    section_id: str
-    heading_path: str
-    page_start: int
-    page_end: int
-    kind: str  # parent / child
-    score: float
-    modality: str = "text"
-    image_path: str = ""
-    region_label: str = ""
-    region_id: str = ""
-    crop_type: str = "page"
-    region_summary: str = ""
-    proposal_source: str = "heuristic"
-    proposal_confidence: float = 0.0
-    bbox_left: int = 0
-    bbox_top: int = 0
-    bbox_right: int = 0
-    bbox_bottom: int = 0
-    bbox_left_norm: float = 0.0
-    bbox_top_norm: float = 0.0
-    bbox_right_norm: float = 1.0
-    bbox_bottom_norm: float = 1.0
-
-
-@dataclass
-class RetrievalResult:
-    intent: QueryIntent
-    evidences: List[Evidence]
-    section_complete: bool  # True if we did complete-section fetch
-    coverage: Optional[CoverageInfo] = None
-
-
-@dataclass(frozen=True)
-class CoverageInfo:
-    expected_items: int
-    heading_path: str
-    section_id: str
-
-
-def _meta_to_evidence(meta: dict, doc: str, chunk_id: str, score: float) -> Evidence:
-    return Evidence(
-        chunk_id=chunk_id,
-        text=doc,
-        section_id=meta.get("section_id", ""),
-        heading_path=meta.get("heading_path", ""),
-        page_start=meta.get("page_start", 0),
-        page_end=meta.get("page_end", 0),
-        kind=meta.get("kind", ""),
-        score=score,
-        modality=meta.get("modality", "text"),
-        image_path=meta.get("image_path", ""),
-        region_label=meta.get("region_label", ""),
-        region_id=meta.get("region_id", ""),
-        crop_type=meta.get("crop_type", "page"),
-        region_summary=meta.get("region_summary", ""),
-        proposal_source=meta.get("proposal_source", "heuristic"),
-        proposal_confidence=float(meta.get("proposal_confidence", 0.0) or 0.0),
-        bbox_left=int(meta.get("bbox_left", 0) or 0),
-        bbox_top=int(meta.get("bbox_top", 0) or 0),
-        bbox_right=int(meta.get("bbox_right", 0) or 0),
-        bbox_bottom=int(meta.get("bbox_bottom", 0) or 0),
-        bbox_left_norm=float(meta.get("bbox_left_norm", 0.0) or 0.0),
-        bbox_top_norm=float(meta.get("bbox_top_norm", 0.0) or 0.0),
-        bbox_right_norm=float(meta.get("bbox_right_norm", 1.0) or 1.0),
-        bbox_bottom_norm=float(meta.get("bbox_bottom_norm", 1.0) or 1.0),
-    )
-
-
-def _page_number_from_meta(meta: dict) -> int:
     try:
-        return int(meta.get("page_start", 0) or 0)
+        from .gemini_client import build_gemini_client
+        client = build_gemini_client(api_key=api_key)
+        prompt = (
+            "Aşağıdaki soruyu bir belge arama sistemi için 2 farklı şekilde yeniden formüle et. "
+            "Her formülasyon aynı bilgiyi bulmaya yönelik olsun ama farklı kelimeler kullansın. "
+            "Sadece 2 alternatif sorgu yaz, her biri ayrı satırda. Başka bir şey yazma.\n\n"
+            f"Orijinal: {query}"
+        )
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+        )
+        text = (response.text or "").strip()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip() and len(ln.strip()) > 5]
+        return [query] + lines[:2]
     except Exception:
-        return 0
-
-
-def _meta_is_region(meta: dict) -> bool:
-    region_label = (meta.get("region_label", "") or "").strip()
-    region_id = (meta.get("region_id", "") or "").strip()
-    crop_type = (meta.get("crop_type", "page") or "page").strip().lower()
-    return bool(region_label or region_id or crop_type != "page")
-
-
-def _region_overlap_bonus(query: str, meta: dict) -> float:
-    summary = (meta.get("region_summary", "") or "").strip()
-    if not summary:
-        return 0.0
-    q_tokens = _tokenize_simple(query)
-    s_tokens = _tokenize_simple(summary)
-    if not q_tokens or not s_tokens:
-        return 0.0
-    overlap = len(q_tokens & s_tokens)
-    if overlap <= 0:
-        return 0.0
-    return min(0.004, 0.002 * overlap)
-
-
-def _region_aware_scores(
-    *,
-    query: str,
-    got_ids: List[str],
-    got_metas: List[dict],
-    hybrid_scores: Dict[str, float],
-) -> Dict[str, float]:
-    adjusted = dict(hybrid_scores)
-    if not got_ids:
-        return adjusted
-    if not any(_meta_is_region(meta or {}) for meta in got_metas):
-        return adjusted
-
-    visual_query = _query_prefers_visual_region(query)
-
-    page_modalities: Dict[int, Set[str]] = {}
-    for meta in got_metas:
-        page_no = _page_number_from_meta(meta)
-        if page_no <= 0:
-            continue
-        if not _meta_is_region(meta or {}):
-            continue
-        page_modalities.setdefault(page_no, set()).add((meta.get("modality", "text") or "text").strip().lower())
-
-    cross_modal_pages = {
-        page_no
-        for page_no, mods in page_modalities.items()
-        if "text" in mods and "visual" in mods
-    }
-
-    for cid, meta in zip(got_ids, got_metas):
-        base = adjusted.get(cid, 0.0)
-        modality = (meta.get("modality", "text") or "text").strip().lower()
-        kind = (meta.get("kind", "") or "").strip().lower()
-        crop_type = (meta.get("crop_type", "page") or "page").strip().lower()
-        page_no = _page_number_from_meta(meta)
-        bonus = 0.0
-
-        if not _meta_is_region(meta or {}):
-            adjusted[cid] = base
-            continue
-
-        if modality == "visual":
-            if meta.get("region_label"):
-                bonus += 0.002
-            if crop_type != "page":
-                bonus += 0.002
-            if visual_query:
-                bonus += 0.004
-            if page_no in cross_modal_pages:
-                bonus += 0.003
-            bonus += _region_overlap_bonus(query, meta)
-        elif kind == "table":
-            bonus += 0.003
-            if visual_query:
-                bonus += 0.006
-            bonus += _region_overlap_bonus(query, meta)
-        elif visual_query and page_no in cross_modal_pages:
-            bonus += 0.002
-
-        adjusted[cid] = base + bonus
-
-    return adjusted
-
-
-# ── Heading-aware section matching ───────────────────────────────────────────
-
-def _tokenize_simple(text: str) -> Set[str]:
-    """Simple word tokenizer for TR/EN overlap matching."""
-    text = text.lower()
-    text = re.sub(r"[^0-9a-zçğıöşüâîû\-]+", " ", text)
-    return {t for t in text.split() if len(t) > 1}
-
-
-def _heading_query_overlap(heading_path: str, query: str) -> float:
-    """
-    Compute how many query tokens appear in the heading path.
-    Returns a score 0..1  (fraction of query tokens found in heading).
-    """
-    q_tokens = _tokenize_simple(query)
-    h_tokens = _tokenize_simple(heading_path)
-    if not q_tokens:
-        return 0.0
-    overlap = q_tokens & h_tokens
-    return len(overlap) / len(q_tokens)
-
-
-# ── Heading–query topic relevance (confidence guard) ─────────────────────────
-
-# Common Turkish/English question and structural words that should NOT
-# count as "topic" words when checking heading relevance.
-_QUESTION_WORDS: Set[str] = {
-    # Turkish
-    "nelerdir", "nedir", "nelerden", "nelerini", "nelerle",
-    "listele", "listesi", "sirala",
-    "kaç", "kac", "kadar",
-    "nasıl", "nasil", "neden", "niçin", "nicin",
-    "hepsini", "tamamını", "tamamini", "tümünü", "tumunu",
-    "neler", "hangi", "hangisi", "hangileri",
-    "mi", "mu",
-    # English
-    "what", "list", "all", "every", "how", "enumerate", "are", "the",
-    "is", "which", "many", "much",
-}
-
-
-def _topic_heading_relevant(query: str, heading_path: str, min_prefix: int = 5) -> bool:
-    """
-    Check that the query's **topic words** have meaningful lexical overlap
-    with the section heading.
-
-    Uses prefix-based matching (minimum *min_prefix* shared leading chars)
-    to tolerate Turkish morphological suffixes
-    (e.g. "gereksinimleri" ≈ "gereksinimler").
-
-    Returns ``True`` (= pass) when the heading is missing/short, when the
-    query has no extractable topic words, or when **all** topic words match
-    a heading token.  Returns ``False`` only when at least one topic word
-    has **no** counterpart in the heading, indicating a likely keyword
-    false-positive.
-    """
-    # Strip the file-name prefix:
-    #   "Case_Study.pdf / 2. Heading / 2.1 Sub"  →  "2. Heading / 2.1 Sub"
-    heading = heading_path
-    if " / " in heading:
-        heading = heading.split(" / ", 1)[1]
-    heading = (heading or "").strip()
-    if len(heading) < 3:
-        return True  # too short to compare meaningfully
-
-    q_tokens = _tokenize_simple(query)
-    h_tokens = _tokenize_simple(heading)
-    if not q_tokens or not h_tokens:
-        return True
-
-    # Keep only topic words (remove question / structural words + very
-    # short tokens that are likely suffixes / noise).
-    topic = {t for t in q_tokens if t not in _QUESTION_WORDS and len(t) > 2}
-    if not topic:
-        return True  # query is all question words → don't filter
-
-    # Check every topic word for a match in the heading.
-    for qt in topic:
-        found = False
-        for ht in h_tokens:
-            # 1) Exact match
-            if qt == ht:
-                found = True
-                break
-            # 2) Prefix match (handles Turkish suffixes)
-            pfx = min(min_prefix, min(len(qt), len(ht)))
-            if pfx >= 4:
-                common = 0
-                for i in range(min(len(qt), len(ht))):
-                    if qt[i] == ht[i]:
-                        common += 1
-                    else:
-                        break
-                if common >= pfx:
-                    found = True
-                    break
-        if not found:
-            return False  # at least one topic word has no heading counterpart
-
-    return True
-
-
-def _pick_best_section(
-    got_ids: List[str],
-    got_metas: List[dict],
-    hybrid_scores: Dict[str, float],
-    query: str,
-) -> Optional[tuple[str, str]]:
-    """
-    From the hybrid search results, pick the best section_id.
-    Strategy: combine hybrid score with heading-overlap bonus.
-    This prevents "teslimatlar nelerdir" from matching "Teknik Yaklaşım" just
-    because it ranks slightly higher in the embedding space.
-    """
-    # Collect unique section candidates
-    # (doc_id, section_id) -> (best_hybrid_score, heading_overlap)
-    candidates: Dict[tuple[str, str], Tuple[float, float]] = {}
-    for cid, meta in zip(got_ids, got_metas):
-        if (meta or {}).get("modality") == "visual" or (meta or {}).get("kind") == "visual":
-            continue
-        did = meta.get("doc_id", "")
-        sid = meta.get("section_id", "")
-        if not did or not sid or sid == "root":
-            continue
-        hp = meta.get("heading_path", "")
-        hs = hybrid_scores.get(cid, 0.0)
-        ho = _heading_query_overlap(hp, query)
-        key = (did, sid)
-        if key not in candidates or hs > candidates[key][0]:
-            candidates[key] = (hs, ho)
-
-    if not candidates:
-        # Fallback: some documents have no detected headings; allow selecting root.
-        for cid, meta in zip(got_ids, got_metas):
-            if (meta or {}).get("modality") == "visual" or (meta or {}).get("kind") == "visual":
-                continue
-            did = meta.get("doc_id", "")
-            sid = meta.get("section_id", "")
-            if not did or sid != "root":
-                continue
-            hp = meta.get("heading_path", "")
-            hs = hybrid_scores.get(cid, 0.0)
-            ho = _heading_query_overlap(hp, query)
-            candidates[(did, sid)] = (hs, ho)
-
-        if not candidates:
-            return None
-
-    # Score = hybrid_score + 0.5 * heading_overlap
-    # The 0.5 bonus is enough to nudge a heading-matching section to the top
-    # when hybrid scores are close, but won't override a vastly better match.
-    best_key = max(candidates, key=lambda k: candidates[k][0] + 0.5 * candidates[k][1])
-    return best_key
-
-
-# ── Section + subtree fetch ──────────────────────────────────────────────────
-
-def _fetch_section_and_subtree(
-    index: LocalIndex,
-    doc_id: str,
-    section_id: str,
-    *,
-    max_depth: int = 2,
-) -> List[Evidence]:
-    """
-    Fetch the section's own chunks (parent + children) AND all chunks whose
-    parent_id equals this section_id (the subtree).  This ensures that asking
-    for "4. Teslimatlar" also brings in 4.1, 4.2, etc.
-    """
-    col = index.store._get_collection()
-
-    # 1) Chunks belonging directly to this section
-    own = col.get(
-        where={"$and": [{"doc_id": doc_id}, {"section_id": section_id}]},
-        include=["documents", "metadatas"],
-    )
-
-    # 2) Subtree fetch (depth-limited BFS on section hierarchy)
-    # We walk "section_id -> child sections" via:
-    #   parent chunk meta: parent_id == <parent_section_id>
-    # and we pull all chunks where parent_id == <current_section_id>, which includes:
-    #   - child chunks of the current section
-    #   - parent chunks of immediate sub-sections
-    max_depth = max(0, int(max_depth))
-    subtree_results = []
-    frontier: Set[str] = {section_id}
-    seen_sections: Set[str] = set(frontier)
-
-    for _depth in range(max_depth):
-        if not frontier:
-            break
-
-        next_frontier: Set[str] = set()
-        for cur_sid in sorted(frontier):
-            res = col.get(
-                where={"$and": [{"doc_id": doc_id}, {"parent_id": cur_sid}]},
-                include=["documents", "metadatas"],
-            )
-            subtree_results.append(res)
-
-            # Discover immediate sub-sections: only parent chunks qualify as section nodes.
-            for meta in res.get("metadatas", []) or []:
-                try:
-                    if (meta or {}).get("kind") != "parent":
-                        continue
-                    sid = (meta or {}).get("section_id", "")
-                    pid = (meta or {}).get("parent_id", "")
-                    if not sid or sid == cur_sid:
-                        continue
-                    if pid != cur_sid:
-                        continue
-                    if sid in seen_sections:
-                        continue
-                    seen_sections.add(sid)
-                    next_frontier.add(sid)
-                except Exception:
-                    continue
-
-        frontier = next_frontier
-
-    # Merge all into a single evidence list (deduplicated)
-    seen: Set[str] = set()
-    evidences: List[Evidence] = []
-
-    for result_set in [own] + subtree_results:
-        ids = result_set.get("ids", [])
-        docs = result_set.get("documents", [])
-        metas = result_set.get("metadatas", [])
-        for cid, doc, meta in zip(ids, docs, metas):
-            if cid not in seen:
-                seen.add(cid)
-                evidences.append(_meta_to_evidence(meta, doc or "", cid, score=1.0))
-
-    return evidences
-
-
-# ── Coverage counting ────────────────────────────────────────────────────────
-
-def _count_list_items(text: str) -> int:
-    """
-    Heuristic: count bullet/numbered items, table rows, or repeated
-    structural patterns in a section text.
-    """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return 0
-
-    # Ignore the first line if it looks like a section heading/title.
-    # Parent chunks usually start with the section title (e.g., "2. Foo").
-    first = lines[0]
-    if re.match(r"^(\d+(?:\.\d+)*[.\)]\s|[A-Z]\.\d+(?:\.\d+)*\s)", first) or len(lines) > 1:
-        lines = lines[1:]
-    if not lines:
-        return 0
-
-    count = 0
-
-    # 1) Numbered items: "1.", "1)", "- ", "• ", "* ", "a)", "a."
-    for ln in lines:
-        if re.match(r"^(\d+[\.\)]\s|[a-zA-Z][\.\)]\s|[-•*]\s|[#]\s+\d)", ln):
-            count += 1
-
-    if count >= 2:
-        return count
-
-    # 1.5) Indexed-table heuristic (purely structural):
-    # Many PDF tables extract into patterns like:
-    #   1
-    #   DEVLOG.md
-    #   Description...
-    #   2
-    #   TESTING.md
-    #   Description...
-    #
-    # We count the number of numeric row indices that are followed by a non-numeric label.
-    idx_rows = 0
-    i = 0
-    while i < len(lines) - 1:
-        a = lines[i].strip()
-        b = lines[i + 1].strip()
-        if re.match(r"^\d{1,3}$", a) and not re.match(r"^\d{1,3}$", b):
-            # Basic sanity: label shouldn't be extremely long
-            if 2 <= len(b) <= 120:
-                idx_rows += 1
-                i += 2
-                continue
-        i += 1
-
-    if idx_rows >= 3:
-        return idx_rows
-
-    # 2) Table-like row heuristic (purely structural, no vocabulary lists):
-    #    Count patterns like:
-    #      <short label line>
-    #      <longer description line>
-    #
-    # High-confidence only: if we detect fewer than 3 rows, return 0 to avoid false alarms.
-    def _token_count(s: str) -> int:
-        return len([t for t in re.split(r"\s+", s.strip()) if t])
-
-    def _looks_like_label(s: str) -> bool:
-        if not (3 <= len(s) <= 60):
-            return False
-        if s.endswith((".", "!", "?", ":", ";")):
-            return False
-        if re.match(r"^\d+$", s):  # pure number lines are often table row indices
-            return False
-        # Labels tend to be short phrases (few tokens)
-        return _token_count(s) <= 7
-
-    def _looks_like_description(s: str) -> bool:
-        # Descriptions tend to be longer and/or sentence-like.
-        if len(s) >= 80:
-            return True
-        if _token_count(s) >= 10:
-            return True
-        if any(p in s for p in (".", ";", ":")) and _token_count(s) >= 6:
-            return True
-        return False
-
-    rows = 0
-    i = 0
-    while i < len(lines) - 1:
-        a = lines[i]
-        b = lines[i + 1]
-
-        # Structural header guard: if we see multiple short lines in a row, it's likely a header block.
-        if _looks_like_label(a) and _looks_like_label(b) and not _looks_like_description(b):
-            i += 1
-            continue
-
-        if _looks_like_label(a) and _looks_like_description(b):
-            rows += 1
-            i += 2
-        else:
-            i += 1
-
-    if rows >= 3:
-        return rows
-
-    # 3) Count sub-section headings within the text
-    heading_count = 0
-    for ln in lines:
-        if re.match(r"^[A-Z0-9]+\.\d+", ln) or re.match(r"^\d+\.\d+", ln):
-            heading_count += 1
-    if heading_count >= 3:
-        return heading_count
-
-    return count
+        logger.warning("Multi-query expansion failed, using original query only", exc_info=True)
+        return [query]
 
 
 # ── 3) Main retrieval pipeline ───────────────────────────────────────────────
@@ -592,6 +83,13 @@ def retrieve(
     final_k: int = 8,
     doc_id: Optional[str] = None,
     section_fetch_max_depth: int = 2,
+    *,
+    rerank_blend_weight: float = 0.6,
+    relevance_min_score_ratio: float = 0.25,
+    relevance_min_keep: int = 3,
+    grounding_min_avg_score: float = 0.15,
+    multi_section_max: int = 3,
+    query_expansion_enabled: bool = False,
 ) -> RetrievalResult:
     """
     Full retrieval pipeline with query routing.
@@ -604,15 +102,53 @@ def retrieve(
     """
     intent = classify_query(query)
 
+    # Morphological expansion improves BM25 recall for Turkish
+    expanded_query = expand_query_morphological(query)
+
+    # Optional: Gemini-based multi-query expansion for broader recall
+    if query_expansion_enabled:
+        import os
+        alt_queries = _multi_query_expand(
+            query,
+            gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        )
+    else:
+        alt_queries = [query]
+
     # Always start with hybrid search to locate the best section
     doc_ids = {doc_id} if doc_id else None
-    hybrid = index.hybrid_search(
-        query,
-        dense_k=dense_k,
-        sparse_k=sparse_k,
-        final_k=final_k,
-        doc_ids=doc_ids,
-    )
+
+    # Run hybrid search for each query variant, merge results
+    if len(alt_queries) > 1:
+        from collections import defaultdict
+        merged_scores: Dict[str, float] = defaultdict(float)
+        merged_ids_set: set[str] = set()
+        for i, aq in enumerate(alt_queries):
+            aq_expanded = expand_query_morphological(aq) if i > 0 else expanded_query
+            h = index.hybrid_search(
+                aq_expanded,
+                dense_k=dense_k,
+                sparse_k=sparse_k,
+                final_k=final_k,
+                doc_ids=doc_ids,
+            )
+            weight = 1.0 if i == 0 else 0.5  # original query gets higher weight
+            for cid in h.ids:
+                merged_scores[cid] = max(merged_scores[cid], h.scores.get(cid, 0.0) * weight)
+                merged_ids_set.add(cid)
+        # Sort by score and take top final_k
+        sorted_merged = sorted(merged_ids_set, key=lambda c: merged_scores[c], reverse=True)[:final_k]
+        from .hybrid import HybridResult
+        hybrid = HybridResult(ids=sorted_merged, scores={c: merged_scores[c] for c in sorted_merged})
+    else:
+        hybrid = index.hybrid_search(
+            expanded_query,
+            dense_k=dense_k,
+            sparse_k=sparse_k,
+            final_k=final_k,
+            doc_ids=doc_ids,
+        )
 
     if not hybrid.ids:
         return RetrievalResult(
@@ -626,16 +162,23 @@ def retrieve(
     got_ids = got.get("ids", [])
     got_docs = got.get("documents", [])
     got_metas = got.get("metadatas", [])
-    adjusted_scores = _region_aware_scores(
+    adjusted_scores = region_aware_scores(
         query=query,
         got_ids=got_ids,
         got_metas=got_metas,
         hybrid_scores=hybrid.scores,
     )
 
+    # Re-rank using embedding cosine similarity (recovers magnitude lost by RRF)
+    # Use ORIGINAL query (not expanded) for re-ranking — embedding captures semantics
+    reranked_scores = rerank_by_embedding(
+        index, query, got_ids, adjusted_scores,
+        blend_weight=rerank_blend_weight,
+    )
+
     ranked = sorted(
         zip(got_ids, got_docs, got_metas),
-        key=lambda item: adjusted_scores.get(item[0], 0.0),
+        key=lambda item: reranked_scores.get(item[0], 0.0),
         reverse=True,
     )
     if ranked:
@@ -643,9 +186,47 @@ def retrieve(
         got_docs = [item[1] for item in ranked]
         got_metas = [item[2] for item in ranked]
 
+    # Determine if the query wants visual content (tables, figures, forms etc.)
+    # If so, don't filter out visual chunks from section fetches.
+    _wants_visual = query_prefers_visual_region(query)
+    _text_only = not _wants_visual
+
+    # ── Multi-section: fetch top-N distinct sections ───────────────────
+    if intent == "multi_section":
+        _depth = max(0, min(10, int(section_fetch_max_depth)))
+        seen_sids: Set[str] = set()
+        all_section_evidences: List[Evidence] = []
+        max_sections = multi_section_max
+
+        for _cid, _meta in zip(got_ids, got_metas):
+            modality = (_meta or {}).get("modality", "text") or "text"
+            kind = (_meta or {}).get("kind", "") or ""
+            if modality == "visual" or kind in ("visual", "toc"):
+                continue
+            did = (_meta or {}).get("doc_id", "")
+            sid = (_meta or {}).get("section_id", "")
+            if not did or not sid or sid in ("root", "toc") or sid in seen_sids:
+                continue
+            seen_sids.add(sid)
+            evs = fetch_section_and_subtree(
+                index, did, sid, max_depth=_depth, text_only=_text_only,
+            )
+            all_section_evidences.extend(evs)
+            if len(seen_sids) >= max_sections:
+                break
+
+        if all_section_evidences:
+            return RetrievalResult(
+                intent=intent,
+                evidences=all_section_evidences,
+                section_complete=True,
+            )
+        # else: fall through to normal_qa
+
+    # ── Section list: single best section + subtree ──────────────────────
     if intent == "section_list":
-        best = _pick_best_section(
-            got_ids, got_metas, adjusted_scores, query,
+        best = pick_best_section(
+            got_ids, got_metas, reranked_scores, query,
         )
 
         if best:
@@ -667,41 +248,91 @@ def retrieve(
                     heading_path_str = meta["heading_path"]
                     break
 
-            if _topic_heading_relevant(query, heading_path_str):
+            if topic_heading_relevant(query, heading_path_str):
                 # High confidence → complete section + subtree fetch
-                section_evidences = _fetch_section_and_subtree(
+                # text_only is dynamic: True for text queries, False when
+                # the user asks about visual content (tables, figures, etc.).
+                _depth = max(0, min(10, int(section_fetch_max_depth)))
+                section_evidences = fetch_section_and_subtree(
                     index,
                     best_doc_id,
                     best_section_id,
-                    max_depth=max(0, min(10, int(section_fetch_max_depth))),
+                    max_depth=_depth,
+                    text_only=_text_only,
                 )
 
-                # Coverage info from the parent chunk text
-                coverage = None
-                for ev in section_evidences:
-                    if ev.kind == "parent" and ev.section_id == best_section_id:
-                        n = _count_list_items(ev.text)
-                        if n > 0:
-                            coverage = CoverageInfo(
-                                expected_items=n,
-                                heading_path=ev.heading_path,
-                                section_id=ev.section_id,
+                # TOC-entry guard: if the fetched section has almost no
+                # meaningful text (e.g. a table-of-contents row like
+                # "2. Fonksiyonel Gereksinimler (s.2)"), try sibling
+                # sections that share the same heading topic before
+                # falling through to normal-QA.
+                _total_text = sum(len(ev.text) for ev in section_evidences)
+                if _total_text < 120:
+                    _seen_sids: Set[str] = {best_section_id}
+                    _best_alt: List[Evidence] = []
+                    _best_alt_len = _total_text
+                    for _cid, _meta in zip(got_ids, got_metas):
+                        _sid = (_meta or {}).get("section_id", "")
+                        if not _sid or _sid in _seen_sids:
+                            continue
+                        if (_meta or {}).get("modality") == "visual":
+                            continue
+                        _seen_sids.add(_sid)
+                        _hp = (_meta or {}).get("heading_path", "")
+                        if topic_heading_relevant(query, _hp):
+                            _evs = fetch_section_and_subtree(
+                                index,
+                                best_doc_id,
+                                _sid,
+                                max_depth=_depth,
+                                text_only=_text_only,
                             )
-                        break
+                            _evs_len = sum(len(e.text) for e in _evs)
+                            if _evs_len > _best_alt_len:
+                                _best_alt = _evs
+                                _best_alt_len = _evs_len
+                    if _best_alt:
+                        section_evidences = _best_alt
 
-                return RetrievalResult(
-                    intent=intent,
-                    evidences=section_evidences,
-                    section_complete=True,
-                    coverage=coverage,
-                )
-            # else: low confidence → fall through to normal-QA evidence
+                # Re-check: if still empty/tiny, fall through to normal-QA
+                if sum(len(ev.text) for ev in section_evidences) < 30:
+                    pass  # fall through
+                else:
+                    # Coverage info from the parent chunk text
+                    coverage = None
+                    for ev in section_evidences:
+                        if ev.kind == "parent" and ev.section_id == best_section_id:
+                            n = count_list_items(ev.text)
+                            if n > 0:
+                                coverage = CoverageInfo(
+                                    expected_items=n,
+                                    heading_path=ev.heading_path,
+                                    section_id=ev.section_id,
+                                )
+                            break
 
-    # Normal QA: return hybrid top-k evidence
+                    return RetrievalResult(
+                        intent=intent,
+                        evidences=section_evidences,
+                        section_complete=True,
+                        coverage=coverage,
+                    )
+            # else: low confidence or empty section → fall through to normal-QA evidence
+
+    # Normal QA: return hybrid top-k evidence + parent context enrichment
+    # For each child chunk, also fetch its parent section text so the LLM
+    # has hierarchical context (heading + surrounding content).
     evidences: List[Evidence] = []
     for cid, doc, meta in zip(got_ids, got_docs, got_metas):
-        score = adjusted_scores.get(cid, hybrid.scores.get(cid, 0.0))
-        evidences.append(_meta_to_evidence(meta, doc or "", cid, score))
+        score = reranked_scores.get(cid, hybrid.scores.get(cid, 0.0))
+        evidences.append(meta_to_evidence(meta, doc or "", cid, score))
+
+    evidences = enrich_with_parent_context(index, evidences)
+    evidences = filter_low_relevance(
+        evidences,
+        min_score_ratio=relevance_min_score_ratio,
+        min_keep=relevance_min_keep,
+    )
 
     return RetrievalResult(
         intent=intent,

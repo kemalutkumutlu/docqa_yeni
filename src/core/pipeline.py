@@ -99,6 +99,15 @@ class RAGPipeline:
     openai_model: str = "gpt-4o-mini"
     multimodal_assets_dir: Optional[Path] = None
 
+    # RAG retrieval thresholds (propagated from Settings)
+    rerank_blend_weight: float = 0.6
+    relevance_min_score_ratio: float = 0.25
+    relevance_min_keep: int = 3
+    grounding_min_avg_score: float = 0.15
+    multi_section_max: int = 3
+    context_max_tokens: int = 100000
+    query_expansion_enabled: bool = False
+
     # State
     _documents: Dict[str, DocumentState] = field(default_factory=dict)
     _index: Optional[LocalIndex] = None
@@ -372,6 +381,20 @@ class RAGPipeline:
         if self.processing_mode in ("multimodal", "smart"):
             chunks.extend(visual_chunks_from_ingest(ingest))
         chunks.extend(table_chunks_from_ingest(ingest))
+        # TOC chunk: searchable but excluded from section-based retrieval
+        if ingest.toc_text:
+            chunks.append(Chunk(
+                chunk_id=f"{ingest.doc_id}:toc:parent",
+                doc_id=ingest.doc_id,
+                file_name=ingest.file_name,
+                section_id="toc",
+                parent_id=None,
+                heading_path=f"{ingest.file_name} / İçindekiler",
+                page_start=1,
+                page_end=1,
+                text=ingest.toc_text,
+                kind="toc",
+            ))
 
         state = DocumentState(
             doc_id=ingest.doc_id,
@@ -891,6 +914,12 @@ class RAGPipeline:
             query,
             doc_id=doc_hint,
             section_fetch_max_depth=self.section_fetch_max_depth,
+            rerank_blend_weight=self.rerank_blend_weight,
+            relevance_min_score_ratio=self.relevance_min_score_ratio,
+            relevance_min_keep=self.relevance_min_keep,
+            grounding_min_avg_score=self.grounding_min_avg_score,
+            multi_section_max=self.multi_section_max,
+            query_expansion_enabled=self.query_expansion_enabled,
         )
         _retrieval_ms = (time.perf_counter() - _t_ret) * 1000
 
@@ -1012,6 +1041,12 @@ class RAGPipeline:
             query,
             doc_id=doc_hint,
             section_fetch_max_depth=self.section_fetch_max_depth,
+            rerank_blend_weight=self.rerank_blend_weight,
+            relevance_min_score_ratio=self.relevance_min_score_ratio,
+            relevance_min_keep=self.relevance_min_keep,
+            grounding_min_avg_score=self.grounding_min_avg_score,
+            multi_section_max=self.multi_section_max,
+            query_expansion_enabled=self.query_expansion_enabled,
         )
         _retrieval_ms = (time.perf_counter() - _t_ret) * 1000
 

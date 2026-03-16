@@ -18,10 +18,11 @@ def simple_tokenize(text: str) -> List[str]:
 
     # Language-agnostic robustness:
     # add character 3-grams to improve matching for suffixes/typos (e.g., "adres" vs "adresini")
+    # Threshold lowered to 4 chars to cover short Turkish words (tablo, form, amaç, test)
     ngrams: list[str] = []
     for tok in tokens:
         # avoid exploding token count on very long strings (IDs/addresses)
-        if len(tok) < 5 or len(tok) > 24:
+        if len(tok) < 4 or len(tok) > 24:
             continue
         # generate up to 12 trigrams per token
         limit = min(len(tok) - 2, 12)
@@ -51,9 +52,13 @@ class BM25Index:
 
     @classmethod
     def build(cls, chunks: List[Chunk]) -> "BM25Index":
-        # Index child chunks for retrieval granularity (parents are fetched later)
-        child_chunks = [c for c in chunks if c.kind == "child"]
-        pairs = [(c.chunk_id, simple_tokenize(c.text)) for c in child_chunks]
+        # Index both child AND parent chunks for BM25.
+        # Parent chunks contain heading text that is critical for
+        # section-level keyword matching (e.g. "Teslimatlar" only appears
+        # in the parent chunk heading, not in child body text).
+        # Visual/toc chunks are excluded — they don't carry searchable text.
+        indexable = [c for c in chunks if c.kind in ("child", "parent", "table")]
+        pairs = [(c.chunk_id, simple_tokenize(c.text)) for c in indexable]
         pairs = [(cid, toks) for cid, toks in pairs if toks]
         ids = [cid for cid, _ in pairs]
         toks = [toks for _, toks in pairs]
@@ -99,11 +104,11 @@ class BM25Index:
         This is still much cheaper than re-embedding because tokenization is
         CPU-only and fast.
         """
-        new_children = [c for c in new_chunks if c.kind == "child"]
-        if not new_children:
+        new_indexable = [c for c in new_chunks if c.kind in ("child", "parent", "table")]
+        if not new_indexable:
             return self
 
-        pairs = [(c.chunk_id, simple_tokenize(c.text)) for c in new_children]
+        pairs = [(c.chunk_id, simple_tokenize(c.text)) for c in new_indexable]
         pairs = [(cid, toks) for cid, toks in pairs if toks]
         if not pairs:
             return self

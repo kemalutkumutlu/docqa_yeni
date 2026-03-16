@@ -14,7 +14,7 @@ TextSource = Literal[
     "paddle_ocr",
     "paddle_vl_ocr",
 ]
-ChunkKind = Literal["parent", "child", "visual", "table"]
+ChunkKind = Literal["parent", "child", "visual", "table", "toc"]
 ChunkModality = Literal["text", "visual"]
 
 
@@ -101,6 +101,7 @@ class IngestResult:
     visual_assets: list[VisualAsset] = field(default_factory=list)
     structured_tables: list[StructuredTable] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    toc_text: str = ""  # Raw TOC/bookmark text (not prepended to pages)
 
 
 @dataclass(frozen=True)

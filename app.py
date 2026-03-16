@@ -50,7 +50,7 @@ from src.ui_text import (
 try:
     from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 except Exception as _native_history_import_error:  # pragma: no cover - optional dependency path
-    SQLAlchemyDataLayer = None
+    SQLAlchemyDataLayer = object
 else:
     _native_history_import_error = None
 
@@ -2194,6 +2194,13 @@ def _get_pipeline() -> RAGPipeline:
             ollama_config=ollama_cfg,
             openai_api_key=settings.openai_api_key,
             openai_model=settings.openai_model,
+            rerank_blend_weight=getattr(settings, "rerank_blend_weight", 0.6),
+            relevance_min_score_ratio=getattr(settings, "relevance_min_score_ratio", 0.25),
+            relevance_min_keep=getattr(settings, "relevance_min_keep", 3),
+            grounding_min_avg_score=getattr(settings, "grounding_min_avg_score", 0.15),
+            multi_section_max=getattr(settings, "multi_section_max", 3),
+            context_max_tokens=getattr(settings, "context_max_tokens", 100000),
+            query_expansion_enabled=getattr(settings, "query_expansion_enabled", False),
         )
         _apply_runtime_overrides_to_pipeline(pipeline)
         cl.user_session.set("pipeline", pipeline)

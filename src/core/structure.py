@@ -111,16 +111,38 @@ def _iter_page_lines(pages: Iterable[PageText]) -> list[Line]:
     return lines
 
 
+# Patterns that are always boilerplate regardless of frequency
+_BOILERPLATE_PATTERNS: list[re.Pattern[str]] = [
+    # Standalone page numbers: "1", "- 2 -", "Page 3", "Sayfa 5"
+    re.compile(r"^[-–—\s]*\d{1,4}[-–—\s]*$"),
+    re.compile(r"^(page|sayfa|s\.)\s*\d{1,4}\s*$", re.IGNORECASE),
+    # "X / Y" page indicators: "3 / 12", "3/12"
+    re.compile(r"^\d{1,4}\s*/\s*\d{1,4}$"),
+    # Common footer patterns
+    re.compile(r"^(confidential|gizli|taslak|draft)\s*$", re.IGNORECASE),
+]
+
+
 def _detect_boilerplate(lines: list[Line], pages_count: int) -> set[str]:
     """
     Remove repeating headers/footers (document-agnostic heuristic).
 
-    Strategy: consider first/last few non-empty lines per page as candidates.
-    If a candidate repeats on many pages, treat it as boilerplate.
+    Strategy:
+    1. Pattern-based: standalone page numbers, "Page X", "Sayfa X" etc.
+    2. Frequency-based: lines that repeat on >50% of pages in header/footer
+       positions are treated as boilerplate.
     """
-    if pages_count <= 1:
-        return set()
+    boilerplate: set[str] = set()
 
+    if pages_count <= 1:
+        return boilerplate
+
+    # 1) Pattern-based detection (always boilerplate)
+    for ln in lines:
+        if ln.text and any(pat.match(ln.text.strip()) for pat in _BOILERPLATE_PATTERNS):
+            boilerplate.add(ln.text)
+
+    # 2) Frequency-based detection (repeating headers/footers)
     per_page: dict[int, list[str]] = {}
     for ln in lines:
         if ln.text:
@@ -139,7 +161,9 @@ def _detect_boilerplate(lines: list[Line], pages_count: int) -> set[str]:
 
     # "many pages": >50% of pages (rounded down) or at least 2
     threshold = max(2, pages_count // 2 + 1)
-    return {s for s, n in freq.items() if n >= threshold}
+    boilerplate.update(s for s, n in freq.items() if n >= threshold)
+
+    return boilerplate
 
 
 def build_section_tree(ingest: IngestResult) -> SectionNode:
@@ -303,56 +327,85 @@ def flatten_sections(root: SectionNode) -> list[SectionNode]:
 
 def _split_text_semantically(text: str, max_chars: int, overlap_chars: int) -> list[str]:
     """
-    Simple, deterministic splitter:
+    Deterministic paragraph-aware splitter:
     - Split by blank lines into paragraphs
     - Accumulate paragraphs into ~max_chars windows
-    - Add char-overlap between consecutive windows
+    - Paragraph-aligned overlap: carry the last N chars worth of whole
+      paragraphs from the previous chunk (never cuts mid-paragraph)
     """
     paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     if not paras:
         return []
 
-    chunks: list[str] = []
+    # Build paragraph groups that fit within max_chars
+    groups: list[list[str]] = []
     cur: list[str] = []
     cur_len = 0
     for p in paras:
         add_len = len(p) + (2 if cur else 0)
         if cur and cur_len + add_len > max_chars:
-            chunks.append("\n\n".join(cur).strip())
+            groups.append(cur)
             cur = []
             cur_len = 0
         cur.append(p)
         cur_len += add_len
     if cur:
-        chunks.append("\n\n".join(cur).strip())
+        groups.append(cur)
 
-    if overlap_chars <= 0 or len(chunks) <= 1:
-        return chunks
+    if overlap_chars <= 0 or len(groups) <= 1:
+        return ["\n\n".join(g).strip() for g in groups]
 
-    overlapped: list[str] = []
-    prev_tail = ""
-    for i, ch in enumerate(chunks):
-        if i == 0:
-            overlapped.append(ch)
-        else:
-            prefix = prev_tail[-overlap_chars:]
-            merged = (prefix + "\n\n" + ch).strip() if prefix else ch
-            overlapped.append(merged)
-        prev_tail = ch
-    return overlapped
+    # Paragraph-aligned overlap: for each group after the first, prepend
+    # whole paragraphs from the previous group that fit within overlap_chars.
+    chunks: list[str] = ["\n\n".join(groups[0]).strip()]
+    for i in range(1, len(groups)):
+        prev = groups[i - 1]
+        # Walk backwards through previous group's paragraphs
+        overlap_paras: list[str] = []
+        overlap_len = 0
+        for p in reversed(prev):
+            if overlap_len + len(p) + 2 > overlap_chars:
+                break
+            overlap_paras.insert(0, p)
+            overlap_len += len(p) + 2
+        merged_parts = overlap_paras + groups[i]
+        chunks.append("\n\n".join(merged_parts).strip())
+
+    return chunks
+
+
+def _heading_prefix(heading_path: str, file_name: str) -> str:
+    """
+    Extract a short heading prefix from the heading_path to prepend to
+    child chunk text.  This gives the embedding model section context.
+
+    "Case_Study.pdf / 2. Fonksiyonel Gereksinimler / 2.1 Login"
+    → "[2. Fonksiyonel Gereksinimler / 2.1 Login]\n"
+    """
+    path = heading_path
+    # Strip the file name prefix
+    if " / " in path:
+        path = path.split(" / ", 1)[1]
+    path = path.strip()
+    if not path or path == file_name.strip():
+        return ""
+    return f"[{path}]\n"
 
 
 def section_tree_to_chunks(
     ingest: IngestResult,
     root: SectionNode,
-    child_max_chars: int = 1800,
-    child_overlap_chars: int = 200,
+    child_max_chars: int = 1000,
+    child_overlap_chars: int = 150,
 ) -> list[Chunk]:
     """
     Create parent/child chunks per section node.
 
     - Parent chunk: full section text (title + full body)
     - Child chunks: split of full section text for retrieval granularity
+
+    Default child_max_chars=1000 (~250 tokens) is optimized for embedding
+    models that perform best at 128-256 token inputs.
     """
     chunks: list[Chunk] = []
 
@@ -388,6 +441,7 @@ def section_tree_to_chunks(
                 if not child_texts:
                     child_texts = [root_text]
 
+                _hpfx = _heading_prefix(node.heading_path, ingest.file_name)
                 for idx, ct in enumerate(child_texts):
                     chunks.append(
                         Chunk(
@@ -399,7 +453,7 @@ def section_tree_to_chunks(
                             heading_path=node.heading_path,
                             page_start=node.page_start,
                             page_end=node.page_end,
-                            text=ct,
+                            text=_hpfx + ct,
                             kind="child",
                         )
                     )
@@ -433,6 +487,7 @@ def section_tree_to_chunks(
         if not child_texts:
             child_texts = [parent_text]
 
+        _hpfx = _heading_prefix(node.heading_path, ingest.file_name)
         for idx, ct in enumerate(child_texts):
             chunks.append(
                 Chunk(
@@ -444,7 +499,7 @@ def section_tree_to_chunks(
                     heading_path=node.heading_path,
                     page_start=node.page_start,
                     page_end=node.page_end,
-                    text=ct,
+                    text=_hpfx + ct,
                     kind="child",
                 )
             )

@@ -84,6 +84,15 @@ class Settings:
     ollama_vlm_model: str
     ollama_timeout: int
 
+    # RAG retrieval thresholds
+    rerank_blend_weight: float        # embedding vs RRF blend (0..1, default 0.6)
+    relevance_min_score_ratio: float  # min score / max score ratio (default 0.25)
+    relevance_min_keep: int           # minimum evidence to keep (default 3)
+    grounding_min_avg_score: float    # pre-generation grounding threshold (default 0.15)
+    multi_section_max: int            # max sections for multi_section intent (default 3)
+    context_max_tokens: int           # max tokens for LLM context window (default 100000)
+    query_expansion_enabled: bool     # enable Gemini-based multi-query expansion
+
 
 def load_settings() -> Settings:
     # Load .env if present (dev-friendly)
@@ -236,6 +245,46 @@ def load_settings() -> Settings:
         section_fetch_max_depth = 2
     section_fetch_max_depth = max(0, min(10, section_fetch_max_depth))
 
+    # ── RAG retrieval thresholds ──────────────────────────────────────────
+    try:
+        rerank_blend_weight = float(os.getenv("RERANK_BLEND_WEIGHT", "0.6").strip())
+    except (ValueError, TypeError):
+        rerank_blend_weight = 0.6
+    rerank_blend_weight = max(0.0, min(1.0, rerank_blend_weight))
+
+    try:
+        relevance_min_score_ratio = float(os.getenv("RELEVANCE_MIN_SCORE_RATIO", "0.25").strip())
+    except (ValueError, TypeError):
+        relevance_min_score_ratio = 0.25
+    relevance_min_score_ratio = max(0.0, min(1.0, relevance_min_score_ratio))
+
+    try:
+        relevance_min_keep = int(os.getenv("RELEVANCE_MIN_KEEP", "3").strip())
+    except (ValueError, TypeError):
+        relevance_min_keep = 3
+    relevance_min_keep = max(1, min(50, relevance_min_keep))
+
+    try:
+        grounding_min_avg_score = float(os.getenv("GROUNDING_MIN_AVG_SCORE", "0.15").strip())
+    except (ValueError, TypeError):
+        grounding_min_avg_score = 0.15
+    grounding_min_avg_score = max(0.0, min(1.0, grounding_min_avg_score))
+
+    try:
+        multi_section_max = int(os.getenv("MULTI_SECTION_MAX", "3").strip())
+    except (ValueError, TypeError):
+        multi_section_max = 3
+    multi_section_max = max(1, min(10, multi_section_max))
+
+    try:
+        context_max_tokens = int(os.getenv("CONTEXT_MAX_TOKENS", "100000").strip())
+    except (ValueError, TypeError):
+        context_max_tokens = 100000
+    context_max_tokens = max(1000, min(500000, context_max_tokens))
+
+    query_expansion_enabled_raw = (os.getenv("QUERY_EXPANSION_ENABLED", "0") or "0").strip().lower()
+    query_expansion_enabled = query_expansion_enabled_raw in ("1", "true", "yes", "y", "on")
+
     # Embedding model selection:
     # - Default: Gemini embedding for highest remote quality.
     # - "auto" keeps the previous local behavior:
@@ -304,4 +353,11 @@ def load_settings() -> Settings:
         ollama_llm_model=ollama_llm_model,
         ollama_vlm_model=ollama_vlm_model,
         ollama_timeout=ollama_timeout,
+        rerank_blend_weight=rerank_blend_weight,
+        relevance_min_score_ratio=relevance_min_score_ratio,
+        relevance_min_keep=relevance_min_keep,
+        grounding_min_avg_score=grounding_min_avg_score,
+        multi_section_max=multi_section_max,
+        context_max_tokens=context_max_tokens,
+        query_expansion_enabled=query_expansion_enabled,
     )

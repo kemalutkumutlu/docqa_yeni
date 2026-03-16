@@ -712,9 +712,8 @@ def ingest_pdf(
                 if form_fields:
                     text_norm = text_norm + "\n" + form_fields
 
-            # ── Prepend TOC/bookmarks to first page ──────────────────────────────
-            if page_no == 1 and toc_prefix:
-                text_norm = toc_prefix + "\n" + text_norm
+            # TOC is stored separately as a dedicated chunk (not prepended to page text)
+            # to avoid creating phantom section headings from TOC entries.
 
             pages.append(
                 PageText(
@@ -765,6 +764,7 @@ def ingest_pdf(
         visual_assets=visual_assets,
         structured_tables=structured_tables,
         warnings=warnings,
+        toc_text=toc_prefix,
     )
 
 

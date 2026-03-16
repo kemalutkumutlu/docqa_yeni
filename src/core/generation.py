@@ -9,6 +9,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -16,6 +17,8 @@ import json
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 import httpx
 
@@ -177,87 +180,14 @@ def _openai_chat_completion_stream(
     raise last_err  # type: ignore[misc]
 
 
-# ── System prompts ───────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT_BASE = """\
-Sen bir belge analiz asistanısın. Sana verilen BAĞLAM parçalarını kullanarak \
-kullanıcının sorusunu yanıtla.
-
-KESİN KURALLAR — bunlara uymazsan cevap geçersiz sayılır:
-1. SADECE verilen BAĞLAM'daki bilgileri kullan. Bağlamda olmayan hiçbir bilgiyi \
-   ekleme, tahmin etme veya yorumlama.
-2. Eğer sorunun cevabı bağlamda yoksa veya yetersizse, tam olarak şu cümleyi yaz: \
-   "Belgede bu bilgi bulunamadı."
-3. Her bilgi cümlesinin sonuna kaynak referansı ekle: [DosyaAdı - Sayfa X]
-   Bölgesel görsel kanıt varsa region bilgisini de koru: [DosyaAdı - Sayfa X, Region top]
-4. Türkçe cevap ver (kullanıcı İngilizce sorarsa İngilizce).
-5. Cevabı düzgün formatlayarak ver (madde işaretleri, numaralı liste vb.).
-"""
-
-_SECTION_LIST_ADDENDUM = """\
-UYARI: Bu bir "liste/bölüm çıkarma" sorusudur. Bağlamdaki ilgili bölümün \
-ALTINDAKİ TÜM maddeleri, satırları veya alt başlıkları eksiksiz olarak listele. \
-Hiçbirini atlama. Eğer bağlamda {expected} adet madde varsa, cevabında da en az \
-{expected} adet madde olmalıdır.
-"""
-
-_CHAT_SYSTEM_PROMPT = """\
-Sen yardımcı bir asistansın.
-
-Kurallar:
-- Normal sohbet edebilirsin (selamlaşma, hal hatır, genel sorular).
-- Bu modda "belge içeriğine dayanarak" iddia üretme; belge soruları için kullanıcıdan belge moduna geçmesini iste.
-- Gereksiz yere kaynak/citation yazma.
-- Yanıtı asla yarım bırakma; mutlaka tamamlanmış bir cümle veya paragrafla bitir.
-"""
-
-_INCOMPLETE_ENDINGS = (
-    ":",
-    ";",
-    ",",
-    "-",
-    "–",
-    "—",
-    "/",
-    "(",
-    "[",
-    "{",
-    "“",
-    '"',
+from .prompts import (
+    SYSTEM_PROMPT_BASE,
+    SECTION_LIST_ADDENDUM,
+    MULTI_SECTION_ADDENDUM,
+    CHAT_SYSTEM_PROMPT,
+    chat_style_addendum,
 )
-
-_COMPLETE_ENDINGS = (
-    ".",
-    "!",
-    "?",
-    "]",
-    ")",
-    "}",
-    '"',
-    "”",
-    "'",
-    "…",
-)
-
-
-def _chat_style_addendum(chat_style: str) -> str:
-    style = (chat_style or "").strip().lower()
-    if style == "empathetic":
-        return (
-            "\n\nTON KILAVUZU:\n"
-            "- Kullanıcı olumsuz/üzgün bir duygu paylaşıyor.\n"
-            "- Kısa bir empati ifadesiyle başla (örn. 'Üzgünüm, zor bir gün gibi görünüyor.').\n"
-            "- Yargılamadan, sakin ve destekleyici bir dille devam et.\n"
-        )
-    if style == "congratulatory":
-        return (
-            "\n\nTON KILAVUZU:\n"
-            "- Kullanıcı övgü/tebrik içerikli bir ifade kullandı.\n"
-            "- Kısa bir teşekkür veya tebrik karşılığı ver.\n"
-            "- Samimi ama kısa kal; abartılı ifadelerden kaçın.\n"
-        )
-    return ""
-
 
 def _response_looks_incomplete(text: str) -> bool:
     """
@@ -460,15 +390,116 @@ def _language_addendum(query: str) -> str:
 
 # ── Context builder ──────────────────────────────────────────────────────────
 
+def _verify_answer_grounding(answer: str, context: str) -> str:
+    """
+    Post-generation verification: check if the answer is grounded in context.
+
+    Heuristic checks:
+    1. If answer contains specific numbers/names not found in context → flag
+    2. If answer is very long but context is very short → suspicious
+    3. If answer says "belgede" + positive claim but context is empty → override
+
+    Returns the (possibly modified) answer.
+    """
+    answer_stripped = answer.strip()
+    _NOT_FOUND = "Belgede bu bilgi bulunamadı."
+
+    # If context is empty/tiny but answer is substantive → force not-found
+    if len(context.strip()) < 20 and answer_stripped and answer_stripped != _NOT_FOUND:
+        return _NOT_FOUND
+
+    # If answer is much longer than context (ratio > 3x) and context is short → suspicious
+    if context.strip() and len(answer_stripped) > 3 * len(context.strip()) and len(context.strip()) < 200:
+        # Don't override if the answer looks like a well-cited response
+        citation_count = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer_stripped))
+        if citation_count == 0:
+            return _NOT_FOUND
+
+    return answer
+
+
+def _grounding_check(evidences: List[Evidence], *, min_avg_score: float = -1.0) -> List[Evidence]:
+    """
+    Pre-generation grounding check: verify that retrieved evidence is
+    actually relevant before sending to the LLM.
+
+    If the average score of non-enrichment evidence is below *min_avg_score*,
+    return an empty list — causing the LLM to respond with
+    "Belgede bu bilgi bulunamadı." instead of hallucinating from
+    weakly-related context.
+
+    Section-complete fetches (score=1.0) are always trusted.
+    """
+    if not evidences:
+        return evidences
+
+    # Resolve threshold: -1 sentinel means "read from env/config default"
+    if min_avg_score < 0:
+        import os
+        try:
+            min_avg_score = float(os.getenv("GROUNDING_MIN_AVG_SCORE", "0.15"))
+        except (ValueError, TypeError):
+            min_avg_score = 0.15
+
+    # Section-complete fetches always pass grounding
+    if any(ev.score == 1.0 for ev in evidences):
+        return evidences
+
+    # Compute average score of real evidence
+    # Exclude enrichment parent chunks (score < 0 sentinel) from avg calculation
+    real_scores = [ev.score for ev in evidences if ev.score > 0]
+    if not real_scores:
+        return evidences
+
+    avg = sum(real_scores) / len(real_scores)
+    if avg < min_avg_score:
+        return []  # empty context → LLM says "Belgede bu bilgi bulunamadı."
+
+    return evidences
+
+
+def _estimate_tokens(text: str) -> int:
+    """
+    Fast token estimation without external dependencies.
+
+    Heuristic: ~1 token per 3.5 chars for Turkish/mixed text.
+    This is conservative (overestimates) to avoid exceeding limits.
+    """
+    if not text:
+        return 0
+    return max(1, int(len(text) / 3.5))
+
+
+# Maximum context tokens to send to the LLM.
+# Configurable via CONTEXT_MAX_TOKENS env var (default: 100_000).
+def _get_context_max_tokens() -> int:
+    import os
+    try:
+        return int(os.getenv("CONTEXT_MAX_TOKENS", "100000"))
+    except (ValueError, TypeError):
+        return 100_000
+
+
 def _build_context(evidences: List[Evidence]) -> str:
     """
     Assemble evidence chunks into a single context string for the LLM.
     Prefer parent chunks (full sections) to avoid redundancy with children.
+    Enforces a token budget to prevent context window overflow.
     """
+    # Grounding check: reject weakly-related evidence before context building
+    evidences = _grounding_check(evidences)
+
+    if not evidences:
+        return ""
+
+    max_tokens = _get_context_max_tokens()
+
     # Deduplicate: if a parent exists for a section, skip its children
     parent_sections = {ev.section_id for ev in evidences if ev.kind == "parent"}
     blocks: list[str] = []
     seen_sections: set[str] = set()
+    total_tokens = 0
+    separator_tokens = _estimate_tokens("\n\n---\n\n")
 
     for ev in evidences:
         # Skip child chunks if parent is already included
@@ -481,8 +512,17 @@ def _build_context(evidences: List[Evidence]) -> str:
         seen_sections.add(key)
 
         header = _format_evidence_header(ev)
+        block = f"{header}\n{ev.text}"
+        block_tokens = _estimate_tokens(block)
 
-        blocks.append(f"{header}\n{ev.text}")
+        # Check if adding this block would exceed the budget
+        sep_cost = separator_tokens if blocks else 0
+        if total_tokens + block_tokens + sep_cost > max_tokens and blocks:
+            # Budget exhausted — stop adding more evidence
+            break
+
+        blocks.append(block)
+        total_tokens += block_tokens + sep_cost
 
     return "\n\n---\n\n".join(blocks)
 
@@ -557,6 +597,7 @@ def _visual_parts(evidences: List[Evidence], limit: int = 2) -> list[Any]:
         try:
             img_bytes = Path(ev.image_path).read_bytes()
         except Exception:
+            logger.debug("Failed to read visual evidence image: %s", ev.image_path, exc_info=True)
             continue
         parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
         seen_paths.add(ev.image_path)
@@ -868,7 +909,7 @@ def generate_chat_answer(
     """
     Chat-only generation (no retrieval, no citations).
     """
-    system = _CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query)
+    system = CHAT_SYSTEM_PROMPT + chat_style_addendum(chat_style) + _language_addendum(query)
     (
         build_gemini_client,
         gemini_model_candidates,
@@ -926,7 +967,7 @@ def generate_chat_answer_openai(
     """
     Chat-only generation via OpenAI Chat Completions.
     """
-    system = _CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query)
+    system = CHAT_SYSTEM_PROMPT + chat_style_addendum(chat_style) + _language_addendum(query)
 
     def _call_chat(user_contents: str, *, temperature: float = 0.4, max_tokens: int = 4096) -> str:
         last_err: Optional[Exception] = None
@@ -1008,11 +1049,13 @@ def generate_answer(
     context = _build_context(retrieval.evidences)
 
     # Build system prompt
-    system = _SYSTEM_PROMPT_BASE + _language_addendum(query)
+    system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
         coverage_expected = retrieval.coverage.expected_items
-        system += _SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+        system += SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+    elif retrieval.intent == "multi_section":
+        system += MULTI_SECTION_ADDENDUM
 
     # Build user message with context
     user_message = (
@@ -1143,6 +1186,9 @@ def generate_answer(
                 f"Lütfen cevabı kontrol edin."
             )
 
+    # Post-generation grounding verification
+    answer = _verify_answer_grounding(answer, context)
+
     return GenerationResult(
         answer=answer,
         citations_found=citations_found,
@@ -1193,11 +1239,13 @@ def generate_answer_openai(
         )
 
     context = _build_context(retrieval.evidences)
-    system = _SYSTEM_PROMPT_BASE + _language_addendum(query)
+    system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
         coverage_expected = retrieval.coverage.expected_items
-        system += _SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+        system += SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+    elif retrieval.intent == "multi_section":
+        system += MULTI_SECTION_ADDENDUM
 
     user_message = (
         f"BAĞLAM:\n{context}\n\n"
@@ -1364,11 +1412,13 @@ def generate_answer_stream(
         )
 
     context = _build_context(retrieval.evidences)
-    system = _SYSTEM_PROMPT_BASE + _language_addendum(query)
+    system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
         coverage_expected = retrieval.coverage.expected_items
-        system += _SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+        system += SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+    elif retrieval.intent == "multi_section":
+        system += MULTI_SECTION_ADDENDUM
 
     user_message = (
         f"BAĞLAM:\n{context}\n\n"
@@ -1551,11 +1601,13 @@ def generate_answer_openai_stream(
         )
 
     context = _build_context(retrieval.evidences)
-    system = _SYSTEM_PROMPT_BASE + _language_addendum(query)
+    system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
         coverage_expected = retrieval.coverage.expected_items
-        system += _SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+        system += SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+    elif retrieval.intent == "multi_section":
+        system += MULTI_SECTION_ADDENDUM
 
     user_message = (
         f"BAĞLAM:\n{context}\n\n"
@@ -1631,7 +1683,7 @@ def generate_chat_answer_local(
     """
     from .local_llm import OllamaConfig, ollama_chat  # noqa: F811
 
-    system = _CHAT_SYSTEM_PROMPT + _chat_style_addendum(chat_style) + _language_addendum(query)
+    system = CHAT_SYSTEM_PROMPT + chat_style_addendum(chat_style) + _language_addendum(query)
     def _call_chat(user_message: str, *, temperature: float = 0.4, max_tokens: int = 4096) -> str:
         return ollama_chat(
             cfg=ollama_cfg,
@@ -1695,11 +1747,13 @@ def generate_answer_local(
     context = _build_context(retrieval.evidences)
 
     # Build system prompt (SAME as Gemini path)
-    system = _SYSTEM_PROMPT_BASE + _language_addendum(query)
+    system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
         coverage_expected = retrieval.coverage.expected_items
-        system += _SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+        system += SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+    elif retrieval.intent == "multi_section":
+        system += MULTI_SECTION_ADDENDUM
 
     user_message = (
         f"BAĞLAM:\n{context}\n\n"
@@ -1838,11 +1892,13 @@ def generate_answer_local_stream(
         )
 
     context = _build_context(retrieval.evidences)
-    system = _SYSTEM_PROMPT_BASE + _language_addendum(query)
+    system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
         coverage_expected = retrieval.coverage.expected_items
-        system += _SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+        system += SECTION_LIST_ADDENDUM.format(expected=coverage_expected)
+    elif retrieval.intent == "multi_section":
+        system += MULTI_SECTION_ADDENDUM
 
     user_message = (
         f"BAĞLAM:\n{context}\n\n"
