@@ -369,31 +369,60 @@ README.md
 TESTING.md
 DEVLOG.md
 GPU_REQUIREMENTS.md
+SUNUM_ICERIGI.md
 chainlit.md
 .env.example
 
 scripts/
+  baseline_gate.py
+  build_index.py
   docling_layout_runner.py
   docling_text_runner.py
+  eval_case_study.py
+  eval_retrieval.py
+  extract_text.py
+  folder_suite.py
   generate_layout_sidecar.py
+  hallucination_test.py
   inspect_regions.py
+  lang_gate.py
   paddle_ocr_runner.py
   preflight.py
+  preview_structure.py
+  search_index.py
+  smoke_suite.py
   validate_layout_sidecar.py
 
 src/
   config.py
   core/
+    content_normalization.py
+    doc_cache.py
+    embedding.py
+    eventlog.py
+    evidence.py
+    gemini_client.py
     generation.py
+    hybrid.py
+    indexing.py
     ingestion.py
     layout_detector.py
     layout_regions.py
+    local_llm.py
     models.py
     multimodal.py
     ocr_backend.py
     pipeline.py
+    prompts.py
+    query_classification.py
+    ranking.py
     retrieval.py
+    sparse.py
+    structure.py
     table_structure.py
+    utils.py
+    vectorstore.py
+    vlm_extract.py
 ```
 
 ## Kisa Not

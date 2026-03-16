@@ -44,6 +44,14 @@ En hizli regresyon kapisi:
 .venv-gpu/bin/python -m py_compile app.py src/config.py src/core/*.py scripts/*.py
 ```
 
+Hedefli birim testleri:
+
+```bash
+.venv-gpu/bin/python scripts/test_bug.py
+.venv-gpu/bin/python scripts/test_generation.py
+.venv-gpu/bin/python scripts/test_retrieval.py
+```
+
 Bu adim:
 
 - import hatalari

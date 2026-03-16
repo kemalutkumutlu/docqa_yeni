@@ -187,10 +187,9 @@ from .prompts import (
     MULTI_SECTION_ADDENDUM,
     CHAT_SYSTEM_PROMPT,
     chat_style_addendum,
+    _COMPLETE_ENDINGS,
+    _INCOMPLETE_ENDINGS,
 )
-
-_COMPLETE_ENDINGS = (".", "!", "?", '."', '!"', '?"')
-_INCOMPLETE_ENDINGS = (",", " ve", " ile", " veya", " çünkü", " ama", " fakat", " Ancak", " Ayrıca")
 
 def _response_looks_incomplete(text: str) -> bool:
     """
@@ -421,7 +420,27 @@ def _verify_answer_grounding(answer: str, context: str) -> str:
     return answer
 
 
-def _grounding_check(evidences: List[Evidence], *, min_avg_score: float = -1.0) -> List[Evidence]:
+def _strip_thinking_leak(text: str) -> str:
+    """Remove Gemini thinking-model internal monologue lines that leak into the response.
+
+    Thinking models (e.g. gemini-2.5-pro) sometimes output their chain-of-thought
+    as lines starting with '*   ' (asterisk + 2+ spaces). These should never appear
+    in the final answer shown to the user.
+    """
+    if not text or "*   " not in text:
+        return text
+    lines = text.splitlines()
+    cleaned = [ln for ln in lines if not re.match(r"^\*\s{2,}", ln)]
+    result = "\n".join(cleaned).strip()
+    return result if result else text
+
+
+def _grounding_check(
+    evidences: List[Evidence],
+    *,
+    min_avg_score: float = -1.0,
+    intent: str = "normal_qa",
+) -> List[Evidence]:
     """
     Pre-generation grounding check: verify that retrieved evidence is
     actually relevant before sending to the LLM.
@@ -444,6 +463,13 @@ def _grounding_check(evidences: List[Evidence], *, min_avg_score: float = -1.0) 
         except (ValueError, TypeError):
             min_avg_score = 0.15
 
+    # Intent-specific adjustment: section_list needs stricter grounding
+    # (false positives worse than misses), normal_qa can be looser (recall)
+    if intent == "section_list":
+        min_avg_score = max(min_avg_score, 0.20)
+    elif intent == "normal_qa":
+        min_avg_score = min(min_avg_score, 0.12)
+
     # Section-complete fetches always pass grounding
     if any(ev.score == 1.0 for ev in evidences):
         return evidences
@@ -459,6 +485,92 @@ def _grounding_check(evidences: List[Evidence], *, min_avg_score: float = -1.0) 
         return []  # empty context → LLM says "Belgede bu bilgi bulunamadı."
 
     return evidences
+
+
+def _clean_table_text(text: str) -> str:
+    """
+    Clean up malformed table markdown before sending to the LLM.
+
+    PDF tables often extract as broken pipe-separated strings like:
+      |||||||: |Col1|Col2|Col1|Col2|...
+      |---|---|---| |value|value|value|
+
+    This function:
+    1. Removes duplicate pipe sequences (||||||| → single row boundary)
+    2. Strips <br> HTML entities
+    3. Deduplicates repeated cell values within a row
+    4. Removes pure separator rows (|---|---|)
+    5. Returns a clean, readable representation
+    """
+    import re as _re
+
+    if not text or "|" not in text:
+        return text
+
+    lines = text.splitlines()
+    cleaned: list[str] = []
+
+    # Pre-detect header rows: any line immediately before a |---|---| separator
+    # is a column-name header and should be skipped (not converted to a data bullet).
+    header_indices: set[int] = set()
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if _re.match(r"^[\|\s\-:]+$", s) and "--" in s and i > 0:
+            header_indices.add(i - 1)
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Skip table header rows (column name rows before separator)
+        if idx in header_indices:
+            continue
+
+        # Skip pure markdown separator rows
+        if _re.match(r"^[\|\s\-:]+$", stripped) and "--" in stripped:
+            continue
+
+        # Skip lines that are just pipes and spaces
+        if _re.match(r"^\|+\s*$", stripped):
+            continue
+
+        # Remove <br> HTML
+        stripped = stripped.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+
+        # If line contains pipe-separated content, parse it
+        if "|" in stripped:
+            # Split on | and clean each cell
+            parts = [p.strip() for p in stripped.split("|")]
+            # Remove empty AND pure-punctuation tokens like ": " from "|||||||:"
+            parts = [p for p in parts if p and not _re.match(r'^[:\s\-|]+$', p)]
+            # Strip markdown bold/italic markers from cell values (VLM outputs **bold**)
+            parts = [_re.sub(r'\*{1,3}', '', p).strip() for p in parts]
+            parts = [p for p in parts if p]
+
+            # Deduplicate repeated cell values
+            deduped: list[str] = []
+            seen_in_row: set[str] = set()
+            for p in parts:
+                if p and p not in seen_in_row:
+                    deduped.append(p)
+                    seen_in_row.add(p)
+
+            if deduped:
+                # Convert to readable bullet format instead of raw pipes
+                if len(deduped) == 1:
+                    cleaned.append(f"- {deduped[0]}")
+                elif len(deduped) == 2:
+                    cleaned.append(f"- {deduped[0]}: {deduped[1]}")
+                else:
+                    label = deduped[0]
+                    desc = " ".join(deduped[1:])
+                    cleaned.append(f"- {label}: {desc}")
+            continue
+
+        # Non-pipe line: keep as-is
+        if stripped:
+            cleaned.append(stripped)
+
+    return "\n".join(cleaned)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -483,14 +595,14 @@ def _get_context_max_tokens() -> int:
         return 100_000
 
 
-def _build_context(evidences: List[Evidence]) -> str:
+def _build_context(evidences: List[Evidence], *, intent: str = "normal_qa") -> str:
     """
     Assemble evidence chunks into a single context string for the LLM.
     Prefer parent chunks (full sections) to avoid redundancy with children.
     Enforces a token budget to prevent context window overflow.
     """
     # Grounding check: reject weakly-related evidence before context building
-    evidences = _grounding_check(evidences)
+    evidences = _grounding_check(evidences, intent=intent)
 
     if not evidences:
         return ""
@@ -515,7 +627,9 @@ def _build_context(evidences: List[Evidence]) -> str:
         seen_sections.add(key)
 
         header = _format_evidence_header(ev)
-        block = f"{header}\n{ev.text}"
+        # Clean up malformed table markdown before sending to LLM
+        ev_text = _clean_table_text(ev.text) if "|" in (ev.text or "") else ev.text
+        block = f"{header}\n{ev_text}"
         block_tokens = _estimate_tokens(block)
 
         # Check if adding this block would exceed the budget
@@ -836,41 +950,81 @@ def _render_deterministic_section_list(retrieval: RetrievalResult) -> Optional[s
         return None
 
     target_sid = retrieval.coverage.section_id
-    parent_ev: Optional[Evidence] = None
-    for ev in retrieval.evidences:
-        if ev.kind == "parent" and ev.section_id == target_sid:
-            parent_ev = ev
-            break
-    if parent_ev is None:
-        # fallback: any parent
-        for ev in retrieval.evidences:
-            if ev.kind == "parent":
-                parent_ev = ev
-                break
+    expected = retrieval.coverage.expected_items if retrieval.coverage else None
+
+    # Collect all parent evidence chunks; target section first, then subsections.
+    # VLM multi-column reading order can place the actual list table in a subsection
+    # chunk even though the query targets the parent section.
+    parent_evs: list = [ev for ev in retrieval.evidences if ev.kind == "parent"]
+    parent_evs.sort(key=lambda ev: (0 if ev.section_id == target_sid else 1, ev.section_id or ""))
+
+    if not parent_evs:
+        return None
+
+    def _render_items(ev: Evidence, items: list) -> Optional[str]:
+        file_name = _extract_file_name_from_heading_path(ev.heading_path)
+        cite = _format_citation(file_name, ev)
+        lines_out: list[str] = []
+        for idx, it in enumerate(items, start=1):
+            t = (it or "").strip()
+            if t.startswith("- "):
+                t = t[2:]
+            if re.match(r'^(#|Col\d+|col_?\d*)\s*:', t):
+                continue
+            t = re.sub(r'^\d+:\s*', '', t)
+            if not t:
+                continue
+            lines_out.append(f"{idx}. {t} {cite}")
+        return "\n".join(lines_out).strip() or None
+
+    # ── Pass 1: prefer explicitly numbered table rows ("- N: item") ──────────
+    # A properly numbered delivery/list table (rows: "1 X", "2 Y" …) is a strong
+    # signal of a structured list, and should be preferred over plain-label tables
+    # (which may be requirements tables mis-assigned to this section by the VLM).
+    best_num_ev: Optional[Evidence] = None
+    best_num_items: list = []
+    for ev in parent_evs:
+        text = ev.text or ""
+        clean = _clean_table_text(text) if "|" in text else text
+        num_items = [
+            ln.strip() for ln in clean.splitlines()
+            if re.match(r"^-\s*\d+[:\s]", ln.strip())
+        ]
+        if len(num_items) >= 3 and len(num_items) > len(best_num_items):
+            best_num_items = num_items
+            best_num_ev = ev
+
+    if best_num_ev and len(best_num_items) >= 3:
+        # Deduplicate rows with the same leading number (merged-cell split produces duplicates)
+        seen_nums: set = set()
+        deduped_num_items: list = []
+        for ln in best_num_items:
+            m = re.match(r"^-\s*(\d+)[:\s]", ln)
+            n = m.group(1) if m else None
+            if n and n in seen_nums:
+                continue
+            if n:
+                seen_nums.add(n)
+            deduped_num_items.append(ln)
+        best_num_items = deduped_num_items
+        result = _render_items(best_num_ev, best_num_items)
+        if result:
+            return result
+
+    # ── Pass 2: original behaviour — use target section's parent ─────────────
+    parent_ev: Optional[Evidence] = parent_evs[0] if parent_evs else None
     if parent_ev is None:
         return None
 
-    items = _extract_section_list_items(parent_ev.text)
+    clean_text = _clean_table_text(parent_ev.text) if "|" in (parent_ev.text or "") else parent_ev.text
+    items = _extract_section_list_items(clean_text)
     if not items:
         return None
 
-    # Only use deterministic rendering if it meets (or exceeds) the structural expected count.
-    expected = retrieval.coverage.expected_items if retrieval.coverage else None
     if expected is not None and len(items) < expected:
         return None
 
-    file_name = _extract_file_name_from_heading_path(parent_ev.heading_path)
-    cite = _format_citation(file_name, parent_ev)
-
-    # Render as numbered list; keep items as-is (extract-only; no translation).
-    lines_out: list[str] = []
-    for idx, it in enumerate(items, start=1):
-        t = (it or "").strip()
-        if not t:
-            continue
-        lines_out.append(f"{idx}. {t} {cite}")
-
-    return "\n".join(lines_out).strip() or None
+    return _render_items(parent_ev, items)
 
 
 # ── Coverage post-validation ─────────────────────────────────────────────────
@@ -938,7 +1092,7 @@ def generate_chat_answer(
                                 max_output_tokens=max_tokens,
                             ),
                         )
-                        return (resp.text or "").strip()
+                        return _strip_thinking_leak((resp.text or "").strip())
                     except Exception as model_exc:
                         last_model_error = model_exc
                         if not is_model_not_found_error(model_exc):
@@ -1049,7 +1203,7 @@ def generate_answer(
             context_preview="",  # deterministic path doesn't need to expose context
         )
 
-    context = _build_context(retrieval.evidences)
+    context = _build_context(retrieval.evidences, intent=retrieval.intent)
 
     # Build system prompt
     system = SYSTEM_PROMPT_BASE + _language_addendum(query)
@@ -1103,7 +1257,7 @@ def generate_answer(
                                 max_output_tokens=max_tokens,
                             ),
                         )
-                        return response.text or ""
+                        return _strip_thinking_leak(response.text or "")
                     except Exception as model_exc:
                         last_model_error = model_exc
                         if not is_model_not_found_error(model_exc):
@@ -1241,7 +1395,7 @@ def generate_answer_openai(
             context_preview="",
         )
 
-    context = _build_context(retrieval.evidences)
+    context = _build_context(retrieval.evidences, intent=retrieval.intent)
     system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
@@ -1414,7 +1568,7 @@ def generate_answer_stream(
             context_preview="",
         )
 
-    context = _build_context(retrieval.evidences)
+    context = _build_context(retrieval.evidences, intent=retrieval.intent)
     system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
@@ -1481,7 +1635,7 @@ def generate_answer_stream(
     if not chunks and last_err is not None:
         raise last_err
 
-    answer = "".join(chunks).strip() or "Belgede bu bilgi bulunamadı."
+    answer = _strip_thinking_leak("".join(chunks).strip()) or "Belgede bu bilgi bulunamadı."
     if answer.strip() != "Belgede bu bilgi bulunamadı.":
         def _continue_call(prompt: str) -> str:
             last_err: Optional[Exception] = None
@@ -1501,7 +1655,7 @@ def generate_answer_stream(
                                     max_output_tokens=1024,
                                 ),
                             )
-                            return (resp.text or "").strip()
+                            return _strip_thinking_leak((resp.text or "").strip())
                         except Exception as model_exc:
                             last_model_error_inner = model_exc
                             if not is_model_not_found_error(model_exc):
@@ -1603,7 +1757,7 @@ def generate_answer_openai_stream(
             context_preview="",
         )
 
-    context = _build_context(retrieval.evidences)
+    context = _build_context(retrieval.evidences, intent=retrieval.intent)
     system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:
@@ -1747,7 +1901,7 @@ def generate_answer_local(
             context_preview="",
         )
 
-    context = _build_context(retrieval.evidences)
+    context = _build_context(retrieval.evidences, intent=retrieval.intent)
 
     # Build system prompt (SAME as Gemini path)
     system = SYSTEM_PROMPT_BASE + _language_addendum(query)
@@ -1894,7 +2048,7 @@ def generate_answer_local_stream(
             context_preview="",
         )
 
-    context = _build_context(retrieval.evidences)
+    context = _build_context(retrieval.evidences, intent=retrieval.intent)
     system = SYSTEM_PROMPT_BASE + _language_addendum(query)
     coverage_expected: Optional[int] = None
     if retrieval.intent == "section_list" and retrieval.coverage:

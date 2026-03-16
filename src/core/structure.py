@@ -57,6 +57,24 @@ _RE_NUM_DOT = re.compile(r"^(?P<num>\d+(?:\.\d+)*)\.\s+(?P<title>.+?)\s*$")
 _RE_NUM_DASH = re.compile(r"^(?P<num>\d+(?:\.\d+)*)\s*[-–—]\s*(?P<title>.+?)\s*$")
 _RE_ALPHA_NUM = re.compile(r"^(?P<alpha>[A-Z])\.(?P<num>\d+(?:\.\d+)*)\s+(?P<title>.+?)\s*$")
 
+# Markdown heading/bold patterns added by VLMs (e.g. "## 4. Teslimatlar", "**4.1 Title**")
+_RE_MD_HASHES = re.compile(r"^#{1,6}\s+")
+_RE_MD_BOLD = re.compile(r"^\*{1,3}(.+?)\*{1,3}$")
+_RE_MD_UNDER = re.compile(r"^_{1,3}(.+?)_{1,3}$")
+
+
+def _strip_markdown_formatting(s: str) -> str:
+    """Strip VLM-added markdown from a heading line before pattern matching."""
+    s = _RE_MD_HASHES.sub("", s).strip()
+    m = _RE_MD_BOLD.match(s)
+    if m:
+        s = m.group(1).strip()
+        return s
+    m = _RE_MD_UNDER.match(s)
+    if m:
+        s = m.group(1).strip()
+    return s
+
 
 def _heading_level_from_key(key: str) -> int:
     # "2" -> 1, "4.1" -> 2, "A.4.1" -> 3
@@ -77,11 +95,18 @@ def detect_heading(line: str) -> Optional[Heading]:
       - "4.1. Title"
       - "4.1 - Title"
       - "A.4.1 Title"
+      - "## 4. Title"  (VLM markdown output)
+      - "**4. Title**" (VLM bold output)
 
     Non-numbered headings are intentionally NOT detected here yet, to avoid
     false positives (e.g., repeating headers/footers).
     """
     s = line.strip()
+    if not s:
+        return None
+
+    # Strip markdown formatting VLMs may add (## heading, **bold**, __under__)
+    s = _strip_markdown_formatting(s)
     if not s:
         return None
 
@@ -208,6 +233,11 @@ def build_section_tree(ingest: IngestResult) -> SectionNode:
             return False
         # Reject lines ending in sentence-ending punctuation (colon is ok for "Summary:")
         if t.endswith((".", "!", "?", ";")):
+            return False
+        # Reject "Label: Value" key-value pairs — these are data, not headings.
+        # e.g. "Oğuzcan Özdemir: ASELSAN", "Programlama: Python, C++"
+        colon_idx = t.find(": ")
+        if 0 < colon_idx < len(t) - 2:
             return False
             
         toks = [x for x in re.split(r"\s+", t) if x]
@@ -352,6 +382,30 @@ def flatten_sections(root: SectionNode) -> list[SectionNode]:
     return out
 
 
+def _split_long_paragraph(paragraph: str, max_tokens: int) -> list[str]:
+    """Split a single paragraph at sentence boundaries if it exceeds max_tokens."""
+    if _count_tokens(paragraph) <= max_tokens:
+        return [paragraph]
+    # Turkish/English sentence boundaries: '.', '!', '?' followed by space
+    sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+    if len(sentences) <= 1:
+        return [paragraph]
+    groups: list[str] = []
+    current: list[str] = []
+    current_toks = 0
+    for sent in sentences:
+        sent_toks = _count_tokens(sent)
+        if current and current_toks + sent_toks + 1 > max_tokens:
+            groups.append(" ".join(current))
+            current = []
+            current_toks = 0
+        current.append(sent)
+        current_toks += sent_toks + 1
+    if current:
+        groups.append(" ".join(current))
+    return groups if groups else [paragraph]
+
+
 def _split_text_semantically(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
     """
     Deterministic paragraph-aware token splitter:
@@ -363,6 +417,12 @@ def _split_text_semantically(text: str, max_tokens: int, overlap_tokens: int) ->
     paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     if not paras:
         return []
+
+    # Pre-split paragraphs that exceed max_tokens at sentence boundaries
+    expanded: list[str] = []
+    for p in paras:
+        expanded.extend(_split_long_paragraph(p, max_tokens))
+    paras = expanded
 
     # Build paragraph groups that fit within max_tokens
     groups: list[list[str]] = []

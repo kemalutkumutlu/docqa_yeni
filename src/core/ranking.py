@@ -382,6 +382,19 @@ def count_list_items(text: str) -> int:
     if rows >= 3:
         return rows
 
+    # Pipe-separated table rows (common PDF table format)
+    pipe_rows = 0
+    for ln in lines:
+        cells = [c.strip() for c in ln.split("|") if c.strip()]
+        if len(cells) >= 2:
+            # Skip pure separator rows like |---|---|
+            if all(re.match(r'^[-:]+$', c) for c in cells):
+                continue
+            pipe_rows += 1
+    if pipe_rows >= 3:
+        # Subtract 1 for likely header row
+        return max(pipe_rows - 1, 1)
+
     # Sub-section headings
     heading_count = 0
     for ln in lines:

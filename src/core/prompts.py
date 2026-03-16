@@ -15,6 +15,10 @@ KESİN KURALLAR — bunlara uymazsan cevap geçersiz sayılır:
    Bölgesel görsel kanıt varsa region bilgisini de koru: [DosyaAdı - Sayfa X, Region top]
 4. Türkçe cevap ver (kullanıcı İngilizce sorarsa İngilizce).
 5. Cevabı düzgün formatlayarak ver (madde işaretleri, numaralı liste vb.).
+6. BAĞLAM içinde tablo verisi varsa (| işaretleri, satır/sütun yapısı veya ham tablo \
+   metni): Bu veriyi olduğu gibi tekrar etme. İçeriği yorumla ve düzgün, okunabilir bir \
+   liste veya açıklama olarak yaz. Ham tablo sembollerini (|||, |---|, <br> vb.) \
+   kesinlikle cevaba dahil etme.
 """
 
 SECTION_LIST_ADDENDUM = """\

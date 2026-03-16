@@ -1,5 +1,29 @@
 # DEVLOG
 
+## Faz 11.4 — Tablo Format Düzeltmesi ve VLM Heading Detection (2026-03-16)
+
+Bu faz, VLM (force mod) çıktısındaki iki yapısal sorunu giderir.
+
+### 11.4.1 — Tablo Formatı Bozukluğu (`_clean_table_text`)
+
+**Sorun:** VLM, birleşik hücreli tabloları Markdown tablo olarak üretiyordu (`| Belge Yükleme | Belge Yükleme | Belge Yükleme |`). `_clean_table_text()` pipe'ları temizliyordu ama `" | ".join()` ile tekrar pipe formatında birleştiriyordu. Bu yüzden LLM pipe tablolarını birebir tekrar üretiyordu. Ayrıca `|||||||:` gibi boş hücreli başlık satırlarından gelen `": "` token'ları temizlenmiyordu.
+
+**Düzeltmeler (`src/core/generation.py`):**
+- `" | ".join(deduped)` → bullet format (`- label: desc`) olarak değiştirildi
+- `[p for p in parts if p]` filtresi → `not re.match(r'^[:\s\-|]+', p)` ile genişletildi (`:` token'ları eleniyor)
+- `header_indices` pre-detection eklendi: `|---|---|` satırından hemen önceki satır, kolon adı başlık satırı olarak işaretlenerek tamamen atlanıyor
+- `_render_deterministic_section_list()` içinde `^(#|Col\d+|col_?\d*)\s*:` regex ile tablo başlık satırları eleniyor
+- `^\d+:\s*` regex ile çift numaralandırma (`1. 1: DEVLOG.md`) önleniyor
+
+### 11.4.2 — VLM Markdown Başlık Tespiti (`detect_heading`)
+
+**Sorun:** VLM, başlıkları `## 4. Teslimatlar` veya `**4. Teslimatlar**` formatında üretiyordu. `detect_heading()` sadece düz `4. Teslimatlar` formatını tanıdığı için "Teslimatlar" bölümü section tree'ye eklenemiyordu. Tüm teslimat içeriği yanlış bölüme (gereksinimler) düşüyordu.
+
+**Düzeltme (`src/core/structure.py`):**
+- `_strip_markdown_formatting()` fonksiyonu eklendi: `## heading`, `**bold**`, `__under__` formatlarını regex ile sıyırıyor
+- `detect_heading()` başında bu fonksiyon çağrılıyor; sıyırma sonrası normal regex matching devam ediyor
+- Bu düzeltme index zamanında çalışır; etkisini görmek için belgenin yeniden yüklenmesi gerekir
+
 ## Faz 11.3 — 10/10 Ingestion & OCR/VLM Fusion
 
 Bu faz, ingestion hattının kalitesini maksimum (10/10) seviyesine çıkarmak amacıyla yapılan çekirdek iyileştirmelerini içerir.

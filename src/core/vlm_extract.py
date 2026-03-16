@@ -35,28 +35,81 @@ class VLMConfig:
 
 
 _EXTRACT_ONLY_PROMPT = """\
-You are an OCR+layout extraction engine.
+You are a precise document extraction engine. Your only job is to faithfully extract \
+every piece of visible text from the image, preserving its structure and associations.
 
-Task: Extract ONLY the text that is visible in the image. Do not add, infer, or summarize.
+## Core Rule
+Extract ONLY what is visually present. Do NOT add, infer, summarize, or translate.
 
-Rules:
-- Output plain text or Markdown that preserves layout as best as possible.
-- If you see headings, keep them on their own lines.
-- If you see lists, keep bullet/numbering.
-- If you see tables, represent them as Markdown tables if possible; otherwise keep rows line-by-line.
-- Do not translate.
-- If a region is unreadable, omit it (do not guess).
+## Reading Order
+- Single-column content and tables: LEFT → RIGHT, then TOP → BOTTOM.
+- Multi-column document layout (sidebars, CV layout, magazine-style):
+  Read each COLUMN fully top-to-bottom before moving to the next column.
+  Exception: compact label-value tables where rows clearly pair a name/label on the left
+  with a value/company on the right — read those rows LEFT → RIGHT.
+
+## Layout Handling
+
+### Headings & Sections
+- Numbered headings (e.g. "1.", "2.3", "A.1"): keep on their own line, preserve the number.
+- Bold or large-text headings: keep on their own line.
+- Section hierarchy must be preserved exactly as seen.
+
+### Multi-Column Layouts (CVs, articles, brochures)
+- Independent sidebar sections (e.g. Education sidebar, Work Experience sidebar, Skills sidebar):
+  Each section heading and its contents must be output separately, top-to-bottom within
+  that column. Do NOT merge sidebar section headings with the opposite column's content.
+- Compact label-value tables or lists (e.g. reference lists, property lists):
+  Output each row as: `Label: Value` (on the same line, colon-separated).
+  Example: if "Oğuzcan Özdemir" is on the left and "ASELSAN" is on the right,
+  output: `Oğuzcan Özdemir: ASELSAN`
+
+### Tables
+- Represent as Markdown tables: `| col1 | col2 | col3 |`
+- CRITICAL — merged cells: if a cell visually spans multiple columns, write its
+  value ONCE in the first cell, leave the others empty: `| value | | |`
+- Do NOT repeat the merged cell value across every column it spans.
+- Row-column association must be exact: each value must appear in its correct cell.
+
+### Lists
+- Numbered lists: preserve the number prefix exactly (1., 2., a), b), etc.)
+- Bullet lists: use `- ` prefix.
+- Nested lists: indent with 2 spaces per level.
+
+### Forms & Checkboxes
+- Checkbox checked: `[x] Label`
+- Checkbox unchecked: `[ ] Label`
+- Text field: `Field name: field value` (if value is filled) or `Field name: ___` (if empty)
+
+### Key-Value Pairs (specs, metadata, reference lists)
+- If text is arranged as label + value pairs (even without explicit table borders),
+  output as: `Label: Value`
+
+### Headers & Footers
+- Include page headers and footers as-is, on their own lines.
+
+### Unreadable Regions
+- If a region is genuinely unreadable, omit it entirely. Do NOT guess.
+
+### Language
+- Do NOT translate. Output text in the exact language it appears.
+- Preserve special characters (Turkish: ğ ü ş ı ö ç Ğ Ü Ş İ Ö Ç).
 """
-
 
 
 _OCR_GROUNDING_PROMPT = """\
 
 ---
-SUPPLEMENTARY OCR TRUTH:
-Below is the raw text extracted by a standard formatting engine. It may have poor layout formatting, but its character and number recognition is highly accurate.
-Use this text strictly as a grounding reference to prevent hallucinations.
-Correct the layout using the visual image, but rely on the OCR text for exact spellings, numbers, and punctuation.
+SUPPLEMENTARY OCR REFERENCE (character accuracy only):
+A separate OCR engine has extracted the raw text below. Its CHARACTER and NUMBER \
+recognition is highly accurate, but its reading ORDER and LAYOUT may be wrong \
+(e.g. it may read columns top-to-bottom instead of left-to-right).
+
+Instructions:
+- Use the IMAGE as the sole authority for layout, reading order, and associations.
+- Use this OCR text ONLY to verify exact spellings, numbers, dates, and punctuation.
+- If the OCR text contradicts the image layout, ALWAYS follow the image layout.
+- Do NOT copy the OCR text order into your output.
 
 [OCR TEXT START]
 {ocr_context}
@@ -108,7 +161,7 @@ def _extract_via_gemini(image: Image.Image, cfg: VLMConfig, ocr_context: Optiona
                 ],
                 config=types.GenerateContentConfig(
                     temperature=0.0,
-                    max_output_tokens=4096,
+                    max_output_tokens=8192,
                 ),
             )
             return (resp.text or "").strip()
@@ -139,6 +192,6 @@ def _extract_via_ollama(image: Image.Image, cfg: VLMConfig, ocr_context: Optiona
         image=image,
         prompt=prompt,
         temperature=0.0,
-        max_tokens=4096,
+        max_tokens=8192,
     )
 

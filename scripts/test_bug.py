@@ -51,7 +51,6 @@ async def main():
             chat_history=[]
         )
         print("DONE", res.answer)
-        print("DONE", res.answer)
     except Exception as e:
         import traceback
         traceback.print_exc()

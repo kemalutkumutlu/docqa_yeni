@@ -106,7 +106,7 @@ class RAGPipeline:
     grounding_min_avg_score: float = 0.15
     multi_section_max: int = 3
     context_max_tokens: int = 100000
-    query_expansion_enabled: bool = False
+    query_expansion_enabled: bool = True
 
     # State
     _documents: Dict[str, DocumentState] = field(default_factory=dict)
@@ -262,6 +262,7 @@ class RAGPipeline:
                 f"docai_location={self.docai_location}",
                 f"docai_processor_id={self.docai_layout_processor_id}",
                 f"docai_processor_version={self.docai_layout_processor_version}",
+                f"pdf_text_backend={self.pdf_text_backend or 'pymupdf'}",
                 f"docling_python_bin={self.docling_python_bin}",
                 f"docling_layout_model={self.docling_layout_model}",
                 f"docling_artifacts_path={self.docling_artifacts_path or ''}",

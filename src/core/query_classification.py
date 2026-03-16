@@ -200,7 +200,16 @@ def expand_query_morphological(query: str) -> str:
         for sfx in _TR_SUFFIXES:
             if w.endswith(sfx) and len(w) - len(sfx) >= 3:
                 stem = w[:-len(sfx)]
-                if stem not in {w}:
+                # Guard: reject too-short stems
+                if len(stem) < 3:
+                    continue
+                # Guard: reject stems that are common question/structural words
+                if stem in _QUESTION_WORDS:
+                    continue
+                # Guard: reject aggressive stripping (suffix longer than stem)
+                if len(stem) < 4 and len(sfx) > len(stem):
+                    continue
+                if stem != w:
                     stems.add(stem)
                 break
     if not stems:

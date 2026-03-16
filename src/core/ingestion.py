@@ -26,22 +26,55 @@ from .vlm_extract import VLMConfig, extract_text_from_image
 def _page_is_visual_heavy(page: "fitz.Page", *, image_area_threshold: float = 0.10) -> bool:
     """
     Returns True if the page contains significant visual content (images, charts, etc.).
-    Uses PyMuPDF image bounding boxes to compute image-area / page-area ratio.
-    Threshold default 10% — pages with a small logo are not considered visual-heavy.
+
+    Two signals are combined:
+    1. Bitmap images  — via get_images() bounding boxes (existing logic).
+    2. Vector drawings — via get_drawings() filled paths.  PyMuPDF get_images()
+       only returns embedded raster images, so pages whose visual content is drawn
+       as vector paths (charts, diagrams, engineering drawings) were previously
+       missed.  We now also sum the area of filled vector paths that are large
+       enough to represent meaningful visual elements (≥ 0.5 % of page area each),
+       and treat the page as visual-heavy when that total meets the same threshold.
+
+    Threshold default 10 % — pages with a small logo or thin table borders are
+    not considered visual-heavy.
     """
     try:
-        images = page.get_images(full=True)
-        if not images:
-            return False
         page_area = page.rect.width * page.rect.height
         if page_area <= 0:
             return False
+
+        # ── 1. Bitmap images ─────────────────────────────────────────────────
         total_img_area = 0.0
-        for img in images:
+        for img in page.get_images(full=True):
             xref = img[0]
             for rect in page.get_image_rects(xref):
                 total_img_area += rect.width * rect.height
-        return (total_img_area / page_area) >= image_area_threshold
+        if (total_img_area / page_area) >= image_area_threshold:
+            return True
+
+        # ── 2. Vector drawings (charts, diagrams, SVG-like content) ──────────
+        # Only count *filled* paths — strokes alone are typically table borders,
+        # underlines, or separator lines and should not trigger visual-heavy.
+        # Additionally require each path's bounding rect to be at least 0.5 % of
+        # the page area to ignore tiny decorative marks.
+        min_path_area = page_area * 0.005
+        total_vector_area = 0.0
+        for draw in page.get_drawings():
+            if draw.get("fill") is None:
+                continue
+            rect = draw.get("rect")
+            if rect is None:
+                continue
+            area = rect.width * rect.height
+            if area < min_path_area:
+                continue
+            total_vector_area += area
+            # Early exit: no need to keep summing once threshold is crossed.
+            if total_vector_area >= page_area * image_area_threshold:
+                return True
+
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -400,6 +433,103 @@ def _extract_native_tables_text(page: fitz.Page) -> str:
         return ""
 
 
+def _merge_cross_page_tables(pages: list[PageText]) -> list[PageText]:
+    """Merge table fragments that are split across consecutive pages.
+
+    PDF table extraction works per-page, so a table spanning a page break
+    produces two partial/broken fragments.  This function detects such splits
+    and appends the continuation from page N+1 to page N, removing it from
+    page N+1 so the downstream chunker sees a complete table in one place.
+    """
+    if len(pages) < 2:
+        return pages
+
+    def _trailing_table_lines(text: str) -> tuple[bool, int]:
+        """Check if text ends with table-like lines.
+        Returns (has_trailing_table, index_of_first_table_line_from_end).
+        """
+        lines = text.rstrip().splitlines()
+        if not lines:
+            return False, 0
+        # Scan from bottom; count consecutive lines that look like table rows
+        table_count = 0
+        for line in reversed(lines):
+            stripped = line.strip()
+            if not stripped:
+                # blank line — stop if we already found table lines
+                if table_count > 0:
+                    break
+                continue
+            if "|" in stripped:
+                table_count += 1
+            else:
+                break
+        return table_count >= 2, table_count
+
+    def _leading_table_lines(text: str) -> tuple[bool, list[str], str]:
+        """Check if text starts with table-like lines (continuation).
+        Returns (has_leading_table, table_lines, remaining_text).
+        """
+        lines = text.lstrip().splitlines()
+        if not lines:
+            return False, [], text
+        table_lines: list[str] = []
+        rest_start = 0
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                if table_lines:
+                    # blank line after table content — check if next line continues
+                    # Look ahead: if next non-blank line also has pipes, continue
+                    has_more = False
+                    for future in lines[idx + 1:]:
+                        fs = future.strip()
+                        if not fs:
+                            continue
+                        if "|" in fs:
+                            has_more = True
+                        break
+                    if has_more:
+                        table_lines.append("")
+                        continue
+                    rest_start = idx
+                    break
+                continue
+            if "|" in stripped or re.match(r"^[\|\s\-:]+$", stripped):
+                table_lines.append(line)
+            else:
+                rest_start = idx
+                break
+        else:
+            rest_start = len(lines)
+
+        if len(table_lines) < 2:
+            return False, [], text
+        remaining = "\n".join(lines[rest_start:]).strip()
+        return True, table_lines, remaining
+
+    result = list(pages)
+    for i in range(len(result) - 1):
+        curr_text = result[i].text or ""
+        next_text = result[i + 1].text or ""
+
+        has_trailing, _ = _trailing_table_lines(curr_text)
+        if not has_trailing:
+            continue
+
+        has_leading, leading_lines, remaining = _leading_table_lines(next_text)
+        if not has_leading:
+            continue
+
+        # Merge: append continuation to current page
+        merged_text = curr_text.rstrip() + "\n" + "\n".join(leading_lines)
+        result[i] = replace(result[i], text=merged_text)
+        # Remove table fragment from next page
+        result[i + 1] = replace(result[i + 1], text=remaining)
+
+    return result
+
+
 def _extract_page_text_ordered(page: fitz.Page) -> str:
     """Extract page text with multi-column layout awareness.
 
@@ -463,7 +593,7 @@ class DoclingTextConfig:
     smart: bool = False  # skip subprocess if PyMuPDF quality is already sufficient
 
 
-def _docling_smart_should_run(pdf: "fitz.Document", sample_pages: int = 3) -> bool:
+def _docling_smart_should_run(pdf: "fitz.Document", sample_pages: int = 5) -> bool:
     """
     Check if running Docling is worth the subprocess overhead.
     Samples up to `sample_pages` pages with PyMuPDF; if most already have
@@ -482,8 +612,9 @@ def _docling_smart_should_run(pdf: "fitz.Document", sample_pages: int = 3) -> bo
             checked += 1
     if checked == 0:
         return True
-    # Run Docling only when fewer than 70% of sampled pages have good quality.
-    return (good / checked) < 0.70
+    # Run Docling only when fewer than 50% of sampled pages have good quality.
+    # 70% was too aggressive — triggered Docling even when most pages were fine.
+    return (good / checked) < 0.50
 
 
 def _docling_text_env(cfg: DoclingTextConfig) -> dict[str, str]:
@@ -696,9 +827,17 @@ def ingest_pdf(
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         vlm_text = extract_text_from_image(img, cfg=vlm, ocr_context=text_norm)
                         vlm_text_norm = _finalize_extracted_text(vlm_text, source="vlm")
-                        # Dual-quality selection: keep whichever preserves structure better.
-                        text_norm, source = _pick_best_candidate([(text_norm, source), (vlm_text_norm, "vlm")])
-                        vlm_pages_used += 1
+                        if vlm_text_norm:
+                            if vlm.mode == "force":
+                                # force mode: always use VLM output, bypass structure scoring.
+                                text_norm, source = vlm_text_norm, "vlm"
+                            else:
+                                # auto/smart: dual-quality selection.
+                                text_norm, source = _pick_best_candidate([(text_norm, source), (vlm_text_norm, "vlm")])
+                            # Only count pages where VLM produced usable output.
+                            # Empty responses (blank pages, API returning nothing) do not
+                            # consume quota — exceptions are already excluded by the try/except.
+                            vlm_pages_used += 1
                 except Exception as e:  # noqa: BLE001
                     warnings.append(f"VLM failed on page {page_no}: {e}")
 
@@ -745,6 +884,9 @@ def ingest_pdf(
                 visual_assets.extend(assets)
     finally:
         pdf.close()
+    # ── Merge table fragments split across page boundaries ──────────────────
+    pages = _merge_cross_page_tables(pages)
+
     if table_config is not None:
         # Table smart mode: skip external extraction for pages with native PDF text layer
         # (PyMuPDF find_tables already handled them). Only run on OCR/VLM pages.
@@ -799,7 +941,7 @@ def ingest_image(
     # Candidate list: (text, source)
     cands: list[tuple[str, str]] = []
 
-    if vlm and vlm.mode in ("force", "auto") and img_rgb is not None and (
+    if vlm and vlm.mode in ("force", "auto", "smart") and img_rgb is not None and (
         getattr(vlm, "provider", "gemini") == "local" or bool(getattr(vlm, "api_key", ""))
     ):
         try:
@@ -812,14 +954,23 @@ def ingest_image(
 
     if ocr.enabled and img_rgb is not None:
         try:
+            # Resolve "smart" OCR backend for image files.
+            # Images have no existing text layer, so treat every image as a
+            # "fully scanned" page: prefer docai (when configured) else paddle_vl.
+            _ocr_cfg = ocr
+            if (ocr.backend or "").strip().lower() == "smart":
+                if (ocr.docai_processor_id or "").strip():
+                    _ocr_cfg = replace(ocr, backend="docai")
+                else:
+                    _ocr_cfg = replace(ocr, backend="paddle_vl")
             ocr_variants = [img_rgb]
-            if (ocr.backend or "tesseract_legacy").strip().lower() == "tesseract_legacy":
+            if (_ocr_cfg.backend or "tesseract_legacy").strip().lower() == "tesseract_legacy":
                 # Multi-pass OCR only for the legacy Tesseract path.
                 ocr_variants = _preprocess_variants_for_ocr(img_rgb)[:4]
             for im in ocr_variants:
                 ocr_result = ocr_image_text(
                     im,
-                    cfg=ocr,
+                    cfg=_ocr_cfg,
                     document_name=file_name,
                     page_number=1,
                     image_kind="image",

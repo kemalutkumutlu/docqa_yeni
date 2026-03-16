@@ -89,7 +89,9 @@ def retrieve(
     relevance_min_keep: int = 3,
     grounding_min_avg_score: float = 0.15,
     multi_section_max: int = 3,
-    query_expansion_enabled: bool = False,
+    query_expansion_enabled: bool = True,
+    toc_text_min_chars: int = 120,
+    empty_section_min_chars: int = 30,
 ) -> RetrievalResult:
     """
     Full retrieval pipeline with query routing.
@@ -267,7 +269,7 @@ def retrieve(
                 # sections that share the same heading topic before
                 # falling through to normal-QA.
                 _total_text = sum(len(ev.text) for ev in section_evidences)
-                if _total_text < 120:
+                if _total_text < toc_text_min_chars:
                     _seen_sids: Set[str] = {best_section_id}
                     _best_alt: List[Evidence] = []
                     _best_alt_len = _total_text
@@ -295,7 +297,7 @@ def retrieve(
                         section_evidences = _best_alt
 
                 # Re-check: if still empty/tiny, fall through to normal-QA
-                if sum(len(ev.text) for ev in section_evidences) < 30:
+                if sum(len(ev.text) for ev in section_evidences) < empty_section_min_chars:
                     pass  # fall through
                 else:
                     # Coverage info from the parent chunk text
