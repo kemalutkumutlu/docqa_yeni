@@ -1117,8 +1117,8 @@ def _settings_dependency_summary(
         else "sinirli: processing_mode=classic"
     )
     table_line = (
-        f"aktif: {table_backend}"
-        if table_enabled == "on"
+        f"aktif: {table_backend}" + (" (smart)" if table_enabled == "smart" else "")
+        if table_enabled in ("on", "smart")
         else "kapali"
     )
     generation_line = (
@@ -1278,7 +1278,7 @@ def _effective_settings_values(pipeline: RAGPipeline) -> dict[str, str | int]:
         "visual_chunk_level": getattr(pipeline, "visual_chunk_level", "page"),
         "visual_region_source": getattr(pipeline, "visual_region_source", "heuristic"),
         "visual_detector_backend": getattr(pipeline, "visual_detector_backend", "none"),
-        "table_structure_enabled": "on" if bool(getattr(current_table, "enabled", False)) else "off",
+        "table_structure_enabled": ("smart" if bool(getattr(current_table, "smart", False)) else "on") if bool(getattr(current_table, "enabled", False)) else "off",
         "table_structure_backend": getattr(current_table, "backend", "auto"),
         "llm_provider": getattr(pipeline, "llm_provider", "gemini"),
         "generation_model_choice": _llm_model_for_provider(pipeline, getattr(pipeline, "llm_provider", "gemini")),
@@ -1368,7 +1368,7 @@ def _settings_fallback_summary(
     else:
         lines.append(f"VLM path: `{resolved_vlm_provider}` aktif.")
 
-    if table_enabled != "on":
+    if table_enabled not in ("on", "smart"):
         lines.append("Table stage: kapali.")
     elif table_backend == "off":
         lines.append("Table stage: backend=off oldugu icin kapali.")
