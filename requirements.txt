@@ -4,6 +4,7 @@
 # Core
 python-dotenv==1.2.1
 httpx==0.28.1
+tiktoken==0.8.0
 
 # Parsing / PDF / images
 pymupdf==1.26.7
