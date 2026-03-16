@@ -164,7 +164,7 @@ def rerank_by_embedding(
 
     cosine_scores: Dict[str, float] = {}
     for cid, emb in zip(chunk_ids_got, chunk_embeddings):
-        if emb:
+        if emb is not None and len(emb) > 0:
             cosine_scores[cid] = _cosine_similarity(q_emb, emb)
         else:
             cosine_scores[cid] = 0.0
