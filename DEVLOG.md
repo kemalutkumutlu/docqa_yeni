@@ -1,5 +1,65 @@
 # DEVLOG
 
+## Faz 11.5 — VLM Prompt Yenileme, Görsel Chunk Retrieval, Alıntı Güvenilirliği ve Embedding Yönlendirme (2026-03-17)
+
+Bu faz, CV ve yapısal form belgelerindeki retrieval sorunlarını ve streaming path'teki alıntı güvenilirliğini iyileştiren bir dizi değişiklik içerir.
+
+### 11.5.1 — VLM Extraction Prompt Tam Yenileme (`vlm_extract.py`)
+
+**Sorun:** Önceki `_EXTRACT_ONLY_PROMPT`, yıldız puanları (`★★★☆☆` gibi formlar), tablolar ve sayfa düzeni hakkında yetersiz çıkarım üretiyordu.
+
+**Değişiklik:**
+- `_EXTRACT_ONLY_PROMPT` tamamen yeniden yazıldı.
+- Artık kapsamlı okuma kuralları var: sayfa başlıkları, numaralı/işaretli listeler, tablolar (başlık + satırlar), yıldız puanları → `X/Y` formatında (`★★★☆☆` → `3/5`), grafik/çizelge, çok sütunlu düzen.
+- Okuma sırası (reading order), bölüm başlıklarının çıkarımı ve OCR grounding kullanımı daha açık hale getirildi.
+- Prompt Gemini-spesifik değil; aynı prompt local Ollama vision modelleri ile de çalışır.
+
+### 11.5.2 — Görsel Chunk Retrieval Düzeltmesi (`retrieval.py`)
+
+**Sorun:** CV'de "BECERİLER" gibi başlıklar metin chunk olarak indekslenmemiş, sadece visual chunk olarak mevcuttu. Section text boş olduğunda retrieval visual chunk içeriğini göremiyordu.
+
+**Değişiklikler:**
+- Section metin boş olduğunda doğrudan Chroma sorgusu ile visual chunk'lar getirildi.
+- Komşu section aramasında (`sibling_search`) visual chunk'ları atlayan kural kaldırıldı.
+- Sonuç: "AutoCAD: 4/5", "Python: 5/5" gibi içeriklerin doğru çıkarılması sağlandı.
+
+### 11.5.3 — Streaming Path'inde Sessiz Alıntı Retry (`generation.py`)
+
+**Sorun:** `generate_answer_stream` fonksiyonu, tasarım gereği citation/coverage retry döngüsünü atlıyordu. Bu yüzden streaming path'inde `citations_found: 0` görünüyordu.
+
+**Değişiklik:**
+- Streaming tamamlandıktan sonra `citations_found == 0` ise sessiz bir citation retry yapılıyor.
+- Bu retry `result.answer` ve `citations_found` değerlerini günceller; UI'ya gönderilmiş streamed içerik **değiştirilmez**.
+- Önceki yaklaşımda `stream_msg.content` doğrudan set edilince Chainlit raw kod olarak render ediyordu; bu yüzden display update kaldırıldı.
+
+### 11.5.4 — Kanıt Paneli Filtrelemesi (`pipeline.py`)
+
+**Değişiklik:**
+- `_summarize_evidence` fonksiyonuna `answer: str = ""` parametresi eklendi.
+- Cevap boş değilse, panelde yalnızca cevaptta atıfta bulunulan sayfaları içeren chunk'lar gösterilir.
+- Atıf tespiti regex ile: `\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]` pattern'ından sayfa numaraları çıkarılır.
+- Hem `ask()` hem `ask_stream()` metodları `answer=result.answer or ""` ile çağırır.
+- Önceden tüm retrieved chunk'lar gösteriliyordu; bazı bölümler cevapla ilgisiz görünüyordu.
+
+### 11.5.5 — Yanlış Öncül Sorgulara "Hayır, ..." Yanıtı (`prompts.py`)
+
+**Değişiklik:**
+- System prompt güncellendi: konu belgede olmayan sorgular → `"Belgede bu bilgi bulunamadı."` devam eder; **belge içeriğiyle ilgili ama yanlış öncüllü sorgular** → `"Hayır, ..."` ile başlayan düzeltici yanıt üretilir.
+- Bu genel bir kural; tek bir sorguya özel değil.
+
+### 11.5.6 — Embedding Vertex AI Bypass (`gemini_client.py`, `embedding.py`)
+
+**Sorun:** `gemini-embedding-2-preview` modeli Vertex AI üzerinde `400 FAILED_PRECONDITION` hatası veriyordu (model henüz bu GCP projesinde allowlist'e alınmamış).
+
+**Değişiklikler:**
+- `gemini_client.py`'a `use_vertex_ai_for_embedding()` fonksiyonu eklendi: `EMBEDDING_VERTEX_ENABLED` env değişkenini kontrol eder.
+- `EMBEDDING_VERTEX_ENABLED=0` ise embedding client Vertex AI yerine `GEMINI_API_KEY` ile doğrudan AI Studio API'sine bağlanır.
+- `embedding.py`'daki `_load_gemini_client`: `EMBEDDING_VERTEX_ENABLED=0` ise `genai.Client(api_key=api_key)` olarak oluşturulur.
+- LLM ve VLM hâlâ Vertex AI kullanmaya devam eder.
+- `.env`'e `EMBEDDING_VERTEX_ENABLED=0` eklendi.
+
+---
+
 ## Faz 11.4 — Tablo Format Düzeltmesi ve VLM Heading Detection (2026-03-16)
 
 Bu faz, VLM (force mod) çıktısındaki iki yapısal sorunu giderir.

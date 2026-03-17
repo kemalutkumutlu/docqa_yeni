@@ -149,6 +149,16 @@ Panelde dort bilgilendirme alani vardir:
 
 Bunlar salt okunurdur ve secili kombinasyonun neye donustugunu anlatir.
 
+## Kanit Paneli (Evidence)
+
+Soru cevaplandiktan sonra gosterilen kanit panel yalnizca **cevaptta atifta bulunulan sayfalara** ait chunk'lari icerir.
+
+- Cevap `[DosyaAdi - Sayfa X]` formatinda citation iceriyorsa, yalnizca o sayfalardaki chunk'lar gosterilir.
+- Retrieval sonucunda gelen ama cevapla ilgisi olmayan chunk'lar kanit panelinde gizlenir.
+- Cevap "Belgede bu bilgi bulunamadi." ise kanit paneli bos olabilir.
+
+Bu davranis bilinclidir: kullaniciya "neden bu cevap geldi" sorusuna dogrudan yanit verir.
+
 ## Tasarim Notu
 
 Bu UI bir operasyon paneli degil, gelistirme ve demo panelidir. Bu yuzden:

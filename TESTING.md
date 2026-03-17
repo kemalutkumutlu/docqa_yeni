@@ -100,7 +100,14 @@ Kontrol edilenler:
 - citation zorunlulugu
 - coverage
 - hallucination guard
-- negatif sorularda "Belgede bu bilgi bulunamadi."
+- konu belge disinda → "Belgede bu bilgi bulunamadi."
+- yanlis onculle belge icerigi → "Hayir, ..." ile duzeltici yanit (ornegin "Kemal Utku musunuz?" → "Hayir, ...")
+
+Streaming path citation kontrolu:
+
+- Uygulama uzerinden streaming ile soru sor
+- Debug bölümünde `Citation sayisi` > 0 olmali
+- Streaming sonrasi sessiz citation retry devreye girdiyse `result.answer` içinde citation vardir ama UI'da gosterilen streamed icerik degismemis olmali
 
 ### 5. Smoke suite
 
@@ -291,13 +298,16 @@ Beklenen:
    - `Teslim suresi nedir?`
    - `Projenin amaci nedir?`
    - `Araba kac beygir?`
+   - Yanlış öncüllü soru (örn. belgedeki bir kişi adından farklı ad kullanarak sor)
 
 Beklenen:
 
 - ilk iki soru `section_list`
 - ortadakiler normal QA
-- sonuncusu negatif guard
+- `Araba kac beygir?` → negatif guard → "Belgede bu bilgi bulunamadi."
+- yanlış öncüllü soru → "Hayır, ..." ile başlayan düzeltici yanıt
 - cevaplarda citation olsun
+- kanit panelinde yalnizca atifta bulunulan sayfalar gorulsun
 
 Ek multimodal kontrol:
 

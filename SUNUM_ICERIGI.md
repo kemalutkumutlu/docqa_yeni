@@ -215,12 +215,13 @@ LLM kullaniyorum ama kontrolsuz birakmiyorum
 **Sayfada yer almasi gerekenler**
 - Siki system prompt
 - Baglam disi bilgi yasak
-- Baglam yoksa sabit fallback:
-  - `Belgede bu bilgi bulunamadi.`
+- Baglam yoksa sabit fallback: `Belgede bu bilgi bulunamadi.`
+- Yanlış öncüllü sorguda: `Hayır, ...` ile başlayan düzeltici yanıt
 - Her bilgi cumlesinde citation zorunlu
-- Citation yoksa retry
+- Citation yoksa retry (streaming'de sessiz retry; UI içeriği değişmez)
 - Coverage eksikse retry ve warning
 - Streaming ve non-streaming varyantlari var
+- Kanit paneli: yalnizca cevaptta atifta bulunulan sayfalar
 
 **Konusma notu**
 Buradaki hedefim "guzel cevap" degil, "guvenilir cevap" oldu. Bu yuzden cevabin kaynaksiz gelmesini kabul etmiyorum. Liste sorularinda kapsama kontrolu yapiyorum. Gerektiginde extractive yol da kullanabiliyorum.
@@ -322,6 +323,7 @@ Bugun gosterecegim aktif konfigurasyon
 - `GEMINI_MODEL=gemini-3.1-pro-preview`
 - `GEMINI_FALLBACK_MODEL=gemini-2.5-pro`
 - `EMBEDDING_MODEL=gemini-embedding-2-preview`
+- `EMBEDDING_VERTEX_ENABLED=0` (Vertex'te allowlist sorunu; AI Studio key ile doğrudan)
 - `DOC_PROCESSING_MODE=multimodal`
 - `VISUAL_CHUNK_LEVEL=region`
 - `VISUAL_REGION_SOURCE=detector`
@@ -332,7 +334,7 @@ Bugun gosterecegim aktif konfigurasyon
 - `VLM_MODE=force`
 
 **Konusma notu**
-Demo icin kaliteyi one cikan hibrit bir profil kullaniyorum. OCR tarafinda local GPU gucunden, layout ve generation tarafinda ise cloud modellerden yararlaniyorum. Bu kombinasyon kalite-maliyet dengesinde guclu bir nokta sagliyor.
+Demo icin kaliteyi one cikan hibrit bir profil kullaniyorum. OCR tarafinda local GPU gucunden, layout ve generation tarafinda ise cloud modellerden yararlaniyorum. Embedding'in Vertex'teki allowlist sorununu `EMBEDDING_VERTEX_ENABLED=0` ile bypass ediyorum; LLM ve VLM hala Vertex uzerinden gidiyor. Bu kombinasyon kalite-maliyet dengesinde guclu bir nokta sagliyor.
 
 ---
 

@@ -5,15 +5,17 @@ PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Proje, belgeyi
 ## Bugunku Durum
 
 - Belge turleri: `PDF`, `PNG`, `JPG`
-- Retrieval: dense + sparse + RRF
-- Generation: `gemini`, `openai`, `local` veya `extractive`
+- Retrieval: dense + sparse + RRF; görsel chunk fallback (section text boşsa visual chunk sorgusu)
+- Generation: `gemini`, `openai`, `local` veya `extractive`; streaming + sessiz citation retry
 - OCR backends: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`
 - Layout detector backends: `none`, `sidecar`, `docai`, `docling`
 - Table structure backends: `off`, `auto`, `docai`, `gemini`, `heuristic`
 - PDF text backends: `pymupdf` (default), `docling`, `auto`
 - Processing mode: `classic` veya `multimodal`
+- Embedding: `gemini-embedding-001` veya local; Vertex AI bypass (`EMBEDDING_VERTEX_ENABLED=0`)
 - UI: Chainlit tabanli; `Basic` ve `Advanced` ayar sekmeleri var
 - Desktop UI: sol tarafta custom sohbet gecmisi paneli, sag tarafta custom runtime settings paneli
+- Kanıt paneli: yalnızca cevapta atıfta bulunulan sayfalara ait chunk'lar gösterilir
 
 ## Mimari
 
@@ -93,6 +95,9 @@ GEMINI_FALLBACK_MODEL=gemini-2.5-pro
 DOC_PROCESSING_MODE=multimodal
 MULTIMODAL_ANSWER_MODE=auto
 EMBEDDING_MODEL=gemini-embedding-2-preview
+# gemini-embedding-2-preview Vertex'te FAILED_PRECONDITION verebilir;
+# bu durumda AI Studio API key ile doğrudan çalıştır:
+EMBEDDING_VERTEX_ENABLED=0
 
 OCR_ENABLED=1
 OCR_BACKEND=docai
@@ -250,6 +255,7 @@ Chainlit UI su an:
 - `Current Draft`, `Applied Pipeline`, `Fallback Notes` ve `Document Context` ozet kartlari vardir
 - onceki ayri `Belge Durumu` element sidebar'i kaldirilmistir; belge baglami runtime paneline tasinmistir
 - sol sohbet panelinde TUSAS markalama alani bulunur
+- kanit paneli yalnizca cevaptta atifta bulunulan sayfalara ait chunk'lari gosterir (konu disi chunk'lar gizlenir)
 
 Onemli sinir:
 
@@ -308,6 +314,18 @@ Google kullaniyorsan:
 - `DOCAI_LOCATION`
 - processor id alanlari
 - `GOOGLE_APPLICATION_CREDENTIALS`
+
+#### Gemini Embedding — Vertex AI bypass
+
+Bazı GCP projelerinde `gemini-embedding-2-preview` modeli Vertex AI'da `400 FAILED_PRECONDITION` verebilir (allowlist sorunu). Bu durumda embedding'i AI Studio API key'iyle doğrudan çalıştırmak için:
+
+```ini
+EMBEDDING_VERTEX_ENABLED=0
+```
+
+Bu ayar yalnızca embedding yolunu etkiler; LLM ve VLM hâlâ Vertex AI kullanmaya devam eder.
+
+`EMBEDDING_VERTEX_ENABLED` ayarlanmazsa (veya `1` ise) embedding de Vertex AI üzerinden gider.
 
 ## Calistirma
 
