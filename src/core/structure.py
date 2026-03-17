@@ -383,27 +383,51 @@ def flatten_sections(root: SectionNode) -> list[SectionNode]:
 
 
 def _split_long_paragraph(paragraph: str, max_tokens: int) -> list[str]:
-    """Split a single paragraph at sentence boundaries if it exceeds max_tokens."""
+    """Split a single paragraph at line or sentence boundaries if it exceeds max_tokens.
+
+    Tries newline-based splitting first to preserve list items (e.g. Turkish
+    numbered/lettered lists that end without punctuation).  Falls back to
+    sentence-boundary splitting when the paragraph is a single long line.
+    """
     if _count_tokens(paragraph) <= max_tokens:
         return [paragraph]
-    # Turkish/English sentence boundaries: '.', '!', '?' followed by space
+
+    # ── 1) Newline-based splitting (handles numbered/bulleted lists) ──────────
+    lines = [ln.strip() for ln in paragraph.split("\n") if ln.strip()]
+    if len(lines) > 1:
+        groups: list[str] = []
+        current: list[str] = []
+        current_toks = 0
+        for line in lines:
+            line_toks = _count_tokens(line)
+            if current and current_toks + line_toks + 1 > max_tokens:
+                groups.append("\n".join(current))
+                current = []
+                current_toks = 0
+            current.append(line)
+            current_toks += line_toks + 1
+        if current:
+            groups.append("\n".join(current))
+        return groups if groups else [paragraph]
+
+    # ── 2) Sentence-boundary splitting (single long line fallback) ────────────
     sentences = re.split(r'(?<=[.!?])\s+', paragraph)
     if len(sentences) <= 1:
         return [paragraph]
-    groups: list[str] = []
-    current: list[str] = []
-    current_toks = 0
+    sent_groups: list[str] = []
+    cur_sents: list[str] = []
+    cur_toks = 0
     for sent in sentences:
         sent_toks = _count_tokens(sent)
-        if current and current_toks + sent_toks + 1 > max_tokens:
-            groups.append(" ".join(current))
-            current = []
-            current_toks = 0
-        current.append(sent)
-        current_toks += sent_toks + 1
-    if current:
-        groups.append(" ".join(current))
-    return groups if groups else [paragraph]
+        if cur_sents and cur_toks + sent_toks + 1 > max_tokens:
+            sent_groups.append(" ".join(cur_sents))
+            cur_sents = []
+            cur_toks = 0
+        cur_sents.append(sent)
+        cur_toks += sent_toks + 1
+    if cur_sents:
+        sent_groups.append(" ".join(cur_sents))
+    return sent_groups if sent_groups else [paragraph]
 
 
 def _split_text_semantically(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
@@ -484,17 +508,19 @@ def _heading_prefix(heading_path: str, file_name: str) -> str:
 def section_tree_to_chunks(
     ingest: IngestResult,
     root: SectionNode,
-    child_max_tokens: int = 250,
+    child_max_tokens: int = 512,
     child_overlap_tokens: int = 40,
 ) -> list[Chunk]:
     """
     Create parent/child chunks per section node.
 
     - Parent chunk: full section text (title + full body)
-    - Child chunks: split of full section text for retrieval granularity
+    - Child chunks: split of the section BODY ONLY for retrieval granularity.
+      The heading is NOT included in the body split — it is added via
+      _heading_prefix so it appears exactly once per child chunk.
 
-    Default child_max_chars=1000 (~250 tokens) is optimized for embedding
-    models that perform best at 128-256 token inputs.
+    child_max_tokens=512 balances retrieval granularity with embedding quality
+    and avoids splitting Turkish numbered/bulleted list items mid-item.
     """
     chunks: list[Chunk] = []
 
@@ -522,13 +548,15 @@ def section_tree_to_chunks(
                     )
                 )
 
+                # Split body only (not title) so heading prefix appears exactly once per child.
+                root_body = "\n".join(ln.text for ln in node.body_lines).strip()
                 child_texts = _split_text_semantically(
-                    root_text,
+                    root_body or root_text,
                     max_tokens=child_max_tokens,
                     overlap_tokens=child_overlap_tokens,
                 )
                 if not child_texts:
-                    child_texts = [root_text]
+                    child_texts = [root_body or root_text]
 
                 _hpfx = _heading_prefix(node.heading_path, ingest.file_name)
                 for idx, ct in enumerate(child_texts):
@@ -568,13 +596,15 @@ def section_tree_to_chunks(
             )
         )
 
+        # Split body only (not title) so heading prefix appears exactly once per child.
+        body_text = "\n".join(ln.text for ln in node.body_lines).strip()
         child_texts = _split_text_semantically(
-            parent_text,
+            body_text or parent_text,
             max_tokens=child_max_tokens,
             overlap_tokens=child_overlap_tokens,
         )
         if not child_texts:
-            child_texts = [parent_text]
+            child_texts = [body_text or parent_text]
 
         _hpfx = _heading_prefix(node.heading_path, ingest.file_name)
         for idx, ct in enumerate(child_texts):

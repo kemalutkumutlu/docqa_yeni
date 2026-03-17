@@ -17,6 +17,14 @@ def use_vertex_ai() -> bool:
     return _env_true("VERTEX_ENABLED") or _env_true("GOOGLE_GENAI_USE_VERTEXAI")
 
 
+def use_vertex_ai_for_embedding() -> bool:
+    """Returns False if EMBEDDING_VERTEX_ENABLED=0, bypassing Vertex AI for embeddings."""
+    explicit = (os.getenv("EMBEDDING_VERTEX_ENABLED", "") or "").strip().lower()
+    if explicit in ("0", "false", "no", "n", "off"):
+        return False
+    return use_vertex_ai()
+
+
 def _resolve_project_id() -> str:
     explicit_project = (os.getenv("VERTEX_PROJECT_ID", "") or "").strip()
     if explicit_project:
@@ -67,7 +75,15 @@ def _resolve_vertex_location(model_name: str = "") -> str:
         or (os.getenv("GOOGLE_CLOUD_LOCATION", "") or "").strip()
         or primary
     )
+    # Embedding models require a region-specific endpoint (not "global").
+    # Use EMBEDDING_VERTEX_LOCATION if set, otherwise fall back to the fallback location.
+    embedding_loc = (
+        (os.getenv("EMBEDDING_VERTEX_LOCATION", "") or "").strip()
+        or fallback
+    )
     model = (model_name or "").strip().lower()
+    if "embedding" in model:
+        return embedding_loc
     if "gemini-2.5-pro" in model:
         return fallback
     if "gemini-3.1-pro" in model:

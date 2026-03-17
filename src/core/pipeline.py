@@ -126,15 +126,26 @@ class RAGPipeline:
         return self._logger
 
     @staticmethod
-    def _summarize_evidence(retrieval: RetrievalResult, *, limit: int = 4) -> list[str]:
+    def _summarize_evidence(retrieval: RetrievalResult, *, limit: int = 4, answer: str = "") -> list[str]:
         if not any(
             getattr(ev, "region_label", "") or getattr(ev, "region_id", "") or getattr(ev, "crop_type", "page") != "page"
             for ev in retrieval.evidences
         ):
             return []
+
+        # Build set of cited page numbers from the answer to filter evidence.
+        cited_pages: set[str] | None = None
+        if answer and answer.strip() != "Belgede bu bilgi bulunamadı.":
+            cited_pages = set(re.findall(r"Sayfa\s*(\d+)", answer))
+
         lines: list[str] = []
         seen: set[str] = set()
         for ev in retrieval.evidences:
+            # Skip evidences whose page was not cited in the answer.
+            if cited_pages is not None:
+                ev_pages = {str(p) for p in (ev.page_start, ev.page_end) if p}
+                if not ev_pages & cited_pages:
+                    continue
             file_name = (ev.heading_path.split(" / ", 1)[0].strip() if " / " in (ev.heading_path or "") else (ev.heading_path or "").strip()) or "Belge"
             page_text = f"Sayfa {ev.page_start}" if ev.page_start else "Sayfa ?"
             region_bits: list[str] = []
@@ -420,7 +431,10 @@ class RAGPipeline:
                 "Bu belgeden metin/bolum cikarilamadi (bos veya OCR gerektiriyor olabilir)."
             ]
             self._index = None
-            state.collection_name = "chunks"
+            # Keep existing collection_name if already known (e.g. from a previous
+            # build with a different doc).  Avoids overwriting chunks_d3072 with "chunks".
+            if not state.collection_name:
+                state.collection_name = self._index.store.collection_name if self._index else "chunks"
             self._doc_cache().save(
                 doc_id=state.doc_id,
                 file_name=state.file_name,
@@ -952,7 +966,7 @@ class RAGPipeline:
                 gemini_fallback_model=self.gemini_fallback_model,
                 multimodal_answer_mode=self.multimodal_answer_mode,
             )
-        result = replace(result, evidence_summary=self._summarize_evidence(ret))
+        result = replace(result, evidence_summary=self._summarize_evidence(ret, answer=result.answer or ""))
         _gen_ms = (time.perf_counter() - _t_gen) * 1000
         lg = self._get_logger()
         if lg:
@@ -1086,7 +1100,7 @@ class RAGPipeline:
                 multimodal_answer_mode=self.multimodal_answer_mode,
                 on_token=on_token,
             )
-        result = replace(result, evidence_summary=self._summarize_evidence(ret))
+        result = replace(result, evidence_summary=self._summarize_evidence(ret, answer=result.answer or ""))
         _gen_ms = (time.perf_counter() - _t_gen) * 1000
 
         lg = self._get_logger()

@@ -9,8 +9,11 @@ kullanıcının sorusunu yanıtla.
 KESİN KURALLAR — bunlara uymazsan cevap geçersiz sayılır:
 1. SADECE verilen BAĞLAM'daki bilgileri kullan. Bağlamda olmayan hiçbir bilgiyi \
    ekleme, tahmin etme veya yorumlama.
-2. Eğer sorunun cevabı bağlamda yoksa veya yetersizse, tam olarak şu cümleyi yaz: \
+2. Eğer sorunun konusu bağlamda hiç geçmiyorsa, tam olarak şu cümleyi yaz: \
    "Belgede bu bilgi bulunamadı."
+   ANCAK bağlamda konuyla ilgili bilgi varsa bu cümleyi YAZMA; sorunun öncülü \
+   yanlış olsa bile bağlamdaki gerçek bilgiyi ver. Yanlış öncüllü sorularda \
+   "Hayır, ..." diye başla ve doğru bilgiyi kaynak göstererek açıkla.
 3. Her bilgi cümlesinin sonuna kaynak referansı ekle: [DosyaAdı - Sayfa X]
    Bölgesel görsel kanıt varsa region bilgisini de koru: [DosyaAdı - Sayfa X, Region top]
 4. Türkçe cevap ver (kullanıcı İngilizce sorarsa İngilizce).

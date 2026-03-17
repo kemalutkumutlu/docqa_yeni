@@ -296,9 +296,32 @@ def retrieve(
                     if _best_alt:
                         section_evidences = _best_alt
 
-                # Re-check: if still empty/tiny, fall through to normal-QA
+                # Re-check: if still empty/tiny, query Chroma directly for visual
+                # chunks belonging to this document before falling through.
                 if sum(len(ev.text) for ev in section_evidences) < empty_section_min_chars:
-                    pass  # fall through
+                    try:
+                        _col = index.store._get_collection()
+                        _vis_res = _col.get(
+                            where={"$and": [{"doc_id": best_doc_id}, {"modality": "visual"}]},
+                            include=["documents", "metadatas"],
+                        )
+                        _vis_evs: List[Evidence] = []
+                        for _cid, _doc, _meta in zip(
+                            _vis_res.get("ids", []),
+                            _vis_res.get("documents", []),
+                            _vis_res.get("metadatas", []),
+                        ):
+                            _vis_evs.append(meta_to_evidence(_meta or {}, _doc or "", _cid, 1.0))
+                        if _vis_evs:
+                            return RetrievalResult(
+                                intent=intent,
+                                evidences=_vis_evs,
+                                section_complete=True,
+                                coverage=None,
+                            )
+                    except Exception:
+                        pass
+                    # else: fall through to normal-QA
                 else:
                     # Coverage info from the parent chunk text
                     coverage = None
@@ -324,6 +347,26 @@ def retrieve(
     # Normal QA: return hybrid top-k evidence + parent context enrichment
     # For each child chunk, also fetch its parent section text so the LLM
     # has hierarchical context (heading + surrounding content).
+
+    # Deduplicate: keep at most 1 chunk per section_id so that long sections
+    # with many child chunks don't dominate the context window.
+    # Visual, table and toc chunks are never deduplicated — they are unique assets.
+    _seen_sids: dict = {}
+    _deduped: list = []
+    for cid, doc, meta in zip(got_ids, got_docs, got_metas):
+        kind = (meta or {}).get("kind", "")
+        modality = (meta or {}).get("modality", "text") or "text"
+        if kind in ("visual", "table", "toc") or modality == "visual":
+            _deduped.append((cid, doc, meta))
+            continue
+        sid = (meta or {}).get("section_id", "")
+        if sid not in _seen_sids:
+            _seen_sids[sid] = True
+            _deduped.append((cid, doc, meta))
+    got_ids = [t[0] for t in _deduped]
+    got_docs = [t[1] for t in _deduped]
+    got_metas = [t[2] for t in _deduped]
+
     evidences: List[Evidence] = []
     for cid, doc, meta in zip(got_ids, got_docs, got_metas):
         score = reranked_scores.get(cid, hybrid.scores.get(cid, 0.0))

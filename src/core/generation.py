@@ -1683,6 +1683,48 @@ def generate_answer_stream(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
     )
 
+    # Post-stream silent citation retry.
+    # Streaming intentionally skips the rewrite loop to avoid retracting emitted tokens.
+    # However, if citations are missing we do a single silent non-streaming reformat
+    # pass AFTER all tokens are emitted.  app.py detects result.answer != stream_msg.content
+    # and refreshes the display.
+    if citations_found == 0 and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
+        try:
+            _system_cite = (
+                system
+                + "\n\nFORMAT DÜZELTME MODU:\n"
+                + "- Sadece cevabı yeniden yaz.\n"
+                + "- Her cümle/madde sonunda mutlaka [DosyaAdı - Sayfa X] kaynak formatı olsun.\n"
+                + "- Kaynaksız hiçbir cümle yazma.\n"
+                + "- İçerik ekleme/çıkarma yapma; sadece formatı düzelt.\n"
+            )
+            for _model_cite in gemini_model_candidates(gemini_model, fallback_model=gemini_fallback_model):
+                try:
+                    _client_cite = build_gemini_client(gemini_api_key, model_name=_model_cite)
+                    _resp_cite = _client_cite.models.generate_content(
+                        model=_model_cite,
+                        contents=gemini_contents,
+                        config=_google_genai_types().GenerateContentConfig(
+                            system_instruction=_system_cite,
+                            temperature=0.0,
+                            max_output_tokens=4096,
+                        ),
+                    )
+                    _answer_cite = _strip_thinking_leak((_resp_cite.text or "").strip())
+                    if _answer_cite and _answer_cite.strip() != "Belgede bu bilgi bulunamadı.":
+                        _cf_cite = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", _answer_cite)) + len(
+                            re.findall(r"\[[^\]]*?/\s*\d+\s*\]", _answer_cite)
+                        )
+                        if _cf_cite > citations_found:
+                            answer = _answer_cite
+                            citations_found = _cf_cite
+                    break
+                except Exception as _exc_cite:
+                    if not is_model_not_found_error(_exc_cite):
+                        break
+        except Exception:
+            pass  # Citation retry failure is non-fatal; original streamed answer is used
+
     coverage_actual: Optional[int] = None
     coverage_ok: Optional[bool] = None
     if coverage_expected is not None:

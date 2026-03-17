@@ -35,20 +35,21 @@ class VLMConfig:
 
 
 _EXTRACT_ONLY_PROMPT = """\
-You are a precise document extraction engine. Your only job is to faithfully extract \
-every piece of visible text from the image, preserving its structure and associations.
+You are a precise document understanding engine. Your job is to extract ALL meaningful \
+content from the image — text, tables, visual indicators, and layout relationships — \
+and represent them faithfully in structured plain text.
 
 ## Core Rule
-Extract ONLY what is visually present. Do NOT add, infer, summarize, or translate.
+Extract everything that is visually present and meaningful. Do NOT add, infer, summarize, \
+or translate. Preserve the relationships between elements exactly as they appear.
 
 ## Reading Order
 - Single-column content and tables: LEFT → RIGHT, then TOP → BOTTOM.
-- Multi-column document layout (sidebars, CV layout, magazine-style):
+- Multi-column layouts (CVs, sidebars, magazine-style):
   Read each COLUMN fully top-to-bottom before moving to the next column.
-  Exception: compact label-value tables where rows clearly pair a name/label on the left
-  with a value/company on the right — read those rows LEFT → RIGHT.
+  Exception: compact label-value rows — read LEFT → RIGHT per row.
 
-## Layout Handling
+## Content Types
 
 ### Headings & Sections
 - Numbered headings (e.g. "1.", "2.3", "A.1"): keep on their own line, preserve the number.
@@ -56,20 +57,16 @@ Extract ONLY what is visually present. Do NOT add, infer, summarize, or translat
 - Section hierarchy must be preserved exactly as seen.
 
 ### Multi-Column Layouts (CVs, articles, brochures)
-- Independent sidebar sections (e.g. Education sidebar, Work Experience sidebar, Skills sidebar):
-  Each section heading and its contents must be output separately, top-to-bottom within
-  that column. Do NOT merge sidebar section headings with the opposite column's content.
-- Compact label-value tables or lists (e.g. reference lists, property lists):
-  Output each row as: `Label: Value` (on the same line, colon-separated).
-  Example: if "Oğuzcan Özdemir" is on the left and "ASELSAN" is on the right,
-  output: `Oğuzcan Özdemir: ASELSAN`
+- Independent sidebar sections (Skills sidebar, Education sidebar, etc.):
+  Output each section heading and its contents separately, top-to-bottom within that column.
+  Do NOT merge sidebar content with the opposite column's content.
+- Compact label-value rows: `Label: Value` on one line.
+  Example: "Oğuzcan Özdemir" left, "ASELSAN" right → `Oğuzcan Özdemir: ASELSAN`
 
 ### Tables
 - Represent as Markdown tables: `| col1 | col2 | col3 |`
-- CRITICAL — merged cells: if a cell visually spans multiple columns, write its
-  value ONCE in the first cell, leave the others empty: `| value | | |`
-- Do NOT repeat the merged cell value across every column it spans.
-- Row-column association must be exact: each value must appear in its correct cell.
+- Merged cells: write value ONCE in the first cell, leave others empty: `| value | | |`
+- Row-column association must be exact.
 
 ### Lists
 - Numbered lists: preserve the number prefix exactly (1., 2., a), b), etc.)
@@ -79,11 +76,23 @@ Extract ONLY what is visually present. Do NOT add, infer, summarize, or translat
 ### Forms & Checkboxes
 - Checkbox checked: `[x] Label`
 - Checkbox unchecked: `[ ] Label`
-- Text field: `Field name: field value` (if value is filled) or `Field name: ___` (if empty)
+- Text field: `Field name: field value` or `Field name: ___` (if empty)
 
-### Key-Value Pairs (specs, metadata, reference lists)
-- If text is arranged as label + value pairs (even without explicit table borders),
-  output as: `Label: Value`
+### Key-Value Pairs
+- Label + value pairs (even without borders): `Label: Value`
+
+### Rating Scales & Visual Skill Indicators
+- Star ratings, dot ratings, progress bars, or any visual scale next to a label:
+  Represent as `Label: X/Y` where X is filled count and Y is total.
+  Example: "AutoCAD ★★★★☆" (4 of 5 filled) → `AutoCAD: 4/5`
+  Example: "Python ●●●●○" → `Python: 4/5`
+  If total scale is ambiguous, use: `AutoCAD: 4 yıldız`
+- Always output every item in a skills/rating section — do NOT skip any row.
+
+### Charts & Diagrams
+- Bar charts, pie charts, line graphs: describe the data relationships as text.
+  Example: "Kategori A: 45%, Kategori B: 30%, Kategori C: 25%"
+- Diagrams with labeled components: output each label and its relationship.
 
 ### Headers & Footers
 - Include page headers and footers as-is, on their own lines.
@@ -164,6 +173,23 @@ def _extract_via_gemini(image: Image.Image, cfg: VLMConfig, ocr_context: Optiona
                     max_output_tokens=8192,
                 ),
             )
+            # Check finish_reason — silently accepting a truncated response
+            # causes entire document sections to go missing from the index.
+            candidates = getattr(resp, "candidates", None) or []
+            if candidates:
+                finish_reason = getattr(candidates[0], "finish_reason", None)
+                # finish_reason == 1 (or "STOP") means normal completion.
+                # Anything else (MAX_TOKENS=2, SAFETY=3, RECITATION=4, …) means
+                # the output is incomplete — treat it as empty so the caller can
+                # fall back to OCR / plain text rather than indexing garbage.
+                finish_val = finish_reason.value if hasattr(finish_reason, "value") else finish_reason
+                if finish_val not in (1, "STOP", "stop"):
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "VLM response truncated (finish_reason=%s) — discarding partial output.",
+                        finish_reason,
+                    )
+                    return ""
             return (resp.text or "").strip()
         except Exception as exc:
             last_model_error = exc

@@ -2889,6 +2889,26 @@ async def _stream_doc_answer_live(
     if stream_msg is None:
         stream_msg = cl.Message(content="")
         await stream_msg.send()
+
+    # Strip spurious trailing fallback that the LLM sometimes appends when it
+    # can't format citations, even though it produced a valid answer.
+    # IMPORTANT: use stream_msg.content (what was actually streamed/shown to the user)
+    # as the source of truth, not result.answer.  Citation retry can overwrite a good
+    # streaming answer with a worse one; using stream_msg.content avoids clobbering
+    # the already-displayed correct text.
+    _NF = "Belgede bu bilgi bulunamadı."
+    _ans = (result.answer or "").strip()
+    _display_text = (stream_msg.content or "").strip() or _ans
+    if _display_text.endswith(_NF) and len(_display_text) > len(_NF) + 20:
+        _prefix = _display_text[: _display_text.rfind(_NF)].rstrip()
+        if _prefix:
+            stream_msg.content = _prefix + _build_qa_debug_suffix(result, mode)
+            await stream_msg.update()
+            evidence_panel = _build_evidence_panel(result)
+            if evidence_panel:
+                await cl.Message(content=evidence_panel).send()
+            return result
+
     if streamed_chars == 0 and result.answer:
         await stream_msg.stream_token(result.answer)
     await stream_msg.stream_token(_build_qa_debug_suffix(result, mode))

@@ -80,12 +80,18 @@ class Embedder:
         if self._gemini_client is not None:
             return self._gemini_client
 
-        from .gemini_client import build_gemini_client
+        from .gemini_client import build_gemini_client, use_vertex_ai_for_embedding
+        from google import genai
 
-        self._gemini_client = build_gemini_client(
-            os.getenv("GEMINI_API_KEY", ""),
-            model_name=self.model_name,
-        )
+        if use_vertex_ai_for_embedding():
+            self._gemini_client = build_gemini_client(
+                os.getenv("GEMINI_API_KEY", ""),
+                model_name=self.model_name,
+            )
+        else:
+            # Bypass Vertex AI for embeddings; use AI Studio API key directly.
+            api_key = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
+            self._gemini_client = genai.Client(api_key=api_key)
         return self._gemini_client
 
     @staticmethod

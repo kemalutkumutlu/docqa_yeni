@@ -52,12 +52,15 @@ class BM25Index:
 
     @classmethod
     def build(cls, chunks: List[Chunk]) -> "BM25Index":
-        # Index both child AND parent chunks for BM25.
-        # Parent chunks contain heading text that is critical for
-        # section-level keyword matching (e.g. "Teslimatlar" only appears
-        # in the parent chunk heading, not in child body text).
+        # Index child and table chunks only.
+        # Parent chunks are excluded: they contain heading + full body, which is a
+        # superset of child chunk content.  Indexing parents alongside children causes
+        # the same section to appear multiple extra times in BM25 results, dominating
+        # hybrid top-k and reducing retrieval diversity.
+        # Heading keyword matching is covered by the [heading_path] prefix that is
+        # prepended to every child chunk during chunking.
         # Visual/toc chunks are excluded — they don't carry searchable text.
-        indexable = [c for c in chunks if c.kind in ("child", "parent", "table")]
+        indexable = [c for c in chunks if c.kind in ("child", "table")]
         pairs = [(c.chunk_id, simple_tokenize(c.text)) for c in indexable]
         pairs = [(cid, toks) for cid, toks in pairs if toks]
         ids = [cid for cid, _ in pairs]
@@ -104,7 +107,7 @@ class BM25Index:
         This is still much cheaper than re-embedding because tokenization is
         CPU-only and fast.
         """
-        new_indexable = [c for c in new_chunks if c.kind in ("child", "parent", "table")]
+        new_indexable = [c for c in new_chunks if c.kind in ("child", "table")]
         if not new_indexable:
             return self
 
