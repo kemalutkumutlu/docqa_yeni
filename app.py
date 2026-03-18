@@ -2829,14 +2829,19 @@ async def _stream_doc_answer_live(
     thinking_msg: cl.Message | None = None,
 ):
     token_queue: SimpleQueue[str] = SimpleQueue()
+    status_queue: SimpleQueue[str] = SimpleQueue()
     stream_msg: cl.Message | None = None
+    status_msg: cl.Message | None = None
 
     def _on_token(token: str) -> None:
         token_queue.put(token)
 
+    def _on_status(msg: str) -> None:
+        status_queue.put(msg)
+
     async with _doc_qa_semaphore():
         worker = asyncio.create_task(
-            cl.make_async(pipeline.ask_stream)(query, _on_token)
+            cl.make_async(pipeline.ask_stream)(query, _on_token, _on_status)
         )
 
         streamed_chars = 0
@@ -2859,6 +2864,17 @@ async def _stream_doc_answer_live(
                         await stream_msg.send()
                     streamed_chars += len(token)
                     await stream_msg.stream_token(token)
+            while True:
+                try:
+                    status_text = status_queue.get_nowait()
+                except Empty:
+                    break
+                if status_msg is None:
+                    status_msg = cl.Message(content=status_text)
+                    await status_msg.send()
+                else:
+                    status_msg.content = status_text
+                    await status_msg.update()
             await asyncio.sleep(0.03)
 
         while True:
@@ -2879,7 +2895,24 @@ async def _stream_doc_answer_live(
                 streamed_chars += len(token)
                 await stream_msg.stream_token(token)
 
+        # Eagerly strip trailing fallback text that the LLM sometimes appends
+        # after a valid answer, so the user doesn't see it during post-stream
+        # processing (citation retry, completion check, etc.).
+        _NF_EARLY = "Belgede bu bilgi bulunamadı."
+        if stream_msg is not None:
+            _sc = (stream_msg.content or "").strip()
+            if _sc.endswith(_NF_EARLY) and len(_sc) > len(_NF_EARLY) + 20:
+                _prefix_early = _sc[: _sc.rfind(_NF_EARLY)].rstrip()
+                if _prefix_early:
+                    stream_msg.content = _prefix_early
+                    await stream_msg.update()
+
         result = await worker
+    if status_msg is not None:
+        try:
+            await status_msg.remove()
+        except Exception:
+            pass
     if thinking_msg and not thinking_removed:
         try:
             await thinking_msg.remove()

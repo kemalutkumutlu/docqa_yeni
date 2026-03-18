@@ -116,6 +116,7 @@ def _openai_chat_completion_stream(
     temperature: float,
     max_tokens: int = 4096,
     on_token: Optional[Callable[[str], None]] = None,
+    on_finish_reason: Optional[Callable[[Optional[bool]], None]] = None,
 ) -> str:
     """
     OpenAI streaming call (SSE data lines) with token callback.
@@ -165,11 +166,15 @@ def _openai_chat_completion_stream(
                     if not data or data == "[DONE]":
                         continue
                     evt = json.loads(data)
-                    tok = (((evt.get("choices") or [{}])[0].get("delta") or {}).get("content") or "")
+                    choice = (evt.get("choices") or [{}])[0]
+                    tok = (choice.get("delta") or {}).get("content") or ""
                     if tok:
                         text_parts.append(tok)
                         _emit(tok)
                         emitted_any = True
+                    fr = choice.get("finish_reason")
+                    if fr and on_finish_reason:
+                        on_finish_reason({"stop": False, "length": True}.get(fr))
                 return "".join(text_parts).strip()
         except Exception as e:
             last_err = e
@@ -191,7 +196,7 @@ from .prompts import (
     _INCOMPLETE_ENDINGS,
 )
 
-def _response_looks_incomplete(text: str) -> bool:
+def _response_looks_incomplete(text: str, *, is_truncated: Optional[bool] = None) -> bool:
     """
     Heuristic guard against provider answers that end mid-sentence.
     Deliberately conservative to avoid unnecessary continuation calls.
@@ -229,7 +234,10 @@ def _response_looks_incomplete(text: str) -> bool:
             return False
 
     last_char = body[-1]
-    if last_char.isalnum() and len(body) >= 200:
+    # Skip this aggressive heuristic when finish_reason was STOP — the model ended
+    # naturally and this check produces too many false positives for Turkish text
+    # (sentences commonly end with a letter, not punctuation).
+    if is_truncated is not False and last_char.isalnum() and len(body) >= 200:
         tail_words = re.findall(r"\w+", lines[-1] if lines else body[-120:])
         if len(tail_words) >= 4:
             return True
@@ -299,13 +307,14 @@ def _complete_if_incomplete(
     query: str,
     continue_fn: Callable[[str], str],
     max_rounds: int = 2,
+    is_truncated: Optional[bool] = None,
 ) -> str:
     text = (initial_text or "").strip()
     if not text:
         return text
 
     for _ in range(max_rounds):
-        if not _response_looks_incomplete(text):
+        if not _response_looks_incomplete(text, is_truncated=is_truncated):
             break
         extra = (continue_fn(_continue_prompt(query, text)) or "").strip()
         if not extra:
@@ -314,6 +323,7 @@ def _complete_if_incomplete(
         if merged == text:
             break
         text = merged
+        is_truncated = None  # subsequent rounds: finish_reason unknown
     return text
 
 
@@ -356,30 +366,69 @@ _TR_CUES = {
     "madde",
     "teslimat",
     "gereksinim",
+    "nerede",
+    "nasıl",
+    "nasil",
+    "kimdir",
+    "neden",
+    "hangi",
+    "neler",
+    "var",
+    "ver",
+    "liste",
+    "yaz",
+    "say",
+    "anlat",
+    "açıkla",
+    "acikla",
+    "özetle",
+    "ozetle",
+    "karşılaştır",
+    "karsilastir",
 }
 
 
 def _preferred_language(query: str) -> str:
     """
-    Return "tr" or "en" based on lightweight cues.
-    We keep this conservative: default to Turkish unless the query clearly looks English.
+    Return "tr" or "en".
+    Strategy:
+      1. Word-level Turkish character ratio ≥ 50 % → Turkish
+      2. Turkish cue words (word boundary) → Turkish
+      3. English cue word at query start → English
+      4. langdetect on queries ≥ 20 chars for reliable detection
+      5. English cue word anywhere → English
+      6. Default → Turkish
     """
+    from langdetect import detect, DetectorFactory, LangDetectException  # type: ignore
+    DetectorFactory.seed = 0
+
     q = (query or "").strip()
     if not q:
         return "tr"
-    if any(ch in _TR_CHARS for ch in q):
+
+    words = q.split()
+    tr_word_count = sum(1 for w in words if any(ch in _TR_CHARS for ch in w))
+    if tr_word_count / len(words) >= 0.5:
         return "tr"
 
     low = q.lower()
-    # Turkish cue words (ASCII-only Turkish writing included)
-    if any(w in low for w in _TR_CUES):
+    if any(w in low.split() for w in _TR_CUES):
         return "tr"
-    # English question cues
+
+    if any(low.startswith(w) for w in _EN_CUES):
+        return "en"
+
+    if len(q) >= 20:
+        try:
+            lang = detect(q)
+            if lang in ("tr", "en"):
+                return lang
+        except LangDetectException:
+            pass
+
     if any(w in low for w in _EN_CUES):
         return "en"
-    # If it's mostly ASCII and contains typical English spacing, lean English.
-    if re.search(r"\b(what|how|why|when|where|who)\b", low):
-        return "en"
+
     return "tr"
 
 
@@ -413,7 +462,7 @@ def _verify_answer_grounding(answer: str, context: str) -> str:
     # If answer is much longer than context (ratio > 3x) and context is short → suspicious
     if context.strip() and len(answer_stripped) > 3 * len(context.strip()) and len(context.strip()) < 200:
         # Don't override if the answer looks like a well-cited response
-        citation_count = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer_stripped))
+        citation_count = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer_stripped, re.IGNORECASE))
         if citation_count == 0:
             return _NOT_FOUND
 
@@ -685,6 +734,38 @@ def _format_evidence_header(ev: Evidence) -> str:
         header += f" | {details}"
     header += "]"
     return header
+
+
+def _fix_citation_filenames(answer: str, valid_names: set) -> str:
+    """Replace hallucinated file names in citations with the correct document name.
+
+    Only acts when the cited file name is NOT in the set of retrieved document names.
+    Preserves the page number and separator so the citation stays intact.
+    Skips processing when valid_names is empty or contains only the fallback value "Belge".
+    """
+    real_names = valid_names - {"Belge", ""}
+    if not real_names:
+        return answer
+
+    def _norm(s: str) -> str:
+        return s.lower().replace(" ", "_").replace("-", "_").replace(".", "_")
+
+    norm_to_real = {_norm(n): n for n in real_names}
+
+    citation_re = re.compile(r"\[([^\]]*?)\s*([-/|])\s*([Ss]ayfa\s*[\d][\d\s\-]*[^\]]*?)\]")
+
+    def _replace(m: re.Match) -> str:
+        file_part = m.group(1).strip()
+        separator = m.group(2)
+        page_part = m.group(3)
+        file_norm = _norm(file_part)
+        if file_norm in norm_to_real:
+            correct = norm_to_real[file_norm]  # canonical form, fixes formatting too
+        else:
+            correct = next(iter(real_names))  # hallucinated — replace with valid doc
+        return f"[{correct} {separator} {page_part}]"
+
+    return citation_re.sub(_replace, answer)
 
 
 def _format_citation(file_name: str, ev: Evidence) -> str:
@@ -1044,6 +1125,70 @@ def _count_answer_items(answer: str) -> int:
     return count
 
 
+_NF_SENTINEL = "Belgede bu bilgi bulunamadı."
+
+
+class _BufferedEmitter:
+    """Buffer trailing tokens that might form the fallback sentinel.
+
+    The LLM sometimes appends "Belgede bu bilgi bulunamadı." at the end of an
+    otherwise correct answer.  Because streaming emits tokens immediately, the
+    user briefly sees this text before post-stream cleanup removes it.
+
+    This emitter holds back tokens that *could* be part of the sentinel and only
+    flushes them once we know they are safe (not the sentinel) or drops them if
+    they turn out to be a trailing sentinel after a real answer.
+    """
+
+    def __init__(self, on_token: Optional[Callable[[str], None]]) -> None:
+        self._on_token = on_token
+        self._buffer: list[str] = []
+        self._emitted_any = False  # tracks whether real content was already sent
+
+    def _raw_emit(self, text: str) -> None:
+        if self._on_token and text:
+            self._emitted_any = True
+            try:
+                self._on_token(text)
+            except Exception:
+                pass
+
+    def emit(self, text: str) -> None:
+        if not self._on_token or not text:
+            return
+        candidate = "".join(self._buffer) + text
+        # Check if any suffix of candidate is a prefix of the sentinel
+        sentinel_may_start = False
+        start = max(0, len(candidate) - len(_NF_SENTINEL))
+        for i in range(start, len(candidate)):
+            if _NF_SENTINEL.startswith(candidate[i:]):
+                sentinel_may_start = True
+                break
+        if sentinel_may_start:
+            self._buffer.append(text)
+            held = "".join(self._buffer)
+            if _NF_SENTINEL in held:
+                before = held[: held.rfind(_NF_SENTINEL)]
+                if before.strip() or self._emitted_any:
+                    # Real content exists (either already emitted or in buffer
+                    # before sentinel) — emit buffer content, drop sentinel
+                    if before:
+                        self._raw_emit(before)
+                    self._buffer.clear()
+                else:
+                    # Sentinel IS the whole answer — flush everything
+                    self.flush()
+        else:
+            self.flush()
+            self._raw_emit(text)
+
+    def flush(self) -> None:
+        """Flush any buffered tokens to the UI."""
+        for t in self._buffer:
+            self._raw_emit(t)
+        self._buffer.clear()
+
+
 @dataclass(frozen=True)
 class GenerationResult:
     answer: str
@@ -1187,7 +1332,7 @@ def generate_answer(
     # Only triggers when we have coverage info (i.e., a parent section chunk).
     deterministic = _render_deterministic_section_list(retrieval)
     if deterministic:
-        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic)) + len(
+        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic, re.IGNORECASE)) + len(
             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", deterministic)
         )
         expected = retrieval.coverage.expected_items if retrieval.coverage else None
@@ -1234,11 +1379,13 @@ def generate_answer(
         is_retryable_api_error,
     ) = _gemini_helpers()
 
+    _last_truncated: list[Optional[bool]] = [None]
+
     def _call(
         system_instruction: str,
         user_contents: str | list[Any],
         temperature: float,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
     ) -> str:
         last_err: Optional[Exception] = None
         for attempt in range(1, 5):
@@ -1257,6 +1404,14 @@ def generate_answer(
                                 max_output_tokens=max_tokens,
                             ),
                         )
+                        try:
+                            fr_name = getattr(
+                                response.candidates[0].finish_reason, "name",
+                                str(response.candidates[0].finish_reason),
+                            )
+                            _last_truncated[0] = (fr_name == "MAX_TOKENS")
+                        except Exception:
+                            _last_truncated[0] = None
                         return _strip_thinking_leak(response.text or "")
                     except Exception as model_exc:
                         last_model_error = model_exc
@@ -1278,7 +1433,8 @@ def generate_answer(
         answer = _complete_if_incomplete(
             answer,
             query=query,
-            continue_fn=lambda prompt: _call(system, prompt, temperature=0.0, max_tokens=1024),
+            continue_fn=lambda prompt: _call(system, prompt, temperature=0.0, max_tokens=2048),
+            is_truncated=_last_truncated[0],
         )
 
     # Count citations in the answer
@@ -1287,12 +1443,16 @@ def generate_answer(
     # - [File / Sayfa 1]
     # - [File | Sayfa 1]
     # - [File / 1]
-    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
     )
 
-    # If citations are missing, do one strict retry to enforce formatting.
-    if citations_found == 0 and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
+    # If citations are missing or insufficient, do one strict retry to enforce formatting.
+    _answer_items = _count_answer_items(answer)
+    _citations_insufficient = citations_found == 0 or (
+        _answer_items > 1 and citations_found < _answer_items
+    )
+    if _citations_insufficient and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
         system_retry = (
             system
             + "\n\nFORMAT DÜZELTME MODU:\n"
@@ -1304,7 +1464,7 @@ def generate_answer(
         answer_retry = _call(system_retry, gemini_contents, temperature=0.0).strip()
         if answer_retry:
             answer = answer_retry
-            citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+            citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
                 re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
             )
 
@@ -1329,7 +1489,7 @@ def generate_answer(
             answer_retry2 = _call(system_retry2, gemini_contents, temperature=0.0).strip()
             if answer_retry2:
                 answer = answer_retry2
-                citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+                citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
                     re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
                 )
                 coverage_actual = _count_answer_items(answer)
@@ -1343,8 +1503,17 @@ def generate_answer(
                 f"Lütfen cevabı kontrol edin."
             )
 
+    # Fix any hallucinated citation file names
+    _valid_names = {_extract_file_name_from_heading_path(ev.heading_path) for ev in retrieval.evidences}
+    answer = _fix_citation_filenames(answer, _valid_names)
+
     # Post-generation grounding verification
     answer = _verify_answer_grounding(answer, context)
+
+    # Recount citations from the final answer (post-fixup transforms may have changed the text)
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
+        re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
+    )
 
     return GenerationResult(
         answer=answer,
@@ -1379,7 +1548,7 @@ def generate_answer_openai(
 
     deterministic = _render_deterministic_section_list(retrieval)
     if deterministic:
-        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic)) + len(
+        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic, re.IGNORECASE)) + len(
             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", deterministic)
         )
         expected = retrieval.coverage.expected_items if retrieval.coverage else None
@@ -1416,7 +1585,7 @@ def generate_answer_openai(
         system_instruction=system,
         user_contents=user_message,
         temperature=0.1,
-        max_tokens=4096,
+        max_tokens=8192,
     ) or "Belgede bu bilgi bulunamadı."
     if answer.strip() != "Belgede bu bilgi bulunamadı.":
         answer = _complete_if_incomplete(
@@ -1428,15 +1597,19 @@ def generate_answer_openai(
                 system_instruction=system,
                 user_contents=prompt,
                 temperature=0.0,
-                max_tokens=1024,
+                max_tokens=2048,
             ),
         )
 
-    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
     )
 
-    if citations_found == 0 and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
+    _answer_items = _count_answer_items(answer)
+    _citations_insufficient = citations_found == 0 or (
+        _answer_items > 1 and citations_found < _answer_items
+    )
+    if _citations_insufficient and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
         system_retry = (
             system
             + "\n\nFORMAT DÜZELTME MODU:\n"
@@ -1451,11 +1624,11 @@ def generate_answer_openai(
             system_instruction=system_retry,
             user_contents=user_message,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=8192,
         ).strip()
         if answer_retry:
             answer = answer_retry
-            citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+            citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
                 re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
             )
 
@@ -1481,11 +1654,11 @@ def generate_answer_openai(
                 system_instruction=system_retry2,
                 user_contents=user_message,
                 temperature=0.0,
-                max_tokens=4096,
+                max_tokens=8192,
             ).strip()
             if answer_retry2:
                 answer = answer_retry2
-                citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+                citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
                     re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
                 )
                 coverage_actual = _count_answer_items(answer)
@@ -1497,6 +1670,15 @@ def generate_answer_openai(
                 f"madde tespit edildi, ancak cevapta {coverage_actual} madde var. "
                 f"Lütfen cevabı kontrol edin."
             )
+
+    # Fix any hallucinated citation file names
+    _valid_names = {_extract_file_name_from_heading_path(ev.heading_path) for ev in retrieval.evidences}
+    answer = _fix_citation_filenames(answer, _valid_names)
+
+    # Recount citations from the final answer (post-fixup transforms may have changed the text)
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
+        re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
+    )
 
     return GenerationResult(
         answer=answer,
@@ -1519,6 +1701,7 @@ def generate_answer_stream(
     gemini_fallback_model: str = "",
     multimodal_answer_mode: str = "auto",
     on_token: Optional[Callable[[str], None]] = None,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> GenerationResult:
     """
     Streaming variant of generate_answer() for UI token-by-token rendering.
@@ -1529,16 +1712,18 @@ def generate_answer_stream(
         skips post-generation rewrite retries (citation/coverage retry), because
         once tokens are emitted to the UI they cannot be retracted safely.
     """
+    _emitter = _BufferedEmitter(on_token)
     def _emit(text: str) -> None:
-        if on_token and text:
-            try:
-                on_token(text)
-            except Exception:
-                pass
+        _emitter.emit(text)
 
     if not retrieval.evidences:
         answer = "Belgede bu bilgi bulunamadı."
-        _emit(answer)
+        _emitter.flush()
+        if on_token:
+            try:
+                on_token(answer)
+            except Exception:
+                pass
         return GenerationResult(
             answer=answer,
             citations_found=0,
@@ -1552,7 +1737,7 @@ def generate_answer_stream(
     deterministic = _render_deterministic_section_list(retrieval)
     if deterministic:
         _emit(deterministic)
-        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic)) + len(
+        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic, re.IGNORECASE)) + len(
             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", deterministic)
         )
         expected = retrieval.coverage.expected_items if retrieval.coverage else None
@@ -1601,6 +1786,7 @@ def generate_answer_stream(
         try:
             last_model_error: Optional[Exception] = None
             chunks = []
+            _stream_truncated: list[Optional[bool]] = [None]
             for model_name in gemini_model_candidates(gemini_model, fallback_model=gemini_fallback_model):
                 try:
                     client = build_gemini_client(gemini_api_key, model_name=model_name)
@@ -1611,13 +1797,23 @@ def generate_answer_stream(
                         config=types.GenerateContentConfig(
                             system_instruction=system,
                             temperature=0.1,
-                            max_output_tokens=4096,
+                            max_output_tokens=8192,
                         ),
                     ):
                         token = (event.text or "")
                         if token:
                             chunks.append(token)
                             _emit(token)
+                        try:
+                            if event.candidates:
+                                fr_name = getattr(
+                                    event.candidates[0].finish_reason, "name",
+                                    str(event.candidates[0].finish_reason),
+                                )
+                                if fr_name in ("STOP", "MAX_TOKENS"):
+                                    _stream_truncated[0] = (fr_name == "MAX_TOKENS")
+                        except Exception:
+                            pass
                     break
                 except Exception as model_exc:
                     last_model_error = model_exc
@@ -1631,12 +1827,25 @@ def generate_answer_stream(
             last_err = e
             if attempt >= 4 or chunks or not is_retryable_api_error(e):
                 raise
+            if on_status:
+                on_status(f"⏳ API yanıt vermiyor, yeniden deneniyor ({attempt}/4)...")
             time.sleep(_retry_sleep_seconds(attempt))
     if not chunks and last_err is not None:
         raise last_err
 
-    answer = _strip_thinking_leak("".join(chunks).strip()) or "Belgede bu bilgi bulunamadı."
-    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+    # Flush any remaining buffered tokens (e.g. incomplete sentinel match)
+    _emitter.flush()
+
+    answer = _strip_thinking_leak("".join(chunks).strip()) or _NF_SENTINEL
+    # Strip trailing fallback that the LLM sometimes appends after a valid answer.
+    if answer.endswith(_NF_SENTINEL) and len(answer) > len(_NF_SENTINEL) + 20:
+        _prefix = answer[: answer.rfind(_NF_SENTINEL)].rstrip()
+        if _prefix:
+            answer = _prefix
+
+    if answer.strip() != _NF_SENTINEL:
+        if on_status:
+            on_status("⏳ Yanıt tamamlanıyor...")
         def _continue_call(prompt: str) -> str:
             last_err: Optional[Exception] = None
             for attempt in range(1, 5):
@@ -1673,22 +1882,29 @@ def generate_answer_stream(
             answer,
             query=query,
             continue_fn=_continue_call,
+            is_truncated=_stream_truncated[0],
         )
         suffix = _continuation_suffix(answer, completed)
         if suffix:
             _emit(suffix)
             answer = completed
 
-    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
     )
 
     # Post-stream silent citation retry.
     # Streaming intentionally skips the rewrite loop to avoid retracting emitted tokens.
-    # However, if citations are missing we do a single silent non-streaming reformat
-    # pass AFTER all tokens are emitted.  app.py detects result.answer != stream_msg.content
-    # and refreshes the display.
-    if citations_found == 0 and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
+    # However, if citations are missing or insufficient we do a single silent non-streaming
+    # reformat pass AFTER all tokens are emitted.  app.py detects result.answer !=
+    # stream_msg.content and refreshes the display.
+    _answer_items_stream = _count_answer_items(answer)
+    _citations_insufficient_stream = citations_found == 0 or (
+        _answer_items_stream > 1 and citations_found < _answer_items_stream
+    )
+    if _citations_insufficient_stream and retrieval.evidences and answer.strip() != _NF_SENTINEL:
+        if on_status:
+            on_status("⏳ Kaynaklar doğrulanıyor...")
         try:
             _system_cite = (
                 system
@@ -1707,12 +1923,12 @@ def generate_answer_stream(
                         config=_google_genai_types().GenerateContentConfig(
                             system_instruction=_system_cite,
                             temperature=0.0,
-                            max_output_tokens=4096,
+                            max_output_tokens=8192,
                         ),
                     )
                     _answer_cite = _strip_thinking_leak((_resp_cite.text or "").strip())
-                    if _answer_cite and _answer_cite.strip() != "Belgede bu bilgi bulunamadı.":
-                        _cf_cite = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", _answer_cite)) + len(
+                    if _answer_cite and _answer_cite.strip() != _NF_SENTINEL:
+                        _cf_cite = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", _answer_cite, re.IGNORECASE)) + len(
                             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", _answer_cite)
                         )
                         if _cf_cite > citations_found:
@@ -1739,6 +1955,15 @@ def generate_answer_stream(
             answer += warning
             _emit(warning)
 
+    # Fix any hallucinated citation file names (app.py refreshes display when answer != streamed content)
+    _valid_names = {_extract_file_name_from_heading_path(ev.heading_path) for ev in retrieval.evidences}
+    answer = _fix_citation_filenames(answer, _valid_names)
+
+    # Recount citations from the final answer (post-fixup transforms may have changed the text)
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
+        re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
+    )
+
     return GenerationResult(
         answer=answer,
         citations_found=citations_found,
@@ -1760,16 +1985,18 @@ def generate_answer_openai_stream(
     """
     Streaming OpenAI variant for token-by-token UI rendering.
     """
+    _emitter = _BufferedEmitter(on_token)
     def _emit(text: str) -> None:
-        if on_token and text:
-            try:
-                on_token(text)
-            except Exception:
-                pass
+        _emitter.emit(text)
 
     if not retrieval.evidences:
         answer = "Belgede bu bilgi bulunamadı."
-        _emit(answer)
+        _emitter.flush()
+        if on_token:
+            try:
+                on_token(answer)
+            except Exception:
+                pass
         return GenerationResult(
             answer=answer,
             citations_found=0,
@@ -1783,7 +2010,7 @@ def generate_answer_openai_stream(
     deterministic = _render_deterministic_section_list(retrieval)
     if deterministic:
         _emit(deterministic)
-        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic)) + len(
+        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic, re.IGNORECASE)) + len(
             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", deterministic)
         )
         expected = retrieval.coverage.expected_items if retrieval.coverage else None
@@ -1814,16 +2041,27 @@ def generate_answer_openai_stream(
         f"SORU: {query}"
     )
 
+    _openai_truncated: list[Optional[bool]] = [None]
     answer = _openai_chat_completion_stream(
         api_key=openai_api_key,
         model=openai_model,
         system_instruction=system,
         user_contents=user_message,
         temperature=0.1,
-        max_tokens=4096,
+        max_tokens=8192,
         on_token=_emit,
-    ) or "Belgede bu bilgi bulunamadı."
-    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+        on_finish_reason=lambda v: _openai_truncated.__setitem__(0, v),
+    ) or _NF_SENTINEL
+    _emitter.flush()
+    # Strip trailing fallback appended after a valid answer
+    if answer.endswith(_NF_SENTINEL) and len(answer) > len(_NF_SENTINEL) + 20:
+        _prefix = answer[: answer.rfind(_NF_SENTINEL)].rstrip()
+        if _prefix:
+            answer = _prefix
+
+    if answer.strip() != _NF_SENTINEL:
+        if on_status:
+            on_status("⏳ Yanıt tamamlanıyor...")
         completed = _complete_if_incomplete(
             answer,
             query=query,
@@ -1833,15 +2071,16 @@ def generate_answer_openai_stream(
                 system_instruction=system,
                 user_contents=prompt,
                 temperature=0.0,
-                max_tokens=1024,
+                max_tokens=2048,
             ),
+            is_truncated=_openai_truncated[0],
         )
         suffix = _continuation_suffix(answer, completed)
         if suffix:
             _emit(suffix)
             answer = completed
 
-    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
     )
 
@@ -1858,6 +2097,15 @@ def generate_answer_openai_stream(
             )
             answer += warning
             _emit(warning)
+
+    # Fix any hallucinated citation file names
+    _valid_names = {_extract_file_name_from_heading_path(ev.heading_path) for ev in retrieval.evidences}
+    answer = _fix_citation_filenames(answer, _valid_names)
+
+    # Recount citations from the final answer (post-fixup transforms may have changed the text)
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
+        re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
+    )
 
     return GenerationResult(
         answer=answer,
@@ -1927,7 +2175,7 @@ def generate_answer_local(
     # Deterministic path (shared, no LLM call needed).
     deterministic = _render_deterministic_section_list(retrieval)
     if deterministic:
-        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic)) + len(
+        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic, re.IGNORECASE)) + len(
             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", deterministic)
         )
         expected = retrieval.coverage.expected_items if retrieval.coverage else None
@@ -1960,7 +2208,7 @@ def generate_answer_local(
         f"SORU: {query}"
     )
 
-    def _call_local(sys: str, msg: str, temp: float, max_tok: int = 4096) -> str:
+    def _call_local(sys: str, msg: str, temp: float, max_tok: int = 8192) -> str:
         return ollama_chat(cfg=ollama_cfg, system=sys, user_message=msg, temperature=temp, max_tokens=max_tok)
 
     answer = _call_local(system, user_message, 0.1) or "Belgede bu bilgi bulunamadı."
@@ -1968,16 +2216,20 @@ def generate_answer_local(
         answer = _complete_if_incomplete(
             answer,
             query=query,
-            continue_fn=lambda prompt: _call_local(system, prompt, 0.0, 1024),
+            continue_fn=lambda prompt: _call_local(system, prompt, 0.0, 2048),
         )
 
     # Citation counting (same logic as Gemini path)
-    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
     )
 
     # Citation retry
-    if citations_found == 0 and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
+    _answer_items_local = _count_answer_items(answer)
+    _citations_insufficient_local = citations_found == 0 or (
+        _answer_items_local > 1 and citations_found < _answer_items_local
+    )
+    if _citations_insufficient_local and retrieval.evidences and answer.strip() != "Belgede bu bilgi bulunamadı.":
         system_retry = (
             system
             + "\n\nFORMAT DÜZELTME MODU:\n"
@@ -1989,7 +2241,7 @@ def generate_answer_local(
         answer_retry = _call_local(system_retry, user_message, 0.0).strip()
         if answer_retry:
             answer = answer_retry
-            citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+            citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
                 re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
             )
 
@@ -2013,7 +2265,7 @@ def generate_answer_local(
             answer_retry2 = _call_local(system_retry2, user_message, 0.0).strip()
             if answer_retry2:
                 answer = answer_retry2
-                citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+                citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
                     re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
                 )
                 coverage_actual = _count_answer_items(answer)
@@ -2025,6 +2277,15 @@ def generate_answer_local(
                 f"madde tespit edildi, ancak cevapta {coverage_actual} madde var. "
                 f"Lütfen cevabı kontrol edin."
             )
+
+    # Fix any hallucinated citation file names
+    _valid_names = {_extract_file_name_from_heading_path(ev.heading_path) for ev in retrieval.evidences}
+    answer = _fix_citation_filenames(answer, _valid_names)
+
+    # Recount citations from the final answer (post-fixup transforms may have changed the text)
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
+        re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
+    )
 
     return GenerationResult(
         answer=answer,
@@ -2051,16 +2312,18 @@ def generate_answer_local_stream(
     """
     from .local_llm import OllamaConfig, ollama_chat, ollama_chat_stream  # noqa: F811
 
+    _emitter = _BufferedEmitter(on_token)
     def _emit(text: str) -> None:
-        if on_token and text:
-            try:
-                on_token(text)
-            except Exception:
-                pass
+        _emitter.emit(text)
 
     if not retrieval.evidences:
         answer = "Belgede bu bilgi bulunamadı."
-        _emit(answer)
+        _emitter.flush()
+        if on_token:
+            try:
+                on_token(answer)
+            except Exception:
+                pass
         return GenerationResult(
             answer=answer,
             citations_found=0,
@@ -2074,7 +2337,7 @@ def generate_answer_local_stream(
     deterministic = _render_deterministic_section_list(retrieval)
     if deterministic:
         _emit(deterministic)
-        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic)) + len(
+        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic, re.IGNORECASE)) + len(
             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", deterministic)
         )
         expected = retrieval.coverage.expected_items if retrieval.coverage else None
@@ -2110,10 +2373,19 @@ def generate_answer_local_stream(
         system=system,
         user_message=user_message,
         temperature=0.1,
-        max_tokens=4096,
+        max_tokens=8192,
         on_token=_emit,
-    ) or "Belgede bu bilgi bulunamadı."
-    if answer.strip() != "Belgede bu bilgi bulunamadı.":
+    ) or _NF_SENTINEL
+    _emitter.flush()
+    # Strip trailing fallback appended after a valid answer
+    if answer.endswith(_NF_SENTINEL) and len(answer) > len(_NF_SENTINEL) + 20:
+        _prefix = answer[: answer.rfind(_NF_SENTINEL)].rstrip()
+        if _prefix:
+            answer = _prefix
+
+    if answer.strip() != _NF_SENTINEL:
+        if on_status:
+            on_status("⏳ Yanıt tamamlanıyor...")
         completed = _complete_if_incomplete(
             answer,
             query=query,
@@ -2122,7 +2394,7 @@ def generate_answer_local_stream(
                 system=system,
                 user_message=prompt,
                 temperature=0.0,
-                max_tokens=1024,
+                max_tokens=2048,
             ),
         )
         suffix = _continuation_suffix(answer, completed)
@@ -2130,7 +2402,7 @@ def generate_answer_local_stream(
             _emit(suffix)
             answer = completed
 
-    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer)) + len(
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
         re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
     )
 
@@ -2147,6 +2419,15 @@ def generate_answer_local_stream(
             )
             answer += warning
             _emit(warning)
+
+    # Fix any hallucinated citation file names
+    _valid_names = {_extract_file_name_from_heading_path(ev.heading_path) for ev in retrieval.evidences}
+    answer = _fix_citation_filenames(answer, _valid_names)
+
+    # Recount citations from the final answer (post-fixup transforms may have changed the text)
+    citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", answer, re.IGNORECASE)) + len(
+        re.findall(r"\[[^\]]*?/\s*\d+\s*\]", answer)
+    )
 
     return GenerationResult(
         answer=answer,
@@ -2187,7 +2468,7 @@ def generate_extractive_answer(
     # Deterministic section list (shared with the LLM path).
     deterministic = _render_deterministic_section_list(retrieval)
     if deterministic:
-        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic)) + len(
+        citations_found = len(re.findall(r"\[[^\]]*?\bSayfa\s*\d+[^\]]*?\]", deterministic, re.IGNORECASE)) + len(
             re.findall(r"\[[^\]]*?/\s*\d+\s*\]", deterministic)
         )
         expected = retrieval.coverage.expected_items if retrieval.coverage else None
