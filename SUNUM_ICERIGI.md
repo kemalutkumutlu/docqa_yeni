@@ -102,7 +102,7 @@ Ingestion ve extraction tasarimi
 
 **Sayfada yer almasi gerekenler**
 - PDF text backend: `pymupdf`, `docling`, `auto`
-- OCR backend: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`
+- OCR backend: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`, `smart`
 - VLM extract: `gemini` veya local vision model
 - OCR + VLM Maksimizasyonu: Modeller artik yaristirilmaz, birlestirilir (Fusion). OCR text, VLM'ye prompt olarak "grounding" amaciyla akıtılır.
 - Dusuk kalite metinde OCR/VLM fusion devreye giriyor
@@ -141,12 +141,13 @@ Hybrid retrieval ve query routing
 - RRF ile birlestirme
 - Query classification:
   - `section_list`
+  - `multi_section`
   - `normal_qa`
 - Heading-aware section secimi
 - Gerekirse tum section + subtree fetch
 
 **Konusma notu**
-Sistemde tum sorular ayni sekilde ele alinmiyor. "Teslimatlar nelerdir?" gibi sorularla "Teslim suresi nedir?" ayni retrieval stratejisine gitmiyor. Bu ayrim, hem eksik madde problemini hem de yanlis section secimini azaltıyor.
+Sistemde tum sorular ayni sekilde ele alinmiyor. "Teslimatlar nelerdir?" gibi sorular `section_list` olarak siniflanip tum alt agac getirilirken, "Teslim suresi nedir?" gibi sorular `normal_qa` ile top-k evidence aliyor. "X ile Y arasindaki fark nedir?" gibi karsilastirma sorulari ise `multi_section` olarak birden fazla bolumden evidence topluyor. Bu ayrim, hem eksik madde problemini hem de yanlis section secimini azaltıyor.
 
 ---
 
@@ -174,7 +175,7 @@ Bu kisim benim icin fark yaratan teknik kararlardan biri oldu. Klasik RAG'de LLM
 Metin yetmediginde ne oluyor?
 
 **Sayfada yer almasi gerekenler**
-- Processing mode: `classic` veya `multimodal`
+- Processing mode: `classic`, `multimodal` veya `smart`
 - Visual chunk level: `page` veya `region`
 - Region source: `heuristic` veya `detector`
 - Detector backend: `none`, `sidecar`, `docai`, `docling`
@@ -308,8 +309,17 @@ Kaliteyi nasil dogruladim?
 - Smoke suite
 - Folder suite ile coklu PDF denemeleri
 
+**Case Study Sonuclari (Case_Study_20260205.pdf)**
+
+| Metric | Sonuc | Aciklama |
+|---|---|---|
+| Intent Accuracy | 25/25 (100%) | Sorgu tipi dogru tespit |
+| Heading Hit | 15/15 (100%) | Beklenen baslik retrieval'da bulunuyor |
+| Section Hit | 6/6 (100%) | Beklenen section key retrieval'da mevcut |
+| Evidence Met | 25/25 (100%) | Minimum evidence sayisi saglanmis |
+
 **Konusma notu**
-Test stratejim sadece unit test degil. Bu tarz bir RAG sistemde ingestion, retrieval ve generation birlikte test edilmeli. Bu yuzden script tabanli kabul kapilari kurdum. Ozellikle retrieval tarafinda LLM-free evaluasyon ayirdim.
+Test stratejim sadece unit test degil. Bu tarz bir RAG sistemde ingestion, retrieval ve generation birlikte test edilmeli. Bu yuzden script tabanli kabul kapilari kurdum. Ozellikle retrieval tarafinda LLM-free evaluasyon ayirdim. Case study sonuclari tum metriklerde %100 basari gosteriyor.
 
 ---
 
@@ -330,7 +340,7 @@ Bugun gosterecegim aktif konfigurasyon
 - `VISUAL_DETECTOR_BACKEND=docai`
 - `PDF_TEXT_BACKEND=docling`
 - `OCR_ENABLED=0` (Docling text extraction aktif, OCR gereksiz)
-- `TABLE_STRUCTURE_BACKEND=auto`
+- `TABLE_STRUCTURE_BACKEND=auto` (`TABLE_STRUCTURE_ENABLED=0`; Docling zaten table markdown uretiyor)
 - `VLM_PROVIDER=gemini`
 - `VLM_MODE=force`
 
@@ -401,8 +411,14 @@ Bu sorularda ana cevabim su olacak: ben sistemi sadece calisan degil, farkli bel
 Bir sonraki teknik adimlar
 
 **Sayfada yer almasi gerekenler**
+
+**DOCQA v2.0 Vizyonu**
+- Graph RAG: Knowledge Graph entegrasyonu; vector-only arama yerine birbirine bagli dugumlerle multi-hop karmasik sorgular
+- Agentic RAG: Otonom QA; basit retrieval yerine coklu belge sentezi ve dogrulama yapabilen akilli ajanlar
+
+**Kisa Vadeli Hedefler**
 - Retrieval iyilestirme:
-  - late interaction veya reranker katmani eklemek
+  - ColBERT veya cross-encoder reranker katmani eklemek
   - ozellikle benzer section'lar arasinda daha hassas ayristirma yapmak
 - Multimodal iyilestirme:
   - region planning ve table extraction kalitesini artirmak
@@ -412,10 +428,10 @@ Bir sonraki teknik adimlar
   - retrieval ve hallucination metriklerini daha sistematik raporlamak
 - Operasyonel iyilestirme:
   - profil bazli hazir demo preset'leri
-  - daha guclu loglama ve gozlemlenebilirlik
+  - yapilandirilmis loglama ve monitoring altyapisi
 
 **Konusma notu**
-Burada dikkat ettigim nokta su: gelecekte sistemi buyutmek istedigim alanlar var, ama bugun once temel belge QA problemini guvenilir sekilde cozmek istedim. Bir sonraki mantikli adim retrieval tarafinda reranking, multimodal tarafta daha iyi region/table ayrimi ve test tarafinda daha genis benchmark kapsami olur.
+Burada dikkat ettigim nokta su: gelecekte sistemi buyutmek istedigim alanlar var, ama bugun once temel belge QA problemini guvenilir sekilde cozmek istedim. Uzun vadede Graph RAG ve Agentic RAG ile multi-hop sorgular ve coklu belge sentezi hedefliyorum. Kisa vadede ise retrieval tarafinda reranking, multimodal tarafta daha iyi region/table ayrimi ve test tarafinda daha genis benchmark kapsami oncelikli.
 
 ---
 
