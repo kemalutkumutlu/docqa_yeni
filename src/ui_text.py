@@ -192,9 +192,8 @@ def build_qa_debug_suffix(result: Any, mode: str) -> str:
     return (
         f"\n\n"
         f"---\n"
-        f"<details><summary>Debug Bilgisi</summary>\n\n"
-        f"{debug_text}\n\n"
-        f"</details>"
+        f"**Debug Bilgisi**\n\n"
+        f"{debug_text}"
     )
 
 

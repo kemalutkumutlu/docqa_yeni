@@ -326,7 +326,7 @@ Kontrol et:
 - `LLM_PROVIDER`
 - `GEMINI_MODEL` veya `OPENAI_MODEL`
 - Vertex kullaniyorsan auth ve location
-- AI Studio kullaniyorsan `VERTEX_ENABLED=0`
+- AI Studio kullaniyorsan `EMBEDDING_VERTEX_ENABLED=0`
 
 ### OCR var ama sonuc bos
 

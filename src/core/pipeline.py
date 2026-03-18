@@ -127,10 +127,7 @@ class RAGPipeline:
 
     @staticmethod
     def _summarize_evidence(retrieval: RetrievalResult, *, limit: int = 4, answer: str = "") -> list[str]:
-        if not any(
-            getattr(ev, "region_label", "") or getattr(ev, "region_id", "") or getattr(ev, "crop_type", "page") != "page"
-            for ev in retrieval.evidences
-        ):
+        if not answer or answer.strip() == "Belgede bu bilgi bulunamadı.":
             return []
 
         # Build set of cited page numbers from the answer to filter evidence.
@@ -1004,6 +1001,7 @@ class RAGPipeline:
         self,
         query: str,
         on_token: Optional[Callable[[str], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
     ) -> GenerationResult:
         """
         Streaming answer path for UI token rendering.
@@ -1045,6 +1043,7 @@ class RAGPipeline:
                     gemini_fallback_model=self.gemini_fallback_model,
                     multimodal_answer_mode=self.multimodal_answer_mode,
                     on_token=on_token,
+                    on_status=on_status,
                 )
             result = replace(result, evidence_summary=self._summarize_evidence(empty))
             return result

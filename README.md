@@ -7,11 +7,11 @@ PDF ve gorsel belgeler uzerinde calisan belge soru-cevap sistemi. Proje, belgeyi
 - Belge turleri: `PDF`, `PNG`, `JPG`
 - Retrieval: dense + sparse + RRF; görsel chunk fallback (section text boşsa visual chunk sorgusu)
 - Generation: `gemini`, `openai`, `local` veya `extractive`; streaming + sessiz citation retry
-- OCR backends: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`
+- OCR backends: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`, `smart`
 - Layout detector backends: `none`, `sidecar`, `docai`, `docling`
-- Table structure backends: `off`, `auto`, `docai`, `gemini`, `heuristic`
-- PDF text backends: `pymupdf` (default), `docling`, `auto`
-- Processing mode: `classic` veya `multimodal`
+- Table structure backends: `off`, `auto`, `docai`, `gemini`, `heuristic`; UI'da `smart` seçeneği de var (sadece taranmış/OCR sayfalarda tablo aşaması çalıştırır)
+- PDF text backends: `pymupdf` (default), `docling`, `auto`, `smart`
+- Processing mode: `classic`, `multimodal` veya `smart` (multimodal ile aynı ama sadece görsel ağırlıklı sayfalarda visual asset üretir)
 - Embedding: `gemini-embedding-001` veya local; Vertex AI bypass (`EMBEDDING_VERTEX_ENABLED=0`)
 - UI: Chainlit tabanli; `Basic` ve `Advanced` ayar sekmeleri var
 - Desktop UI: sol tarafta custom sohbet gecmisi paneli, sag tarafta custom runtime settings paneli
@@ -48,6 +48,7 @@ Gercek davranis:
 
 - `classic`: text-first akis
 - `multimodal`: text akis korunur, buna ek olarak visual chunks ve visual evidence yolu eklenir
+- `smart`: `multimodal` ile aynı akış, fakat visual asset üretimi yalnızca görsel ağırlıklı sayfalar için yapılır (native metin içeren PDF sayfalarda visual aşama atlanır)
 - `VISUAL_CHUNK_LEVEL=region`: detector veya heuristic region planning kullanilir
 - `TABLE_STRUCTURE_ENABLED=1`: sadece tablo gorunen region'larda table extraction denenir
 
@@ -187,6 +188,7 @@ Desteklenen backend'ler:
 - `paddle_vl`: `PaddleOCR-VL-1.5`
 - `paddle`: standart PaddleOCR
 - `tesseract_legacy`: son fallback
+- `smart`: otomatik mod; docai varsa docai, yoksa paddle_vl → paddle → tesseract_legacy zincirine gider
 
 Gercek fallback zinciri:
 
@@ -219,6 +221,7 @@ PDF metin cikarimi icin kullanilan backend secimi:
 - `pymupdf` (default): PyMuPDF ile hizli metin cikarimi
 - `docling`: Docling ile yapisal metin + tablo markdown cikarimi
 - `auto`: `DOCLING_PYTHON_BIN` ayarliysa Docling kullanir, degilse PyMuPDF
+- `smart`: `auto` ile ayni mantik; gelecekte ek akıllı seçim davranışı içerebilir
 
 Secim icin:
 
@@ -409,6 +412,9 @@ scripts/
   preview_structure.py
   search_index.py
   smoke_suite.py
+  test_bug.py
+  test_generation.py
+  test_retrieval.py
   validate_layout_sidecar.py
 
 src/

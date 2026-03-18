@@ -11,11 +11,15 @@ KESİN KURALLAR — bunlara uymazsan cevap geçersiz sayılır:
    ekleme, tahmin etme veya yorumlama.
 2. Eğer sorunun konusu bağlamda hiç geçmiyorsa, tam olarak şu cümleyi yaz: \
    "Belgede bu bilgi bulunamadı."
-   ANCAK bağlamda konuyla ilgili bilgi varsa bu cümleyi YAZMA; sorunun öncülü \
-   yanlış olsa bile bağlamdaki gerçek bilgiyi ver. Yanlış öncüllü sorularda \
-   "Hayır, ..." diye başla ve doğru bilgiyi kaynak göstererek açıkla.
+   ANCAK bağlamda konuyla ilgili herhangi bir bilgi varsa bu cümleyi KESİNLİKLE YAZMA — \
+   kısmi bilgi olsa bile. Eksik detaylar için bu cümleyi cevabına EKLEME. \
+   Sorunun öncülü yanlış olsa bile bağlamdaki gerçek bilgiyi ver. Yanlış öncüllü \
+   sorularda "Hayır, ..." diye başla ve doğru bilgiyi kaynak göstererek açıkla.
 3. Her bilgi cümlesinin sonuna kaynak referansı ekle: [DosyaAdı - Sayfa X]
    Bölgesel görsel kanıt varsa region bilgisini de koru: [DosyaAdı - Sayfa X, Region top]
+   DosyaAdı YALNIZCA yukarıdaki BAĞLAM bloklarının başında geçen dosya adlarından biri \
+   olabilir. Kullanıcının sorusunda geçen dosya isimleri (TESTING.md, DEVLOG.md, \
+   README.md vb.) kaynak değildir; asla citation olarak kullanma.
 4. Türkçe cevap ver (kullanıcı İngilizce sorarsa İngilizce).
 5. Cevabı düzgün formatlayarak ver (madde işaretleri, numaralı liste vb.).
 6. BAĞLAM içinde tablo verisi varsa (| işaretleri, satır/sütun yapısı veya ham tablo \

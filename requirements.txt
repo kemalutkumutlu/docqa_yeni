@@ -2,6 +2,7 @@
 # If you want local CUDA embeddings, install CUDA-compatible torch first.
 
 # Core
+langdetect==1.0.9
 python-dotenv==1.2.1
 httpx==0.28.1
 tiktoken==0.8.0

@@ -54,13 +54,31 @@ def _multi_query_expand(
 
     try:
         from .gemini_client import build_gemini_client
+        from langdetect import detect, DetectorFactory, LangDetectException  # type: ignore
+        DetectorFactory.seed = 0
+
+        try:
+            query_lang = detect(query) if len(query) >= 10 else "tr"
+        except LangDetectException:
+            query_lang = "tr"
+
+        if query_lang == "en":
+            prompt = (
+                "Reformulate the following query in 2 ways for a document retrieval system.\n"
+                "- Line 1: an alternative English formulation using different words.\n"
+                "- Line 2: a Turkish translation of the original query.\n"
+                "Write exactly 2 lines, nothing else.\n\n"
+                f"Original: {query}"
+            )
+        else:
+            prompt = (
+                "Aşağıdaki soruyu bir belge arama sistemi için 2 farklı şekilde yeniden formüle et. "
+                "Her formülasyon aynı bilgiyi bulmaya yönelik olsun ama farklı kelimeler kullansın. "
+                "Sadece 2 alternatif sorgu yaz, her biri ayrı satırda. Başka bir şey yazma.\n\n"
+                f"Orijinal: {query}"
+            )
+
         client = build_gemini_client(api_key=api_key)
-        prompt = (
-            "Aşağıdaki soruyu bir belge arama sistemi için 2 farklı şekilde yeniden formüle et. "
-            "Her formülasyon aynı bilgiyi bulmaya yönelik olsun ama farklı kelimeler kullansın. "
-            "Sadece 2 alternatif sorgu yaz, her biri ayrı satırda. Başka bir şey yazma.\n\n"
-            f"Orijinal: {query}"
-        )
         response = client.models.generate_content(
             model=model,
             contents=prompt,
@@ -107,14 +125,26 @@ def retrieve(
     # Morphological expansion improves BM25 recall for Turkish
     expanded_query = expand_query_morphological(query)
 
-    # Optional: Gemini-based multi-query expansion for broader recall
+    # Optional: Gemini-based multi-query expansion for broader recall.
+    # For Turkish queries expansion adds little value (BM25 already works).
+    # For English queries expansion is required to generate a Turkish translation
+    # so BM25 can match against Turkish document tokens.
     if query_expansion_enabled:
         import os
-        alt_queries = _multi_query_expand(
-            query,
-            gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-        )
+        from langdetect import detect, DetectorFactory, LangDetectException  # type: ignore
+        DetectorFactory.seed = 0
+        try:
+            _query_lang = detect(query) if len(query) >= 10 else "tr"
+        except LangDetectException:
+            _query_lang = "tr"
+        if _query_lang == "en":
+            alt_queries = _multi_query_expand(
+                query,
+                gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
+                gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            )
+        else:
+            alt_queries = [query]
     else:
         alt_queries = [query]
 

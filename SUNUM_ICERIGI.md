@@ -325,16 +325,17 @@ Bugun gosterecegim aktif konfigurasyon
 - `EMBEDDING_MODEL=gemini-embedding-2-preview`
 - `EMBEDDING_VERTEX_ENABLED=0` (Vertex'te allowlist sorunu; AI Studio key ile doğrudan)
 - `DOC_PROCESSING_MODE=multimodal`
-- `VISUAL_CHUNK_LEVEL=region`
+- `VISUAL_CHUNK_LEVEL=page`
 - `VISUAL_REGION_SOURCE=detector`
 - `VISUAL_DETECTOR_BACKEND=docai`
-- `OCR_BACKEND=paddle_vl`
+- `PDF_TEXT_BACKEND=docling`
+- `OCR_ENABLED=0` (Docling text extraction aktif, OCR gereksiz)
 - `TABLE_STRUCTURE_BACKEND=auto`
 - `VLM_PROVIDER=gemini`
 - `VLM_MODE=force`
 
 **Konusma notu**
-Demo icin kaliteyi one cikan hibrit bir profil kullaniyorum. OCR tarafinda local GPU gucunden, layout ve generation tarafinda ise cloud modellerden yararlaniyorum. Embedding'in Vertex'teki allowlist sorununu `EMBEDDING_VERTEX_ENABLED=0` ile bypass ediyorum; LLM ve VLM hala Vertex uzerinden gidiyor. Bu kombinasyon kalite-maliyet dengesinde guclu bir nokta sagliyor.
+Demo icin kaliteyi one cikan bir profil kullaniyorum. Docling ile yapisal metin cikarimi yapiyorum, layout ve generation tarafinda cloud modellerden yararlaniyorum. Embedding'in Vertex'teki allowlist sorununu `EMBEDDING_VERTEX_ENABLED=0` ile bypass ediyorum; LLM ve VLM hala Vertex uzerinden gidiyor. Bu kombinasyon kalite-maliyet dengesinde guclu bir nokta sagliyor.
 
 ---
 
