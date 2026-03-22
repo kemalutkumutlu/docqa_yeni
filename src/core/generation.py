@@ -2303,6 +2303,7 @@ def generate_answer_local_stream(
     query: str,
     ollama_cfg: "OllamaConfig",
     on_token: Optional[Callable[[str], None]] = None,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> GenerationResult:
     """
     Streaming variant of generate_answer_local() for UI token-by-token rendering.

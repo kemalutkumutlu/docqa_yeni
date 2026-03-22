@@ -1029,6 +1029,7 @@ class RAGPipeline:
                         query=query,
                         ollama_cfg=self.ollama_config,
                         on_token=on_token,
+                        on_status=on_status,
                     )
                 else:
                     result = generate_extractive_answer(retrieval=empty, query=query)
@@ -1084,6 +1085,7 @@ class RAGPipeline:
                     query=query,
                     ollama_cfg=self.ollama_config,
                     on_token=on_token,
+                    on_status=on_status,
                 )
             else:
                 result = generate_extractive_answer(retrieval=ret, query=query)
@@ -1098,6 +1100,7 @@ class RAGPipeline:
                 gemini_fallback_model=self.gemini_fallback_model,
                 multimodal_answer_mode=self.multimodal_answer_mode,
                 on_token=on_token,
+                on_status=on_status,
             )
         result = replace(result, evidence_summary=self._summarize_evidence(ret, answer=result.answer or ""))
         _gen_ms = (time.perf_counter() - _t_gen) * 1000
