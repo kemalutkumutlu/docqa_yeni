@@ -1,508 +1,363 @@
 # TUSAS DOCQA Teknik Mulakat Sunum Icerigi
 
-Bu dokuman, mevcut kod tabani ile uyumlu olacak sekilde guncellenmis teknik sunum iskeletidir. Icerik; ingestion, section-tree, hybrid retrieval, multimodal capability, guardrail ve runtime ayarlari dahil gercek uygulama davranisina gore yazilmistir.
+Bu dokuman, `/home/kemalutkumutlu/TUSAS_DOCQA/docqa_yeni/TUSAS-DOCQA (4).pdf` ile tutarli olacak sekilde guncellenmistir. Slayt basliklari, sayfa sayisi ve ana mesajlar dogrudan mevcut PDF akisina gore yazilmistir.
 
-## Sunum Stratejisi
+## Sunum Akisi
 
-- Sunumu 12-15 dakika araliginda bitir.
-- Once problemi, sonra mimariyi, sonra kritik teknik kararlarini anlat.
-- Demo'da sadece "cevap verdi" demek yetmez; evidence, citation ve aktif pipeline'i de goster.
-- Metrik veya profil bilgisi vereceksen sunum gunu script ve `.env` ile son kez dogrula.
+Toplam slayt sayisi: 17
+
+Akis:
+- Problem tanimi
+- Uctan uca cozum mimarisi
+- Dokuman anlama / chunking / retrieval
+- Multimodal ve table-layout isleme
+- Guardrail, backend, UI ve operasyon
+- Test, trade-off, gelecek calismalar ve kapanis
 
 ---
 
 ## Sayfa 1 - Kapak
 
 **Baslik**
-TUSAS DOCQA: Hiyerarsik, Multimodal ve Guardrail Destekli Belge Soru-Cevap Sistemi
+TUSAS DOCQA
 
 **Alt Baslik**
-PDF ve gorsel belgeler icin structure-aware retrieval, OCR/VLM destekli extraction ve kaynakli cevap uretimi
+Guvenlik Katmanli Multimodal Dokuman Soru-Cevaplama Sistemi
 
-**Sayfada yer almasi gerekenler**
-- Proje adi
-- Isim
-- "Technical Interview Presentation"
-- Kisa slogan: "Belgeden cevap, kaynakla birlikte"
+**Sayfada yer alan metin**
+- Kurumsal PDF ve gorsel belgeler icin guvenilir soru-cevap sistemi
+- TEKNIK MULAKAT SUNUMU
+- KEMAL UTKU MUTLU
 
 **Konusma notu**
-Bu projede hedefim sadece belgeyi arayan bir sistem kurmak degildi. Amacim, belge yapisini koruyan, gerektiginde OCR ve gorsel extraction kullanan, retrieval'i sorgu tipine gore degistiren ve cevabi kaynaklariyla birlikte ureten guvenilir bir Document QA sistemi gelistirmekti.
+Bu projede hedefim yalnizca belgeyi arayan bir sistem kurmak degildi. Belge yapisini koruyan, gerektiginde gorsel extraction kullanan ve cevabini kaynakla savunan guvenilir bir Document QA sistemi gelistirdim.
 
 ---
 
 ## Sayfa 2 - Problem Tanimi
 
 **Baslik**
-Neyi cozuyorum?
+Problem Tanimi
 
-**Sayfada yer almasi gerekenler**
-- Kurumsal PDF'lerde metin katmani her zaman temiz degil
-- Scan/image PDF'lerde OCR gerekiyor
-- Tablolar, formlar ve layout kritik bilgi tasiyor
-- Kullanici cogu zaman paragraf degil, bolum veya liste soruyor
-- Sadece vector search ile eksiksiz cevap almak zor
-- Halusinasyon ve kaynak gosterimi kritik risk
+**Sayfada yer alan basliklar**
+- Kayip Layout ve Gorsel Baglam
+- OCR Siniri
+- Retrieval Yetersizligi
+- Grounding ve Guvenilirlik
+
+**Sayfada yer alan mesajlar**
+- Kurumsal belgelerde tablo, form, baslik yapisi ve gorsel yerlesim kritik bilgi tasir
+- Salt metin cikarimi bu baglami koruyamaz
+- OCR gerekli bir temel katmandir ama tek basina yapisal ve gorsel anlami temsil etmeye yetmez
+- Text-only veya sadece dense retrieval liste ve yapisal sorgularda yetersiz kalabilir
+- Kaynak gosterimi, guardrail ve grounded answer generation olmadan guvenilirlik saglanamaz
 
 **Konusma notu**
-Klasik RAG yaklasimi "chunk + embedding + LLM" seviyesinde iyi bir baslangic ama gercek belge problemini tam cozmez. Cunku sorun sadece anlamsal arama degil; extraction kalitesi, baslik hiyerarsisi, tablo yapisi, layout ve cevap guvenilirligi de isin icinde.
+Problemi sadece OCR veya sadece retrieval problemi olarak degil, extraction, yapi ve guvenilirlik problemi olarak ele aldim.
 
 ---
 
-## Sayfa 3 - Cozum Ozeti
+## Sayfa 3 - Uctan Uca Cozum Mimarisi
 
 **Baslik**
-Sistemin kisa ozeti
+Uctan Uca Cozum Mimarisi
 
-**Sayfada yer almasi gerekenler**
-- Girdi: PDF, PNG, JPG
-- Ingestion: PyMuPDF / Docling / OCR / VLM adaylari arasindan en iyi metin secimi
-- Yapisal analiz: section tree + parent/child chunking
-- Retrieval: Dense + Sparse + RRF + embedding rerank
-- Multimodal: page/region visual chunk ve table chunk
-- Generation: Gemini / OpenAI / Local / Extractive
-- Cikti: citation'li ve guardrail'li cevap
+**Sayfada yer alan bloklar**
+- Belge Girdisi: PDF, PNG, JPG ve gorsel/metin tabanli dokumanlar
+- Icerik Cikarimi: PDF text, OCR ve opsiyonel VLM extraction
+- Yapisal Analiz: Section tree, parent/child chunking ve layout-aware yapi
+- Indeksleme: Dense ve sparse index yapisi
+- Hibrit Retrieval: Chroma + BM25 + RRF + rerank ile retrieval
+- Kaynakli Cevap Uretimi: grounded answer generation, source attribution ve guardrail destekli cikti
+
+**Multimodal yan akis**
+- Sayfa/bolge gorselleri
+- Layout detection
+- OCR / VLM / tablo cikarimi
+- Retrieval'a gorsel + metin kanit olarak besleme
 
 **Konusma notu**
-Buradaki temel kararim su oldu: Sistemi moduler kurdum. Boylece ayni uygulama hem online hem local, hem classic hem multimodal, hem de farkli OCR, embedding ve generation backend'leri ile calisabiliyor.
+Ana mimari text-first cekirdegi koruyor; multimodal akis ise buna yan bir capability olarak ekleniyor.
 
 ---
 
-## Sayfa 4 - Uctan Uca Mimari
+## Sayfa 4 - Dokuman Anlama Katmani
 
 **Baslik**
-End-to-end pipeline
+Dokuman Anlama Katmani
 
-**Sayfada yer almasi gerekenler**
-```text
-Belge
--> Ingestion
--> Structure Detection
--> Hierarchical Chunking
--> Dense + Sparse Indexing
--> Hybrid Retrieval
--> Guardrailed Answer Generation
-```
-
-**Ek kutu**
-Multimodal modda:
-```text
-Visual Assets
--> Page / Region Planning
--> OCR / VLM / Table Structure
--> Visual + Text Evidence
-```
+**Sayfada yer alan mesajlar**
+- Her sayfa icin metin kalitesi degerlendirilir
+- Uygun durumda PDF text kullanilir
+- Dusuk kalite durumunda OCR veya VLM tabanli extraction kullanilir
+- Aday Secimi: her sayfa icin en yuksek kaliteli extraction adayi belirlenir
+- Extraction Stratejisi: PDF text, OCR ve VLM yollari kaliteye gore degerlendirilir; gerekirse daha guclu extraction katmanina gecilir
 
 **Konusma notu**
-Text-first cekirdegi korudum, multimodal katmani buna ek olarak yerlestirdim. Yani sistem yeni capability kazanirken mevcut classic akis bozulmuyor. Bu, projeyi hem daha guvenli hem daha bakimi kolay hale getirdi.
+Bu slaytta anlatilan sey tek bir extractor degil, kaliteye gore secim yapan bir ingestion stratejisi oldugu.
 
 ---
 
-## Sayfa 5 - Ingestion ve Extraction Tasarimi
+## Sayfa 5 - Hiyerarsik Temsil ve Chunking
 
 **Baslik**
-Belgeyi once dogru okumak zorundayim
+Hiyerarsik Temsil ve Chunking
 
-**Sayfada yer almasi gerekenler**
-- PDF text backend: `pymupdf`, `docling`, `auto`, `smart`
-- OCR backend: `docai`, `paddle_vl`, `paddle`, `tesseract_legacy`, `smart`
-- VLM mode: `off`, `auto`, `smart`, `force`
-- PyMuPDF tarafinda multi-column okuma sirasi duzeltiliyor
-- Docling butun PDF icin alternatif text adayi uretiyor
-- Dusuk kalite metinde OCR devreye giriyor
-- VLM extract-only calisiyor; OCR metni VLM icin grounding olarak verilebiliyor
+**Alt Baslik**
+Hiyerarsik Yapi Nasil Calisir?
+
+**Sayfada yer alan mesajlar**
+- Numarali heading yapisi (`2.`, `4.1`, `A.4.1`) tespit edilerek section tree olusturulur
+- Her chunk bulundugu bolumle iliskili zengin metadata tasir
+- Header/footer temizligi ingestion asamasinda otomatik uygulanir
+
+**Metadata alanlari**
+- `section_id`
+- `parent_id`
+- `heading_path`
+- `page_start / end`
 
 **Konusma notu**
-Burada tek bir extractor'a bagimli kalmadim. Cunku bir sayfa native text olabilir, digeri scan olabilir, baska bir sayfa da layout olarak karmasik olabilir. Bu yuzden her sayfada en iyi adayi secen bir ingestion mantigi kurdum. VLM'i de serbest QA icin degil, extract-only amacla kullandim; layout authority goruntu, karakter dogrulama kaynagi ise OCR.
+Chunking tarafinda fixed-size parcala yerine section-tree mantigini tercih ettim; cunku retrieval'da kapsami korumak istedim.
 
 ---
 
-## Sayfa 6 - Yapisal Temsil ve Chunking
+## Sayfa 6 - Retrieval Nasil Calisiyor?
 
 **Baslik**
-Neden hiyerarsik chunking kullandim?
+Retrieval Nasil Calisiyor?
 
-**Sayfada yer almasi gerekenler**
-- Numbered heading detection: `2.`, `4.1`, `A.4.1`
-- Repeating header/footer temizligi
-- Gerektiginde sinirli unkeyed heading fallback
-- Section tree olusumu
-- Parent chunk: tam bolum
-- Child chunk: paragraf-hizali, token-bazli bolumleme (`tiktoken cl100k_base`)
-- Metadata: `section_id`, `parent_id`, `heading_path`, `page_start`, `page_end`
+**Sayfada yer alan adimlar**
+- Sorgu Siniflandirma: `section_list` ve `normal_qa` ayrimi
+- Hibrit Retrieval: Dense (Chroma) + Sparse (BM25) birlesimi
+- RRF Birlesimi: Reciprocal Rank Fusion ile yeniden siralama
+- Baslik Eslesmeli Section: dogru section ve tum alt agaci getirme
 
 **Konusma notu**
-Duzenli fixed-size chunking yerine section tree kullandim cunku kullanici genelde "paragraf" degil "bolum" soruyor. Parent chunk tam kapsami, child chunk ise retrieval hassasiyetini sagliyor. Bu hibrit yapi ozellikle liste sorularinda ve section-based sorularda cok faydali oldu.
+Bu slayt retrieval'i tek asamali bir arama olarak degil, siniflandirma + retrieval + birlestirme + bolum secimi olarak anlatiyor.
 
 ---
 
-## Sayfa 7 - Retrieval Nasil Calisiyor?
+## Sayfa 7 - Section List Sorgu Mekanizmasi
 
 **Baslik**
-Hybrid retrieval ve query routing
+Section List Sorgu Mekanizmasi
 
-**Sayfada yer almasi gerekenler**
-- Dense retrieval: embedding tabanli anlamsal arama
-- Sparse retrieval: BM25 ile kelime bazli arama
-- BM25 tarafi ozellikle child/table chunk'larda calisiyor
-- BM25 tarafinda Turkce/Ing. dostu tokenizer ve 3-gram destegi
-- Turkce sorguda morphological expansion
-- Ingilizce sorguda gerekirse query expansion
-- RRF ile birlestirme
-- Embedding rerank ile son siralama
-- Query classification:
-  - `section_list`
-  - `multi_section`
-  - `normal_qa`
+**Sayfada yer alan mesajlar**
+- Liste sorgularinda LLM'e bagimli olmadan deterministik ve kapsam odakli sonuc uretme
+- Sorgu Siniflandirma
+- Baslik Eslesmesi
+- Alt Agac Getirme
+- Kapsam Tahmini
+- Deterministik Uretim
 
 **Konusma notu**
-Tum sorulari ayni retrieval yoluna sokmadim. Cunku "Teslimatlar nelerdir?" ile "Teslim suresi nedir?" ayni problem degil. Ayrica sadece dense ya da sadece sparse kullanmak yerine ikisini birlestirdim. Sparse exact terimleri, dense anlamsal benzerligi tasiyor; RRF ise bu iki sinyalin failure mode'larini dengeliyor.
+Bu slaytta ana vurgu, kritik liste sorularinda cevabi tamamen generative moda birakmamak.
 
 ---
 
-## Sayfa 8 - Section List Sorularini Nasil Guvenceye Aldim?
+## Sayfa 8 - Multimodal Katman
 
 **Baslik**
-Eksiksiz listeleme icin ozel mekanizma
+Multimodal Katman
 
-**Sayfada yer almasi gerekenler**
-- `section_list` sorgulari once siniflandiriliyor
-- En uygun bolum heading-aware seciliyor
-- Topic-heading confidence guard var
-- Sadece top-k degil, tum section + subtree fetch yapiliyor
-- TOC false-positive guard var
-- Gerekirse visual fallback kullaniliyor
-- Coverage heuristic ile beklenen madde sayisi hesaplanabiliyor
-- Uygunsa deterministic liste render ediliyor
-- Yetmezse LLM fallback devreye giriyor
+**Alt Baslik**
+Gorsel Isleme Mimarisi
+
+**Sayfada yer alan mesajlar**
+- Klasik text pipeline'a ek olarak sayfa ve bolge duzeyinde visual chunk uretilir
+- Tablo, form ve layout odakli sorgularda region-aware retrieval devreye girer
+- Sayfa Chunk: tam sayfa gorsel temsil
+- Bolge Chunk: tespit edilen bolge kirpimlari
+- Detector Backend: `none`, `sidecar`, `docai`, `docling`
 
 **Konusma notu**
-Bu kisim projede fark yaratan teknik kararlardan biri. Klasik RAG'de LLM listedeki maddelerin bir kismini atlayabiliyor. Ben burada once section'i dogru secmeye, sonra alt agaci eksiksiz getirmeye, sonra da mumkunse cevabi deterministik uretmeye odaklandim. Yani kritik liste sorularinda uretici modeli degil, veriyi otorite yaptim.
+Bu slaytta multimodal katmanin sadece "resim de gonderiyorum" seviyesinde olmadigini, retrieval mantigina gorsel region bilgisinin de girdigini anlatmak gerekiyor.
 
 ---
 
-## Sayfa 9 - Multimodal Katman
+## Sayfa 9 - Tablo ve Layout Isleme
 
 **Baslik**
-Metin yetmediginde ne oluyor?
+Tablo ve Layout Isleme
 
-**Sayfada yer almasi gerekenler**
-- Processing mode: `classic`, `multimodal`, `smart`
-- Visual chunk level: `page` veya `region`
-- Region source: `heuristic` veya `detector`
-- Detector backend: `none`, `sidecar`, `docai`, `docling`
-- Query tablo/form/layout sinyali tasiyorsa region-aware skor bonusu uygulanabiliyor
-- Gemini tarafinda multimodal answer generation `off/auto/on` olarak kontrol edilebiliyor
+**Sayfada yer alan bloklar**
+- Layout Detection: tablo benzeri bolgeler sayfa uzerinde ayri bir asamada tespit edilir
+- Extraction: table backend (`docai`, `gemini`, `heuristic`, `auto`) yalnizca ilgili bolgelerde calisir
+- Indexing: elde edilen sonuc yapilandirilmis `table` chunk olarak indekslenir
+- Retrieval Kalitesi: tablo sorgularinda region odakli evidence daha yuksek dogruluk ve kapsam saglar
 
 **Konusma notu**
-Multimodal katmani sadece "goruntu de ekleyelim" seviyesinde kurmadim. Region bazli crop, detector secimi, region metadata'si ve retrieval tarafinda visual-aware scoring ekledim. Boylece tablo, form, checkbox, layout veya sayfadaki belirli bir bolgeyle ilgili sorularda daha anlamli evidence toplanabiliyor.
+Layout detection ile structured table extraction ayni sey degil; bu slaytta bilerek iki asamali bir isleme anlatiyoruz.
 
 ---
 
-## Sayfa 10 - Tablo ve Layout Neden Ayri Stage?
+## Sayfa 10 - Cevap Uretimi ve Guardrail Katmani
 
 **Baslik**
-Table structure ve layout neden ayri problem?
+Cevap Uretimi ve Guardrail Katmani
 
-**Sayfada yer almasi gerekenler**
-- Layout detection ayri, OCR ayri, table parsing ayri
-- Table stage: `TABLE_STRUCTURE_ENABLED` (acma/kapama) + `smart` flag
-- Table backend:
-  - `docai`
-  - `gemini`
-  - `heuristic`
-  - `auto`
-- Smart modda sadece OCR/VLM sayfalarinda calistirilabiliyor
-- Sonuc `table` chunk olarak indekse giriyor
+**Sayfada yer alan mesajlar**
+- Sistem, belgede bulunmayan bilgiyi uretmemek uzere yapilandirilmistir
+- Her cevapta kaynak gosterimi zorunludur
+- Cikti Guvencesi: strict system prompt ile LLM davranisi sinirlandirilir
+- Streaming ve non-streaming yanit yollari desteklenir
+- Cevap uretim dongusu denetlenebilir ve gerektiginde yeniden calistirilabilir
+- Baglam Disi Uretim Yasagi: "Belgede bu bilgi bulunamadi."
+- Kaynak Zorunlulugu: kaynak gosterilmezse otomatik yeniden deneme
+- Kapsam Kontrolu: eksik kapsam tespit edilirse yeniden deneme ve uyari mekanizmasi
 
 **Konusma notu**
-Bu ayrimi bilerek yaptim cunku OCR metin verir ama tabloyu tablo yapan satir-sutun iliskisini her zaman koruyamaz. Layout detector bolgeyi buluyor, table stage ise yapisal satir-sutun bilgisini cikarmaya calisiyor. Ozellikle scan veya gorsel agirlikli belgelerde bu ayrim cevabin kalitesini ciddi artiriyor.
+Burada odak "daha akici cevap" degil, "daha denetlenebilir ve kaynakli cevap".
 
 ---
 
-## Sayfa 11 - Cevap Uretimi ve Guardrail'ler
+## Sayfa 11 - Moduler Backend Mimarisi
 
 **Baslik**
-LLM kullaniyorum ama kontrolsuz birakmiyorum
+Moduler Backend Mimarisi
 
-**Sayfada yer almasi gerekenler**
-- Siki system prompt
-- Baglam disi bilgi yasak
-- Baglam yoksa sabit fallback: `Belgede bu bilgi bulunamadi.`
-- Yanlis oncullu sorguda: `Hayir, ...` ile duzeltici cevap
-- Her bilgi cumlesinde citation zorunlu
-- Weak evidence durumunda grounding check ile bos context fallback
-- Deterministic section-list path
-- Kanit paneli: yalnizca cevapta atifta bulunulan sayfalarin evidence ozeti
-- Non-streaming:
-  - citation retry
-  - coverage retry
-  - coverage warning
-- Streaming:
-  - token geri alma yok
-  - silent citation duzeltme passi
-  - coverage warning
+**Sayfada yer alan mesajlar**
+- Her bilesen runtime sirasinda bagimsiz olarak yapilandirilabilir
+- Cloud ve local secenekler ayni arayuz uzerinden yonetilir
+- LLM Provider: Gemini, OpenAI, local veya extractive
+- Embedding: Gemini embedding veya local sentence-transformers
+- OCR: `docai`, `paddle_vl`, `tesseract`
+- VLM: Gemini veya local vision model
+- Layout: `docai`, `docling`, `sidecar`
 
 **Konusma notu**
-Buradaki hedefim "guzel cevap" degil, "guvenilir cevap" oldu. Bu yuzden cevabin kaynaksiz gelmesini kabul etmiyorum. Ayrica streaming ve non-streaming akislari ayni gibi anlatmiyorum; non-streaming daha agresif duzeltme yapabilirken, streaming'de yayinlanan token geri alinmadigi icin daha farkli bir guardrail davranisi var.
+Bu slayt tek bir servis yoluna kilitlenmeyen, runtime'da degistirilebilir bir backend mimarisi kurdugunuzu gosteriyor.
 
 ---
 
-## Sayfa 12 - Neden Bu Kadar Konfigure Edilebilir?
+## Sayfa 12 - Arayuz ve Kontrol Edilebilirlik
 
 **Baslik**
-Moduler backend mimarisi
+Arayuz ve Kontrol Edilebilirlik
 
-**Sayfada yer almasi gerekenler**
-- LLM provider: `gemini`, `openai`, `local`, `none`
-- Embedding: Gemini veya local sentence-transformers
-- OCR: cloud ya da local
-- VLM: cloud ya da local
-- Layout detector: `none`, `sidecar`, `docai`, `docling`
-- Detector basarisiz olursa heuristic fallback
-- Runtime'da bircok ayar UI uzerinden degistirilebiliyor
-- Embedding degisirse indeks yeniden kuruluyor
-- OCR/VLM/pdf-text degisiklikleri yeni belge yuklemelerinde etkili oluyor
+**Sayfada yer alan mesajlar**
+- Demo sirasinda OCR, VLM, retrieval ve generation ayarlari anlik yonetilebilir
+- Runtime Yonetimi: preset ve backend secimi anlik olarak yapilandirilabilir
+- Ayar Kontrolu: OCR, VLM ve retrieval ayarlari demo sirasinda yonetilebilir
+- Esnek Akis: farkli backend kombinasyonlariyla test edilebilir
 
 **Konusma notu**
-Projenin ana hedeflerinden biri tek bir ortama bagimli kalmamakti. Kalite, maliyet, offline ihtiyaci ve donanim imkanina gore farkli pipeline'lar kurulabiliyor. Bu esneklik teknik olarak maliyetliydi ama urun ve demo acisindan cok degerli oldu.
+Bu slayt UI'yi yalnizca chat arayuzu olarak degil, teknik bir kontrol paneli olarak konumlandiriyor.
 
 ---
 
-## Sayfa 13 - UI ve Demo Deneyimi
+## Sayfa 13 - Operasyonel Dayaniklilik
 
 **Baslik**
-Chainlit tabanli ama standart bir chat arayuzu degil
+Operasyonel Dayaniklilik
 
-**Sayfada yer almasi gerekenler**
-- Sol sohbet/gecmis ve belge baglami paneli
-- Sag custom runtime settings paneli
-- `Basic` ve `Advanced` sekmeleri
-- Runtime preset'ler:
-  - `online_best`
-  - `hybrid_best`
-  - `local_best`
-  - `fast`
-- `Apply` / `Reset` akisi
-- Ozet kartlari:
-  - `Current Draft`
-  - `Applied Pipeline`
-  - `Fallback Notes`
-  - `Document Context`
-- Multi-doc akista aktif belge secimi ve dosya adindan routing
-- Komutlar:
-  - `/chat`
-  - `/doc`
-  - `/use <dosya>`
+**Sayfada yer alan bloklar**
+- Belge Onbellegi: fingerprint tabanli cache invalidation ile gereksiz yeniden isleme onlenir
+- Artimli Indeksleme: Persistent Chroma + BM25 yapisinda yalnizca degisen belgeler yeniden islenir
+- Guvenli Kapanis: calisan surecler guvenli bicimde sonlandirilir
+- Lazy Import: kullanilmayan backend bagimliliklari baslangicta yuklenmez
+- Olay Loglama: opsiyonel yapilandirilmis event logging ile gozlemlenebilirlik saglanir
 
 **Konusma notu**
-UI'yi sadece soru-cevap ekrani olarak birakmadim. Teknik mulakatta gostermeyi kolaylastiran bir runtime panel ekledim. Boylece ayni uygulamada hem demo yapabiliyor hem de hangi pipeline'in aktif oldugunu, hangi fallback'in neden devreye girdigini seffaf sekilde gosterebiliyorum.
+Bu slayt, projenin sadece dogru cevap veren degil, ayni zamanda operasyonel olarak da dayanikli bir uygulama oldugunu gosteriyor.
 
 ---
 
-## Sayfa 14 - Coklu Belge ve Operasyonel Dayaniklilik
+## Sayfa 14 - Test ve Degerlendirme Stratejisi
 
 **Baslik**
-Sistemi sadece dogru degil, dayanikli da yapmaya calistim
+Test ve Degerlendirme Stratejisi
 
-**Sayfada yer almasi gerekenler**
-- Document cache ile ayni dosya tekrar islenmiyor
-- Fingerprint ile config degisirse cache invalidation oluyor
-- Incremental indexing ile sadece yeni chunk embed ediliyor
-- Persistent Chroma + BM25
-- Embedding dimension bazli collection isimlendirme
-- Multi-document session destegi
-- Aktif belge secimi ve partial filename routing
-- Optional event logging
-- Graceful shutdown / lazy import / fallback-first davranis
+**Alt Baslik**
+Vaka Calismasi Sonuclari
+
+**Belgeler**
+- `Case_Study_20260205.pdf`
+- `CV-ornek-muhendis.pdf`
+
+**Tabloda yer alan metrikler**
+- Intent Accuracy: `25/25 (100%)`
+- Heading Hit: `15/15 (100%)`
+- Section Hit: `6/6 (100%)`
+- Evidence Met: `25/25 (100%)`
+- Manual QA:
+  - Online: `71/71`
+  - Local: `39/71`
+
+**Degerlendirme metrikleri**
+- Intent Accuracy
+- Heading Hit
+- Section Hit
+- Evidence Met
+- Hallucination Test
+- Manual QA
 
 **Konusma notu**
-Kod tabaninda sadece algoritma degil, operasyonel davranis da onemliydi. Ayni belgeyi tekrar tekrar islememek, yeni dosya geldiginde tum indexi bastan embed etmemek ve coklu belge oturumlarinda yanlis belgeye gitmemek bu yuzden oncelikliydi.
+Bu slaytta script tabanli retrieval degerlendirmesi ile manuel QA sonucunu birlikte anlatiyorsunuz; ozellikle VLM acik/kapali farkinin sonuclara etkisini vurgulamak uygun olur.
 
 ---
 
-## Sayfa 15 - Test ve Degerlendirme Yaklasimi
+## Sayfa 15 - Teknik Kararlar ve Trade-off'lar
 
 **Baslik**
-Kaliteyi nasil dogruladim?
+Teknik Kararlar ve Trade-off'lar
 
-**Sayfada yer almasi gerekenler**
-- Preflight: generation + embedding + VLM smoke
-- Syntax/import gate
-- Baseline gate
-- Retrieval eval:
-  - intent accuracy
-  - heading hit
-  - section hit
-  - evidence met
-  - latency
-- Hallucination test
-- Smoke suite
-- Folder suite ile coklu PDF denemeleri
-- Ek manuel QA ozeti (`test_sonuclari.md`)
-  - Belgeler: `Case_Study_20260205.pdf` + `CV-ornek-muhendis.pdf`
-  - Online mode: `71/71` soru dogru referans kabul edildi
-  - Local mode: ayni soru setinde `39/71` dogru; online moddan belirgin zayif
-  - Paraphrase tutarliligi, liste coverage ve belge disi no-answer davranisi ayrica gozlemlendi
-  - Gozlenen en belirgin farklardan biri VLM etkisiydi; online testte `vlm_mode=force` iken local testte `vlm_mode=off` oldugu icin ozellikle CV gibi layout-duyarli belgelerde dogruluk belirgin dustu
+**Sayfada yer alan mesajlar**
+- Text-First Mimari Korundu
+- Deterministic Retrieval Onceliklendirildi
+- UI'da Apply/Reset Akisi
+- Graph RAG / Agentic RAG Bilincli Olarak Eklenmedi
 
-**Onerilen not**
-Bu sayfada sabit rakam yazacaksan, demo oncesi `scripts/eval_retrieval.py` ve ilgili kabul script'lerini son bir kez calistirip tabloyu guncelle. Sabit metrik yazip stale bir sonuc gostermekten kacinin.
+**Detaylar**
+- Multimodal katman temel pipeline degistirilmeden additive olarak eklendi
+- LLM'e birakilabilecek kararlar mumkun oldugunda heuristic ve kural tabanli mekanizmalarla cozuldu
+- Runtime ayarlari kullanici onayina baglandi
+- Kapsam, denetlenebilirlik ve sadelik onceliklendirildi
 
 **Konusma notu**
-Test stratejim sadece unit test degil. Bu tarz bir RAG sistemde ingestion, retrieval ve generation birlikte degerlendirilmelidir. Bu yuzden bir yandan script tabanli kabul kapilari kurdum, bir yandan da manuel soru-cevap akislarini arsivledim. Boylece hem tekrar uretilebilir metrikleri hem de gercek kullaniciya benzeyen QA davranisini ayni slaytta gosterebiliyorum.
+Bu slaytta "neden yapildi?" kadar "neden bilincli olarak yapilmadi?" sorusunu da cevapliyorsunuz.
 
 ---
 
-## Sayfa 16 - Mevcut Demo Profili
+## Sayfa 16 - Gelecek Calismalar
 
 **Baslik**
-Bugun gosterecegim aktif konfigurasyon
+Gelecek Calismalar
 
-**Sayfada yer almasi gerekenler**
-- `LLM_PROVIDER=gemini`
-- `VERTEX_ENABLED=1`
-- `GEMINI_MODEL=gemini-3.1-pro-preview`
-- `GEMINI_FALLBACK_MODEL=gemini-2.5-pro`
-- `EMBEDDING_MODEL=gemini-embedding-2-preview`
-- `EMBEDDING_VERTEX_ENABLED=0`
-- `DOC_PROCESSING_MODE=multimodal`
-- `PDF_TEXT_BACKEND=docling`
-- `VISUAL_CHUNK_LEVEL=page`
-- `VISUAL_REGION_SOURCE=detector`
-- `VISUAL_DETECTOR_BACKEND=docai`
-- `OCR_ENABLED=0`
-- `TABLE_STRUCTURE_ENABLED=0`
-- `TABLE_STRUCTURE_BACKEND=auto`
-- `VLM_PROVIDER=gemini`
-- `VLM_MODE=force`
-- Pratik demo odagi: page-level multimodal akisi; region/detector capability sistemde mevcut ama bu profilde ana gosterim noktasi degil
-
-**Konusma notu**
-Demo icin kaliteyi one cikan bir profil kullaniyorum. LLM ve VLM tarafinda Vertex yolu acik, embedding tarafinda ise `EMBEDDING_VERTEX_ENABLED=0` ile AI Studio key tabanli yol kullaniliyor. `PDF_TEXT_BACKEND=docling` oldugu icin metin extraction'da Docling tercih ediliyor; OCR kapali ve table stage kapali cunku bu demoda Docling'den gelen yapiyi kullaniyorum. Gorsel tarafta env'de detector ayarlari tanimli olsa da bu profilin pratikteki ana odagi page-level multimodal akis; region-level detector yetenegi sistemde var ama bu sunumda ana mesaj olarak onu one cikarmiyorum.
-
----
-
-## Sayfa 17 - Teknik Kararlar ve Trade-off'lar
-
-**Baslik**
-Neleri bilerek sectim, nelerden bilerek vazgectim?
-
-**Sayfada yer almasi gerekenler**
-- Text-first cekirdegi korudum, multimodal'i additive ekledim
-- Deterministic retrieval iyilestirmelerini LLM'den once koydum
-- Moduler backend mimarisi sectim, tek bir servis yoluna kilitlenmedim
-- UI'da tam reactive config editor yerine `Apply/Reset` modeli kullandim
-- Kritik listelerde generative degil deterministic yol kullandim
-- Bugun Graph RAG veya agentic RAG yok; bilincli olarak eklenmedi
-
-**Konusma notu**
-Her capability'yi eklemek yerine, belge QA problemini dogrudan cozen ve teknik olarak savunulabilir katmanlara odaklandim. Bu da projeyi gereksizce karmasiklastirmadan guclendirdi. "Neden yapmadin?" sorusuna cevabim da bu: Onceligim once temel belge QA'yi guvenilir sekilde cozmekti.
-
----
-
-## Sayfa 18 - Canli Demo Akisi
-
-**Baslik**
-Demo'yu nasil ilerletecegim?
-
-**Sayfada yer almasi gerekenler**
-1. Uygulamayi ac
-2. Runtime panelde aktif pipeline'i goster
-3. Test PDF'lerinden birini yukle
-4. Normal QA sorusu sor
-5. Liste/bolum sorusu sor
-6. Tablo veya layout odakli bir soru sor
-7. Citation ve evidence mantigini goster
-8. Gerekirse `/use <dosya>` ile aktif belgeyi degistir
-
-**Konusma notu**
-Demo'yu teknik gucu gosterecek sekilde ilerletecegim. Once basit QA ile temel akis, sonra section-list sorusu ile deterministic coverage mantigi, en sonda da tablo/layout odakli soru ile multimodal farki gosterecegim.
-
----
-
-## Sayfa 19 - Muhtemel Mulakat Sorulari
-
-**Baslik**
-Bekledigim teknik sorular ve kisa cevaplar
-
-**Sayfada yer almasi gerekenler**
-- Neden sadece vector DB yetmiyor?
-- Neden BM25 ekledin?
-- Neden section tree kurdun?
-- Neden OCR, Docling ve VLM birlikte var?
-- Neden layout ve table stage ayri?
-- Halusinasyonu nasil azalttin?
-- Neden bu kadar cok backend var?
-
-**Konusma notu**
-Bu sorularda ana cevabim su olacak: Sistemi sadece calisan degil, farkli belge tiplerine dayanikli, sorgu tipine gore davranan ve kararlarini aciklayabilen bir yapi olarak kurdum. Yani mimari tercihlerin hepsi belirli bir failure mode'u azaltmak icin var.
-
----
-
-## Sayfa 20 - Gelecek Calismalar
-
-**Baslik**
-Bir sonraki teknik adimlar
-
-**Sayfada yer almasi gerekenler**
-
-**Kisa Vadeli Hedefler**
-- Retrieval iyilestirme:
-  - cross-encoder veya ColBERT benzeri ek reranker
-  - benzer section'lar arasinda daha hassas ayristirma
-- Multimodal iyilestirme:
-  - region planning ve table extraction kalitesini artirma
-  - form/diagram/technical drawing ayrimini guclendirme
-- Evaluation iyilestirme:
-  - daha genis benchmark havuzu
-  - retrieval ve hallucination metriklerini sistematik raporlama
-- Operasyonel iyilestirme:
-  - daha fazla preset/profil
-  - yapilandirilmis loglama ve monitoring
-
-**Uzun Vadeli Opsiyonlar**
+**Uzun Vadeli Vizyon**
 - Graph RAG
 - Agentic RAG
 
+**Kisa Vadeli Hedefler**
+- Reranker / Late Interaction
+- Gelismis Bolge ve Tablo Cikarimi
+- Genis Benchmark Setleri
+- Gozlemlenebilirlik
+
 **Konusma notu**
-Burada dikkat ettigim nokta su: Bugun sistemde olmayan seyleri "varmis" gibi anlatmiyorum. Uzun vadede Graph RAG veya agentic RAG gibi yonler dusunulebilir; ama bugunku odagim once temel belge QA problemini guvenilir ve savunulabilir sekilde cozmeye yonelikti.
+Bu slayt mevcut sistemi abartmadan, sonraki teknik genisleme alanlarini gosteriyor.
 
 ---
 
-## Sayfa 21 - Kapanis
+## Sayfa 17 - Tesekkurler
 
 **Baslik**
-Sonuc
+Tesekkurler
 
-**Sayfada yer almasi gerekenler**
-- Belge yapisini koruyan ingestion
-- Query-aware ve hybrid retrieval
-- Multimodal/table destekli evidence toplama
-- Guardrail'li cevap uretimi
-- Demo dostu ve konfigure edilebilir UI
-
-**Kapanis cumlesi**
-Bu projede hedefim, belgeyi sadece arayan degil; belge yapisini anlayan, farkli extraction ve retrieval stratejilerini birlestiren ve cevabini kaynagi ile savunan bir sistem gelistirmekti.
+**Sayfada yer alan metin**
+- Sorularinizi memnuniyetle yanitlayabilirim.
+- Kemal Utku Mutlu
+- TUSAS DOCQA - Teknik Mulakat Sunumu
 
 ---
 
-## Sunum Sirasinda Dikkat Edilecekler
+## Not
 
-- `.env`, API key veya credential dosyalarini ekrana acma.
-- Demo oncesi `./run.sh` ile preflight gecmis bir ortam kullan.
-- Runtime'da OCR, VLM, pdf text backend veya processing mode degistirirsen yeni belge yukle; bunu kendin belirt.
-- Ilk soruyu kolay, ikinci soruyu `section_list`, ucuncu soruyu tablo/layout odakli sec.
-- Cevap geldiginde sadece metni degil, citation ve evidence mantigini da goster.
-- Metrik slaydi kullaniyorsan rakamlari demo gunu guncelle.
+Bu markdown artik PDF'deki 17 sayfalik mevcut sunumla hizalidir. Onceki taslakta bulunan su bolumler artik bu dosyada ayrica slayt olarak tutulmamistir:
+- Mevcut demo profili
+- Canli demo akisi
+- Muhtemel mulakat sorulari
+- Ayrica ayri kapanis/sonuc slaydi
 
-## Onerilen Demo Sorulari
-
-- `Projenin amaci nedir?`
-- `Teslimatlar nelerdir?`
-- `Bu tabloda hangi satirlar veya sutunlar var?`
-- `Bu sayfadaki form alanlari nelerdir?`
-- `X bolumu ile Y bolumu arasindaki fark nedir?`
-
-## 30 Saniyelik Acilis Metni
-
-Bu proje, PDF ve gorsel belgeler uzerinde calisan hiyerarsik ve multimodal bir Document QA sistemi. Temel farki, sadece metin aramak yerine belge yapisini, baslik hiyerarsisini, tablo ve layout bilgisini de retrieval'e dahil etmesi. Bu sayede cevaplari daha kontrollu, daha izlenebilir ve kaynaklariyla birlikte uretebiliyor.
+Istenirse bu basliklar ayri bir "konusma notlari" dokumani olarak yeniden ayrilabilir; ancak mevcut PDF ile birebir tutarlilik icin bu dosyada tutulmadi.
